@@ -226,9 +226,11 @@ suite in this repo runs the same conformance tests against a real database.
 
 ## Roadmap
 
-- `effect-mq/redis` (Bun.redis / ioredis-free) behind the same conformance suite
-- A standalone non-drizzle Postgres driver on plain `@effect/sql-pg`
-- Repeatable/cron jobs, rate limiting, a reference dashboard
+Next up: repeatable/cron jobs, handler timeouts + unrecoverable errors,
+dashboard admin verbs (pause/promote/cancel), per-store history TTL, richer
+deduplication (throttle/debounce), trace propagation and an event stream, a
+Redis store, and parent-child fan-out. Full prioritized list:
+[ROADMAP.md](https://github.com/TeamWarp/effect-mq/blob/main/ROADMAP.md).
 
 ## License
 
