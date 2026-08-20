@@ -45,12 +45,19 @@ Redis/Postgres backends, `effect/unstable/workflow`, `DurableQueue`).
   depth, run duration, retries, stalls; exported from the worker loops.
 - [ ] **Batch enqueue** (S) — `enqueueMany` in one round trip (one INSERT with
   multi-row VALUES); flagged as an easy perf win during the storage research.
-- [ ] **Custom drizzle columns + typed queue registry** (M, pair these) —
-  `mqJobs<Names>(name, { extend: {...} })` with extras flowing through the
-  generics (driver already INSERTs an explicit column list, so extras need
-  only be nullable/defaulted; drift guard gains a superset mode). The same
-  generics work enables the queue registry: queue names as a user-declared
-  union checked at `Job.make` and `Worker.layer`.
+- [ ] **Drizzle schema customization + typed queue registry** (M, pair
+  these) — three related factory features:
+  - *Custom columns*: `mqJobs<Names>(name, { extend: {...} })` with extras
+    flowing through the generics (the driver already INSERTs an explicit
+    column list, so extras need only be nullable/defaulted; the drift guard
+    gains a superset mode).
+  - *Configurable column names*: `mqJobs(name, { columns: { runAt:
+    "scheduled_at", ... } })` for shops with naming conventions. Prerequisite:
+    the store's raw SQL must derive every column identifier from the table
+    config (`${jobs.runAt}` refs / `getTableConfig`) — today the INSERT
+    column lists and SET fragments hardcode the snake_case names.
+  - *Typed queue registry*: queue names as a user-declared union checked at
+    `Job.make` and `Worker.layer` — the same generics machinery.
 
 ## P2 — scale & topology
 
