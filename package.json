@@ -1,0 +1,45 @@
+{
+  "name": "effect-mq-monorepo",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "examples/*"
+  ],
+  "packageManager": "bun@1.4.0",
+  "scripts": {
+    "check": "bun run --filter './packages/*' check && bun run --filter './examples/*' check",
+    "lint": "oxlint",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "ready": "bun run check && bun run lint && bun run test",
+    "test:pg": "docker compose up -d --wait && vitest run --project effect-mq packages/effect-mq/test/drizzle",
+    "build": "bun run --filter 'effect-mq' build"
+  },
+  "devDependencies": {
+    "@effect/vitest": "catalog:",
+    "@oxlint/plugins": "1.79.0",
+    "@types/node": "catalog:",
+    "effect": "catalog:",
+    "oxlint": "1.79.0",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "overrides": {
+    "effect": "catalog:",
+    "vitest": "catalog:"
+  },
+  "catalog": {
+    "@effect/vitest": "4.0.0-rc.111",
+    "@types/node": "26.1.2",
+    "effect": "4.0.0-rc.111",
+    "typescript": "7.0.2",
+    "vitest": "4.1.11",
+    "drizzle-orm": "1.0.0-rc.5-169397b",
+    "drizzle-kit": "1.0.0-rc.5-ab785fc",
+    "pg": "8.23.0",
+    "@types/pg": "8.15.6",
+    "@effect/sql-pg": "4.0.0-rc.111"
+  }
+}

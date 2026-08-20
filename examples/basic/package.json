@@ -1,0 +1,17 @@
+{
+  "name": "@effect-mq/example-basic",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit -p tsconfig.json",
+    "start": "bun src/main.ts"
+  },
+  "dependencies": {
+    "effect": "catalog:",
+    "effect-mq": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "catalog:"
+  }
+}

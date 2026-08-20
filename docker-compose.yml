@@ -1,0 +1,13 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: effect_mq_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d effect_mq_test"]
+      interval: 2s
+      timeout: 2s
+      retries: 30

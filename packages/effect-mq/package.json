@@ -1,0 +1,73 @@
+{
+  "name": "effect-mq",
+  "version": "0.1.0",
+  "description": "Effect-native background jobs: schema-first definitions, storage-agnostic queue core, worker runtime, and a Postgres store through drizzle.",
+  "license": "MIT",
+  "author": "Adam Rankin",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TeamWarp/effect-mq.git",
+    "directory": "packages/effect-mq"
+  },
+  "bugs": {
+    "url": "https://github.com/TeamWarp/effect-mq/issues"
+  },
+  "keywords": [
+    "effect",
+    "queue",
+    "jobs",
+    "background-jobs",
+    "worker",
+    "postgres",
+    "drizzle"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "src"
+  ],
+  "exports": {
+    "./package.json": "./package.json",
+    ".": "./src/index.ts",
+    "./drizzle": "./src/drizzle/index.ts",
+    "./testing": "./src/testing/index.ts"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "check": "tsc --noEmit -p tsconfig.json",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "test": "vitest run --project effect-mq",
+    "prepack": "bun run build && node scripts/prepack.mjs",
+    "postpack": "node scripts/postpack.mjs"
+  },
+  "peerDependencies": {
+    "@effect/sql-pg": ">=4.0.0-rc <5",
+    "@effect/vitest": ">=4.0.0-rc <5",
+    "drizzle-orm": ">=1.0.0-rc <2",
+    "effect": ">=4.0.0-rc <5"
+  },
+  "peerDependenciesMeta": {
+    "@effect/sql-pg": {
+      "optional": true
+    },
+    "@effect/vitest": {
+      "optional": true
+    },
+    "drizzle-orm": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@effect/sql-pg": "catalog:",
+    "@effect/vitest": "catalog:",
+    "@types/pg": "catalog:",
+    "drizzle-orm": "catalog:",
+    "effect": "catalog:",
+    "pg": "catalog:",
+    "typescript": "catalog:"
+  }
+}

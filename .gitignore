@@ -1,0 +1,14 @@
+node_modules
+.repos
+dist
+coverage
+*.tsbuildinfo
+.DS_Store
+
+plan.md
+
+.agents
+
+skills-lock.json
+package.json.dev
+.npmrc

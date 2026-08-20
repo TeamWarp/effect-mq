@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        ports:
+          - 5433:5432
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: effect_mq_test
+        options: >-
+          --health-cmd "pg_isready -U postgres -d effect_mq_test"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: bun run lint
+      # The Postgres suite runs against the service container above.
+      - run: bun run test
+      - run: bun run --filter 'effect-mq' build
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm provenance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: bun install --frozen-lockfile
+      - name: Verify tag matches package version
+        run: |
+          pkg_version="$(jq -r .version packages/effect-mq/package.json)"
+          if [ "v${pkg_version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match package version v${pkg_version}"
+            exit 1
+          fi
+      # npm publish runs the package's prepack (build + dist-exports swap).
+      - run: npm publish
+        working-directory: packages/effect-mq
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

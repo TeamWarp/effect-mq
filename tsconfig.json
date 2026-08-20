@@ -1,0 +1,11 @@
+{
+  "files": [],
+  "references": [
+    {
+      "path": "./packages/effect-mq"
+    },
+    {
+      "path": "./examples/basic"
+    }
+  ]
+}

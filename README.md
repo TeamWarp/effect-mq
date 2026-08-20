@@ -1,1 +1,99 @@
-Effect MQ
+# effect-mq
+
+Effect-native background jobs: schema-first job definitions, a storage-agnostic
+queue core, a worker runtime, and a Postgres store that lives inside your
+drizzle schema. Built on Effect v4; inspired by BullMQ's semantics and
+`effect/workflow`'s DX.
+
+**→ Full usage documentation lives in the package README:
+[`packages/effect-mq`](./packages/effect-mq/README.md)** (also shown on npm).
+
+```ts
+import { Job } from "effect-mq"
+import { Effect, Schema } from "effect"
+
+class SendEmail extends Job.make("SendEmail", {
+  payload: { to: Schema.String, subject: Schema.String },
+  success: Schema.String,
+  idempotencyKey: ({ to, subject }) => `${to}:${subject}`,
+  metadata: ({ to }) => ({ to }),
+  defaults: { attempts: 3, backoff: { type: "exponential", delay: "1 second" } }
+}) {}
+
+const producer = Effect.gen(function*() {
+  const jobId = yield* SendEmail.enqueue({ to: "ada@example.com", subject: "hi" })
+})
+```
+
+## Highlights
+
+- **One package, tree-shakeable modules** — `effect-mq` (core),
+  `effect-mq/drizzle` (Postgres store + schema factories),
+  `effect-mq/testing` (driver conformance kit). Extra peers are optional.
+- **At-least-once** with token-guarded locks, heartbeat renewal, and stalled
+  recovery; **durable retries** routed through the store, never held in a
+  worker's memory.
+- **Run ledger**: every attempt (success, retry, failure, stall) is persisted
+  and decodes back to typed exits.
+- **Multi-store routing**: bind jobs to named stores (Postgres for
+  business-critical runs, memory/Redis for disposable ones) — wiring enforced
+  at compile time.
+- **Dashboard data layer**: `list` with metadata filters and keyset
+  pagination, `poll`, `retry`, per-job `keep` retention.
+- **Drizzle-native Postgres**: the job tables are drizzle schema factories you
+  re-export — drizzle-kit owns migrations; queries are fully typed including
+  the job-name union. `FOR UPDATE SKIP LOCKED` claims, LISTEN/NOTIFY
+  wake-ups, Node and Bun.
+- **Redaction-aware persistence**: everything is stored schema-encoded;
+  `Schema.Redacted` round-trips (handlers get `Redacted` values),
+  `disallowJsonEncode` refuses persistence entirely.
+
+## Repository layout
+
+```
+packages/effect-mq        the published package (src + tests, incl. the
+                          Postgres suite under test/drizzle)
+examples/basic            runnable end-to-end demo: bun src/main.ts
+docker-compose.yml        Postgres 17 on port 5433 for the drizzle test suite
+tools/oxlint/anti-slop    local lint plugin enforcing honest types
+```
+
+## Development
+
+```sh
+bun install
+bun run check     # TypeScript 7, per package
+bun run lint      # oxlint (incl. anti-slop rules)
+bun run test      # vitest 4 + @effect/vitest, TestClock-driven
+                  # (the Postgres suite self-skips without a database)
+bun run test:pg   # docker compose up + the Postgres suite
+bun run ready     # check + lint + test
+bun run build     # emit dist (tsc, .ts imports rewritten to .js)
+```
+
+The store conformance suite (`effect-mq/testing`) runs against both the
+in-memory driver and real Postgres — under `TestClock` in both cases, because
+drivers take all time as bind parameters from the Effect `Clock`.
+
+## Releasing
+
+CI (`.github/workflows/ci.yml`) runs check/lint/tests (with a Postgres service
+container) on every push and PR. Publishing to npm happens on version tags:
+
+```sh
+# bump "version" in packages/effect-mq/package.json, then
+git tag v0.1.0 && git push --tags
+```
+
+The publish job runs `npm publish` with provenance; it needs an `NPM_TOKEN`
+repository secret. The package's `prepack` builds `dist` and swaps the
+dev (TS-source) exports for dist exports; `postpack` restores them. Verify a
+release candidate locally with:
+
+```sh
+cd packages/effect-mq && bun pm pack   # then inspect / install the tarball
+```
+
+## License
+
+MIT
