@@ -22,8 +22,6 @@ during the initial build (BullMQ v6's Redis/Postgres backends,
   cursor replay (the `QueueEvents` analogue): powers live dashboard updates,
   `waitUntilFinished`-style APIs without polling, and audit trails. NOTIFY
   coalescing caveats already solved for the wake channel apply here.
-- [ ] **Effect `Metric` integration** — counters/histograms for queue
-  depth, run duration, retries, stalls; exported from the worker loops.
 - [ ] **Batch enqueue** — `enqueueMany` in one round trip (one INSERT with
   multi-row VALUES); flagged as an easy perf win during the storage research.
 - [ ] **Drizzle schema customization + typed queue registry** (pair these) —

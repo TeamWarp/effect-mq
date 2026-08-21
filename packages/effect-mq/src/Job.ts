@@ -30,7 +30,7 @@
  *
  * @since 0.1.0
  */
-import { Clock, type Context, Duration, Effect, type Exit, Layer, Option, Predicate, Schedule, Schema } from "effect"
+import { Clock, type Context, Duration, Effect, type Exit, Layer, Metric, Option, Predicate, Schedule, Schema } from "effect"
 import {
   type BackoffPolicy,
   type DedupePolicy,
@@ -51,6 +51,7 @@ import {
   type Service as StoreService,
   unrecoverable
 } from "./JobStore.ts"
+import * as Metrics from "./Metrics.ts"
 
 export {
   /**
@@ -488,6 +489,7 @@ const Proto = {
       const dedupe = normalizeDedupe(
         options?.dedupe ?? this.dedupe?.(payload)
       )
+      const queue = options?.queue !== undefined ? QueueName(options.queue) : this.queue
       return Schema.encodeEffect(this.payloadJsonSchema)(payload).pipe(
         Effect.orDie,
         Effect.flatMap((encoded) =>
@@ -495,9 +497,7 @@ const Proto = {
             store.enqueue({
               id,
               name: this._tag,
-              queue: options?.queue !== undefined
-                ? QueueName(options.queue)
-                : this.queue,
+              queue,
               payload: encoded,
               metadata,
               priority: options?.priority ?? this.defaults.priority,
@@ -518,6 +518,18 @@ const Proto = {
             }))
         ),
         Effect.orDie,
+        Effect.tap((result) =>
+          Metric.update(
+            Metrics.jobsEnqueued.pipe(
+              Metric.withAttributes({
+                name: this._tag,
+                queue,
+                duplicate: result.duplicate ? "true" : "false"
+              })
+            ),
+            1
+          )
+        ),
         Effect.map((result) => result.id)
       )
     }).pipe(

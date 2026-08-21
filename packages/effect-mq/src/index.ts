@@ -26,6 +26,14 @@ export * as JobStore from "./JobStore.ts"
 export * as MemoryJobStore from "./MemoryJobStore.ts"
 
 /**
+ * The metrics effect-mq emits (Effect `Metric` instruments) — process-local,
+ * exported by your observability stack.
+ *
+ * @since 0.3.1
+ */
+export * as Metrics from "./Metrics.ts"
+
+/**
  * The worker runtime: `Worker.layer` and handler registration.
  *
  * @since 0.1.0

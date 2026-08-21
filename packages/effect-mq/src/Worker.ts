@@ -14,7 +14,7 @@
  *
  * @since 0.1.0
  */
-import { Cause, Clock, Context, Deferred, Duration, Effect, Exit, Fiber, FiberSet, Layer, Option, Result, Schedule, Schema, type Scope, Scope as Scope_, Tracer } from "effect"
+import { Cause, Clock, Context, Deferred, Duration, Effect, Exit, Fiber, FiberSet, Layer, Metric, Option, Result, Schedule, Schema, type Scope, Scope as Scope_, Tracer } from "effect"
 import {
   type AckOutcome,
   type BackoffPolicy,
@@ -31,6 +31,7 @@ import {
   type ScheduleRecord,
   type Service as StoreService
 } from "./JobStore.ts"
+import * as Metrics from "./Metrics.ts"
 
 /**
  * Information about the currently running attempt, passed to handlers as the
@@ -117,6 +118,12 @@ export interface WorkerOptions<StoreId = JobStore> {
   readonly pollInterval?: Duration.Input | undefined
   /** How often to tick due repeatable-job schedules (default 15s). */
   readonly scheduleSweepInterval?: Duration.Input | undefined
+  /**
+   * When set, sample `store.counts(queue)` for every registered queue into
+   * the `effect_mq_queue_depth` gauge at this cadence (default: off — depth
+   * sampling costs one store query per queue per tick).
+   */
+  readonly queueMetricsInterval?: Duration.Input | undefined
   /** Identifier used in lock tokens (default: random). */
   readonly id?: string | undefined
 }
@@ -311,6 +318,18 @@ export const make = <StoreId = JobStore>(
           attempt: record.attemptsMade + 1,
           attemptsMax: record.attemptsMax
         }
+        // One line per finished run: outcome counter + duration histogram
+        // (claim time to now, from the Effect Clock).
+        const recordRun = (outcome: string) =>
+          Effect.gen(function*() {
+            const finished = yield* Clock.currentTimeMillis
+            const attributes = { name: record.name, queue: record.queue, outcome }
+            yield* Metric.update(Metrics.jobRuns.pipe(Metric.withAttributes(attributes)), 1)
+            yield* Metric.update(
+              Metrics.jobRunDuration.pipe(Metric.withAttributes(attributes)),
+              Math.max(0, finished - (record.processedAt ?? finished))
+            )
+          })
         return Effect.gen(function*() {
           // The per-run time limit interrupts the handler internally; surface
           // it as a defect so it flows through normal retry accounting.
@@ -334,7 +353,10 @@ export const make = <StoreId = JobStore>(
           // keeps the child interruptible while the fork itself is masked.
           const fiber = yield* Effect.forkChild(restore(handlerEffect))
           inflight.set(record.id, { id: record.id, token, fiber })
+          const busy = Metrics.jobsInFlight.pipe(Metric.withAttributes({ queue: record.queue }))
+          yield* Metric.modify(busy, 1)
           const exit = yield* Effect.exit(restore(Fiber.join(fiber)))
+          yield* Metric.modify(busy, -1)
           inflight.delete(record.id)
           const wasCancelled = cancelling.delete(record.id)
 
@@ -342,7 +364,7 @@ export const make = <StoreId = JobStore>(
           // shutdown races it — cancellation wins, the job must not revive).
           if (wasCancelled && Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)) {
             yield* ackSafely(store.ack(record.id, token, { _tag: "Cancelled" }), "ack")
-            return
+            return yield* recordRun("cancelled")
           }
 
           // Distinguish worker shutdown from a handler that interrupted
@@ -355,6 +377,7 @@ export const make = <StoreId = JobStore>(
             // without consuming an attempt.
             yield* Fiber.interrupt(fiber)
             yield* ackSafely(store.release(record.id, token), "release")
+            yield* recordRun("released")
             return yield* Effect.interrupt
           }
 
@@ -396,6 +419,15 @@ export const make = <StoreId = JobStore>(
             ? { _tag: "Fail", exit: exitValue }
             : routeFailure(record, exitValue)
           yield* ackSafely(store.ack(record.id, token, outcome), "ack")
+          yield* recordRun(
+            outcome._tag === "Complete"
+              ? "completed"
+              : outcome._tag === "Retry"
+              ? "retried"
+              : outcome._tag === "Cancelled"
+              ? "cancelled"
+              : "failed"
+          )
         })
       })
 
@@ -420,6 +452,10 @@ export const make = <StoreId = JobStore>(
             lockDurationMs
           }))
           if (result._tag === "Empty") {
+            yield* Metric.update(
+              Metrics.claims.pipe(Metric.withAttributes({ queue, result: "empty" })),
+              1
+            )
             const now = yield* Clock.currentTimeMillis
             const timeout = result.nextRunAt !== undefined
               ? Math.max(0, Math.min(result.nextRunAt - now, pollMs))
@@ -430,6 +466,17 @@ export const make = <StoreId = JobStore>(
               awaitPulse(observedPulse)
             ]))
           }
+          yield* Metric.update(
+            Metrics.claims.pipe(Metric.withAttributes({ queue, result: "claimed" })),
+            1
+          )
+          const claimedAt = yield* Clock.currentTimeMillis
+          yield* Metric.update(
+            Metrics.jobWaitDuration.pipe(
+              Metric.withAttributes({ name: result.job.name, queue })
+            ),
+            Math.max(0, claimedAt - result.job.runAt)
+          )
           yield* processJob(result.job, token, restore)
         })
       )
@@ -475,16 +522,28 @@ export const make = <StoreId = JobStore>(
         lockDurationMs
       ))
       if (result.lost.length > 0) {
+        yield* Metric.update(Metrics.locksLost, result.lost.length)
         yield* Effect.logWarning(
           "effect-mq: failed to renew locks; jobs may run twice",
           result.lost
         )
+        // A lost lock stays lost: drop the flight so we neither renew nor
+        // recount it every heartbeat (the run's eventual ack surfaces
+        // LockLostError on its own).
+        for (const id of result.lost) {
+          inflight.delete(id)
+        }
       }
       // Honour cross-process cancel requests: interrupt the handler fiber;
       // processJob acks the job as Cancelled.
       for (const id of result.cancelRequested) {
         const flight = inflight.get(id)
         if (flight !== undefined) {
+          // The store re-reports the request every heartbeat until the ack
+          // lands; count the first delivery only.
+          if (!cancelling.has(id)) {
+            yield* Metric.update(Metrics.cancelInterrupts, 1)
+          }
           cancelling.add(id)
           // Delivery only — awaiting the handler's exit here would park the
           // heartbeat behind arbitrary user finalizers and starve every other
@@ -502,6 +561,19 @@ export const make = <StoreId = JobStore>(
       yield* Effect.sleep(stalledMs)
       const recovered = yield* retryStore(store.recoverStalled({ maxStalledCount }))
       if (recovered.length > 0) {
+        const failed = recovered.filter((entry) => entry.failed).length
+        if (failed > 0) {
+          yield* Metric.update(
+            Metrics.stalledRecovered.pipe(Metric.withAttributes({ outcome: "failed" })),
+            failed
+          )
+        }
+        if (recovered.length - failed > 0) {
+          yield* Metric.update(
+            Metrics.stalledRecovered.pipe(Metric.withAttributes({ outcome: "requeued" })),
+            recovered.length - failed
+          )
+        }
         yield* Effect.logWarning("effect-mq: recovered stalled jobs", recovered)
       }
     }).pipe(
@@ -523,7 +595,7 @@ export const make = <StoreId = JobStore>(
             `effect-mq: schedule "${schedule.key}" has an invalid cron/every configuration; skipping`
           )
         }
-        yield* retryStore(store.enqueue({
+        const tick = yield* retryStore(store.enqueue({
           id: JobId(`sched/${schedule.key}/${slot}`),
           name: schedule.jobName,
           queue: schedule.queue,
@@ -537,6 +609,12 @@ export const make = <StoreId = JobStore>(
           dedupe: undefined,
           delayMs: 0
         }))
+        if (!tick.duplicate) {
+          yield* Metric.update(
+            Metrics.scheduleTicks.pipe(Metric.withAttributes({ name: schedule.jobName })),
+            1
+          )
+        }
         yield* retryStore(store.advanceSchedule(schedule.key, slot, next))
       })
 
@@ -560,6 +638,26 @@ export const make = <StoreId = JobStore>(
     yield* FiberSet.run(fibers, renewalLoop)
     yield* FiberSet.run(fibers, stalledLoop)
     yield* FiberSet.run(fibers, scheduleLoop)
+
+    if (options?.queueMetricsInterval !== undefined) {
+      const sampleMs = Duration.toMillis(options.queueMetricsInterval)
+      const depthLoop = Effect.gen(function*() {
+        yield* Effect.sleep(sampleMs)
+        for (const queue of startedQueues) {
+          const counts = yield* retryStore(store.counts(queue))
+          for (const [state, depth] of Object.entries(counts)) {
+            yield* Metric.update(
+              Metrics.queueDepth.pipe(Metric.withAttributes({ queue, state })),
+              depth
+            )
+          }
+        }
+      }).pipe(
+        Effect.catchCause((cause) => Effect.logWarning("effect-mq: queue depth sampling failed", cause)),
+        Effect.forever
+      )
+      yield* FiberSet.run(fibers, depthLoop)
+    }
 
     // SAFETY: the public `register` signature declares Scope, the handler's R
     // and the codec services as requirements; the implementation erases them

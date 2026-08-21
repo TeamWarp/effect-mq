@@ -4,6 +4,16 @@ All notable changes to `effect-mq`. Versions follow 0.x semver: **minor
 bumps may break** (the `JobStore` driver contract in particular); patch
 bumps are additive.
 
+## 0.3.1 (unreleased)
+
+- **Effect `Metric` integration** — the new `Metrics` module exposes the
+  instruments workers and producers emit: enqueues, runs + durations by
+  outcome, queue latency (`effect_mq_job_wait_duration_ms`), claim churn,
+  in-flight and depth gauges (opt-in `queueMetricsInterval` sampler), lock
+  losses, cancel interrupts, stall recoveries, and schedule ticks. Metrics
+  are process-local — export them with your observability stack; durable
+  history stays in the store (`counts()`, the attempt ledger).
+
 ## 0.3.0 (unreleased)
 
 - **Retention split by terminal state** — both per-job `keep` and the

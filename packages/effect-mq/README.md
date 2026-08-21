@@ -171,6 +171,34 @@ DrizzleJobStore.layer({ ...tables, historyTtl: { completed: "1 day", failed: "90
 The sweep honours `min(per-row keep.age, ceiling)`, so a job name that goes
 quiet is still pruned on the timer, not only when its group is next acked.
 
+## Metrics
+
+Workers and producers emit Effect `Metric` instruments (exported as the
+`Metrics` module). They are **process-local operational signal, not
+persisted state** — wire up any Effect-compatible exporter (the Otlp modules
+from `effect/unstable/observability`, `@effect/opentelemetry`, Prometheus)
+and retention lives in your metrics backend. The *durable* analogues stay in
+the store: `store.counts()` for live depth, the attempt ledger for per-run
+history — both queryable forever.
+
+| Metric | Type | Tags |
+| --- | --- | --- |
+| `effect_mq_jobs_enqueued` | counter | `name`, `queue`, `duplicate` |
+| `effect_mq_job_runs` | counter | `name`, `queue`, `outcome` |
+| `effect_mq_job_run_duration_ms` | histogram | `name`, `queue`, `outcome` |
+| `effect_mq_job_wait_duration_ms` | histogram | `name`, `queue` |
+| `effect_mq_claims` | counter | `queue`, `result` (claimed/empty) |
+| `effect_mq_jobs_in_flight` | gauge | `queue` |
+| `effect_mq_queue_depth` | gauge | `queue`, `state` (opt-in sampler) |
+| `effect_mq_locks_lost` / `effect_mq_cancel_interrupts` | counter | — |
+| `effect_mq_stalled_recovered` | counter | `outcome` |
+| `effect_mq_schedule_ticks` | counter | `name` |
+
+`job_wait_duration_ms` is the queue-latency headline: time between a job
+becoming runnable and its claim. Depth sampling costs one `counts()` query
+per queue per tick, so it is opt-in:
+`Worker.layer({ queueMetricsInterval: "15 seconds" })`.
+
 ## Custom job ids
 
 Store-assigned ids default to a compact sequence (`j-<n>`). Bring your own
@@ -475,6 +503,7 @@ handler).
 | `maxStalledCount` | 1 | stalls tolerated before a job is failed outright |
 | `pollInterval` | 5s | idle fallback when no wake-up arrives (wake-ups are queue-filtered and push-based, so the default is fine even on Postgres) |
 | `scheduleSweepInterval` | 15s | how often to tick due repeatable-job schedules |
+| `queueMetricsInterval` | off | sample `store.counts()` per queue into the depth gauge |
 | `id` | random | identifier used in lock tokens |
 
 **Store construction** — every driver accepts `idGenerator`, `historyTtl`,

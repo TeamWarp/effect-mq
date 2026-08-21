@@ -49,6 +49,8 @@ const producer = Effect.gen(function*() {
   queue `pause`/`resume`, and unrecoverable errors that skip the retry budget.
 - **Deduplication**: pending-dedup, throttle, debounce, and
   replace-while-delayed — a separate dedup key that never rewrites job ids.
+- **Metrics**: Effect `Metric` instruments for runs, durations, queue
+  latency, depth, and worker health — export with your observability stack.
 - **Drizzle-native Postgres**: the job tables are drizzle-postgres schema
   factories you re-export — drizzle-kit owns migrations; queries are fully
   typed including the job-name union. `FOR UPDATE SKIP LOCKED` claims,
