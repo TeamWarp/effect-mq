@@ -23,10 +23,11 @@
  */
 import type * as JobStore from "../JobStore.ts"
 import { sql } from "drizzle-orm"
-import { bigint, index, integer, jsonb, pgTable, primaryKey, text, timestamp } from "drizzle-orm/pg-core"
+import { bigint, boolean, index, integer, jsonb, pgTable, primaryKey, text, timestamp } from "drizzle-orm/pg-core"
 
 type JobId = JobStore.JobId
 type QueueName = JobStore.QueueName
+type ScheduleKey = JobStore.ScheduleKey
 type JobState = JobStore.JobState
 type BackoffPolicy = JobStore.BackoffPolicy
 type KeepPolicy = JobStore.KeepPolicy
@@ -55,6 +56,8 @@ export const mqJobs = <JobName extends string = string>(
     stalledCount: integer("stalled_count").notNull().default(0),
     backoff: jsonb("backoff").$type<BackoffPolicy>(),
     keep: jsonb("keep").$type<KeepPolicy>(),
+    timeoutMs: bigint("timeout_ms", { mode: "number" }),
+    cancelRequested: boolean("cancel_requested").notNull().default(false),
     runAt: timestamp("run_at", { withTimezone: true, mode: "date" }).notNull(),
     enqueuedAt: timestamp("enqueued_at", { withTimezone: true, mode: "date" }).notNull(),
     processedAt: timestamp("processed_at", { withTimezone: true, mode: "date" }),
@@ -106,6 +109,42 @@ export const mqJobAttempts = (
   ])
 
 /**
+ * Repeatable-job schedules (one row per `Job.schedule` key).
+ *
+ * @since 0.2.0
+ */
+export const mqSchedules = (tableName = "effect_mq_schedules") =>
+  pgTable(tableName, {
+    key: text("key").primaryKey().$type<ScheduleKey>(),
+    jobName: text("job_name").notNull(),
+    queue: text("queue").notNull().$type<QueueName>(),
+    cron: text("cron"),
+    tz: text("tz"),
+    everyMs: bigint("every_ms", { mode: "number" }),
+    payload: jsonb("payload"),
+    metadata: jsonb("metadata").notNull().default({}).$type<Record<string, string>>(),
+    priority: integer("priority").notNull().default(0),
+    attemptsMax: integer("attempts_max").notNull(),
+    backoff: jsonb("backoff").$type<BackoffPolicy>(),
+    keep: jsonb("keep").$type<KeepPolicy>(),
+    timeoutMs: bigint("timeout_ms", { mode: "number" }),
+    nextRunAt: timestamp("next_run_at", { withTimezone: true, mode: "date" }).notNull()
+  }, (table) => [
+    index(`${tableName}_due_idx`).on(table.nextRunAt)
+  ])
+
+/**
+ * Durable queue control flags (pause/resume).
+ *
+ * @since 0.2.0
+ */
+export const mqQueueControl = (tableName = "effect_mq_queue_control") =>
+  pgTable(tableName, {
+    queue: text("queue").primaryKey().$type<QueueName>(),
+    paused: boolean("paused").notNull().default(false)
+  })
+
+/**
  * @since 0.1.0
  */
 export type MqJobsTable = ReturnType<typeof mqJobs<any>>
@@ -114,3 +153,13 @@ export type MqJobsTable = ReturnType<typeof mqJobs<any>>
  * @since 0.1.0
  */
 export type MqJobAttemptsTable = ReturnType<typeof mqJobAttempts>
+
+/**
+ * @since 0.2.0
+ */
+export type MqSchedulesTable = ReturnType<typeof mqSchedules>
+
+/**
+ * @since 0.2.0
+ */
+export type MqQueueControlTable = ReturnType<typeof mqQueueControl>

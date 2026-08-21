@@ -337,6 +337,8 @@ describe("Worker", () => {
         yield* Deferred.await(done)
         expect(ran).toBe(1)
 
+        // The handler runs in a child fiber; give the run loop a beat to ack.
+        yield* settle
         const status = yield* store.getJob(id)
         assert(Option.isSome(status))
         expect(status.value.state).toBe("completed")
@@ -819,6 +821,7 @@ describe("Worker hardening", () => {
           attemptsMax: 1,
           backoff: undefined,
           keep: undefined,
+          timeoutMs: undefined,
           delayMs: 0
         })
         yield* settle

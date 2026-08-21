@@ -39,7 +39,13 @@ const producer = Effect.gen(function*() {
   business-critical runs, memory/Redis for disposable ones) — wiring enforced
   at compile time.
 - **Dashboard data layer**: `list` with metadata filters and keyset
-  pagination, `poll`, `retry`, per-job `keep` retention.
+  pagination, `poll`, `retry`, per-job `keep` retention plus a per-store
+  `historyTtl` ceiling.
+- **Repeatable jobs**: durable cron/interval schedules with slot-deterministic
+  ids — exactly one job per occurrence across any number of workers.
+- **Fiber-native control**: handler `timeout`s, cross-process `cancel` of
+  running jobs (the handler fiber is interrupted, finalizers run), `promote`,
+  queue `pause`/`resume`, and unrecoverable errors that skip the retry budget.
 - **Drizzle-native Postgres**: the job tables are drizzle schema factories you
   re-export — drizzle-kit owns migrations; queries are fully typed including
   the job-name union. `FOR UPDATE SKIP LOCKED` claims, LISTEN/NOTIFY
@@ -82,7 +88,7 @@ container) on every push and PR. Publishing to npm happens on version tags:
 
 ```sh
 # bump "version" in packages/effect-mq/package.json, then
-git tag v0.1.0 && git push --tags
+git tag v0.2.0 && git push --tags
 ```
 
 The publish job runs `npm publish` with provenance; it needs an `NPM_TOKEN`

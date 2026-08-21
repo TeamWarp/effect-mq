@@ -2,7 +2,7 @@ import * as JobStore from "../../src/JobStore.ts"
 import { PgClient } from "@effect/sql-pg"
 import { Effect, Layer, Redacted } from "effect"
 import * as net from "node:net"
-import { DrizzleJobStore, mqJobAttempts, mqJobs } from "../../src/drizzle/index.ts"
+import { DrizzleJobStore, mqJobAttempts, mqJobs, mqQueueControl, mqSchedules } from "../../src/drizzle/index.ts"
 
 export const pgUrl = process.env.EFFECT_MQ_PG_URL ??
   "postgres://postgres:postgres@localhost:5433/effect_mq_test"
@@ -31,7 +31,12 @@ export const pgClientLive = (): Layer.Layer<PgClient.PgClient> =>
  * DDL matching the schema factories exactly (the drift test keeps them
  * honest). Real applications get this from drizzle-kit migrations instead.
  */
-export const createTablesSql = (jobs: string, attempts: string): ReadonlyArray<string> => [
+export const createTablesSql = (
+  jobs: string,
+  attempts: string,
+  schedules: string,
+  queues: string
+): ReadonlyArray<string> => [
   `CREATE TABLE "${jobs}" (
     id text PRIMARY KEY,
     name text NOT NULL,
@@ -46,6 +51,8 @@ export const createTablesSql = (jobs: string, attempts: string): ReadonlyArray<s
     stalled_count integer NOT NULL DEFAULT 0,
     backoff jsonb,
     keep jsonb,
+    timeout_ms bigint,
+    cancel_requested boolean NOT NULL DEFAULT false,
     run_at timestamptz NOT NULL,
     enqueued_at timestamptz NOT NULL,
     processed_at timestamptz,
@@ -69,6 +76,27 @@ export const createTablesSql = (jobs: string, attempts: string): ReadonlyArray<s
     finished_at timestamptz NOT NULL,
     exit jsonb,
     PRIMARY KEY (job_id, attempt)
+  )`,
+  `CREATE TABLE "${schedules}" (
+    key text PRIMARY KEY,
+    job_name text NOT NULL,
+    queue text NOT NULL,
+    cron text,
+    tz text,
+    every_ms bigint,
+    payload jsonb,
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    priority integer NOT NULL DEFAULT 0,
+    attempts_max integer NOT NULL,
+    backoff jsonb,
+    keep jsonb,
+    timeout_ms bigint,
+    next_run_at timestamptz NOT NULL
+  )`,
+  `CREATE INDEX "${schedules}_due_idx" ON "${schedules}" (next_run_at)`,
+  `CREATE TABLE "${queues}" (
+    queue text PRIMARY KEY,
+    paused boolean NOT NULL DEFAULT false
   )`
 ]
 
@@ -77,7 +105,9 @@ export const freshTableNames = () => {
   const suffix = `${Date.now().toString(36)}_${++tableCounter}_${Math.random().toString(36).slice(2, 6)}`
   return {
     jobs: `mq_jobs_${suffix}`,
-    attempts: `mq_att_${suffix}`
+    attempts: `mq_att_${suffix}`,
+    schedules: `mq_sched_${suffix}`,
+    queues: `mq_q_${suffix}`
   }
 }
 
@@ -90,16 +120,18 @@ export const freshStoreEffect = Effect.gen(function*() {
   const names = freshTableNames()
   const jobs = mqJobs(names.jobs)
   const attempts = mqJobAttempts(jobs, names.attempts)
-  for (const statement of createTablesSql(names.jobs, names.attempts)) {
+  const schedules = mqSchedules(names.schedules)
+  const queues = mqQueueControl(names.queues)
+  for (const statement of createTablesSql(names.jobs, names.attempts, names.schedules, names.queues)) {
     yield* client.unsafe(statement)
   }
   yield* Effect.addFinalizer(() =>
     client.unsafe(
-      `DROP TABLE IF EXISTS "${names.attempts}", "${names.jobs}" CASCADE`
+      `DROP TABLE IF EXISTS "${names.attempts}", "${names.jobs}", "${names.schedules}", "${names.queues}" CASCADE`
     ).pipe(Effect.ignore)
   )
-  const store = yield* DrizzleJobStore.make({ jobs, attempts })
-  return { store, jobs, attempts, names }
+  const store = yield* DrizzleJobStore.make({ jobs, attempts, schedules, queues })
+  return { store, jobs, attempts, schedules, queues, names }
 }).pipe(Effect.orDie)
 
 export const freshStoreLayer = (): Layer.Layer<JobStore.JobStore> =>

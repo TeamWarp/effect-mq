@@ -73,6 +73,89 @@ What you get out of the box:
   and per-job retention via `keep: { count, age }`.
 - **Graceful shutdown** — interrupting a worker releases in-flight jobs back
   to `waiting` without consuming an attempt.
+- **Repeatable jobs** — durable cron/interval schedules
+  (`MyJob.schedule(key, { cron })`) that fire exactly once per occurrence
+  across any number of workers.
+- **Admin verbs** — `cancel` (including *running* jobs, whose handler fiber is
+  interrupted cross-process), `promote` (delayed → now), and queue-level
+  `pause`/`resume`.
+- **Handler timeouts** — `defaults: { timeout: "30 seconds" }` interrupts the
+  handler cleanly and routes through normal retry accounting; something BullMQ
+  can't do to a running processor.
+- **Unrecoverable errors** — `Job.unrecoverable(error)` or a `retryable`
+  predicate skips the remaining retry budget when retrying can't help.
+
+## Repeatable jobs
+
+Schedules are durable rows in the store — not process-local timers — so they
+survive restarts and coordinate across workers. Ticks enqueue with a
+slot-deterministic job id (`sched/<key>/<slot>`), which makes every occurrence
+exactly-once no matter how many workers sweep:
+
+```ts
+// Create or replace (same key = replace; upsert is idempotent to deploy).
+yield* SendDigest.schedule("daily", {
+  cron: "0 9 * * *",              // or: every: "10 minutes"
+  tz: "America/New_York",         // IANA zone, cron only
+  payload: { edition: "morning" }
+})
+
+yield* SendDigest.unschedule("daily")
+```
+
+`cron` fires at the next matching occurrence; `every` first fires one interval
+from now and stays on its original grid. If workers are down over several
+occurrences, missed slots collapse into one run (the next sweep enqueues the
+overdue slot once, then advances past `now`). Options mirror `enqueue`:
+`metadata`, `priority`, `attempts`, `backoff`, `keep`, `timeout`.
+
+## Timeouts, cancellation, and unrecoverable errors
+
+Because handlers are Effect fibers, the runtime can *actually stop them* —
+these verbs interrupt cleanly (finalizers run) instead of abandoning work:
+
+```ts
+class SyncBenefits extends Job.make("sync-benefits", {
+  payload: { employerId: Schema.String },
+  error: SyncError,
+  defaults: { attempts: 5, timeout: "2 minutes" },  // per-run limit
+  retryable: (e) => e.reason !== "employer-deleted" // skip retries when futile
+}) {}
+
+// Inside a handler, mark a specific failure as not worth retrying:
+Effect.fail(Job.unrecoverable(new SyncError({ reason: "plan misconfigured" })))
+
+// From anywhere (a dashboard, another process):
+yield* SyncBenefits.cancel(jobId)   // waiting/delayed: terminal immediately;
+                                    // running: the worker's next heartbeat
+                                    // interrupts the handler fiber
+yield* SyncBenefits.promote(jobId)  // delayed -> runnable now
+
+// Store-level (definition-free) equivalents for generic dashboards:
+const store = yield* JobStore.JobStore
+yield* store.cancel(jobId)
+yield* store.pause(QueueName("email"))   // claims stop; producers unaffected
+yield* store.resume(QueueName("email"))  // wakes idle workers immediately
+```
+
+A timed-out run records a `TimeoutError` defect in the attempt ledger and
+consumes an attempt like any other failure. A cancelled job lands in the
+terminal `cancelled` state with a `cancelled` ledger entry; `awaitResult`
+treats it as a defect (`JobCancelledError`), not a typed failure.
+
+## History retention
+
+Two layers of control:
+
+- **Per job**: `keep: { count, age }` prunes terminal records per name+state
+  at ack time.
+- **Per store**: a retention ceiling applied to *all* terminal records,
+  swept periodically in the background:
+
+```ts
+MemoryJobStore.layerWith({ historyTtl: "7 days" })
+DrizzleJobStore.layer({ jobs, attempts, schedules, queues, historyTtl: "90 days" })
+```
 
 ## Postgres through drizzle
 
@@ -93,13 +176,15 @@ migrations** — no library-run DDL, no parallel migration system:
 
 ```ts
 // db/schema.ts
-import { mqJobAttempts, mqJobs } from "effect-mq/drizzle"
+import { mqJobAttempts, mqJobs, mqQueueControl, mqSchedules } from "effect-mq/drizzle"
 
 // The `name` column is typed to your job tags (derived, not hand-written):
 type JobNames = typeof SyncBenefits._tag | typeof GenerateReport._tag
 
 export const jobs = mqJobs<JobNames>()          // default table: effect_mq_jobs
 export const jobAttempts = mqJobAttempts(jobs)  // default: effect_mq_job_attempts
+export const jobSchedules = mqSchedules()       // default: effect_mq_schedules
+export const jobQueues = mqQueueControl()       // default: effect_mq_queue_control
 ```
 
 ```
@@ -116,9 +201,14 @@ When a future effect-mq version changes the layout, the factory changes and
 import { DrizzleJobStore } from "effect-mq/drizzle"
 import { PgClient } from "@effect/sql-pg"
 import { Layer, Redacted } from "effect"
-import { jobAttempts, jobs } from "./db/schema.ts"
+import { jobAttempts, jobQueues, jobs, jobSchedules } from "./db/schema.ts"
 
-const JobStoreLive = DrizzleJobStore.layer({ jobs, attempts: jobAttempts }).pipe(
+const JobStoreLive = DrizzleJobStore.layer({
+  jobs,
+  attempts: jobAttempts,
+  schedules: jobSchedules,
+  queues: jobQueues
+}).pipe(
   Layer.provide(PgClient.layer({ url: Redacted.make(process.env.DATABASE_URL!) }))
 )
 ```
@@ -209,8 +299,10 @@ Both behaviors are pinned by tests.
 
 Implement the `JobStore` service (one atomic seam: `enqueue`, `claim`, `ack`,
 `release`, `extendLocks`, `recoverStalled`, `awaitWake`, `getJob`,
-`getAttempts`, `list`, `retry`, `counts`, `remove`) and run the conformance
-suite against it:
+`getAttempts`, `list`, `retry`, `counts`, `remove`, `cancel`, `promote`,
+`pause`/`resume`/`pausedQueues`, and the schedule ops
+`upsertSchedule`/`removeSchedule`/`listSchedules`/`dueSchedules`/`advanceSchedule`)
+and run the conformance suite against it:
 
 ```ts
 import { jobStoreConformance } from "effect-mq/testing"
@@ -226,9 +318,8 @@ suite in this repo runs the same conformance tests against a real database.
 
 ## Roadmap
 
-Next up: repeatable/cron jobs, handler timeouts + unrecoverable errors,
-dashboard admin verbs (pause/promote/cancel), per-store history TTL, richer
-deduplication (throttle/debounce), trace propagation and an event stream, a
+Next up: richer deduplication (throttle/debounce), trace propagation, a
+cross-process event stream, batch enqueue, drizzle schema customization, a
 Redis store, and parent-child fan-out. Full prioritized list:
 [ROADMAP.md](https://github.com/TeamWarp/effect-mq/blob/main/ROADMAP.md).
 

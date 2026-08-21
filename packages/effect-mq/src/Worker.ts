@@ -14,18 +14,21 @@
  *
  * @since 0.1.0
  */
-import { Cause, Clock, Context, Deferred, Duration, Effect, Exit, FiberSet, Layer, Schedule, Schema, type Scope, Scope as Scope_, Tracer } from "effect"
+import { Cause, Clock, Context, Deferred, Duration, Effect, Exit, Fiber, FiberSet, Layer, Option, Result, Schedule, Schema, type Scope, Scope as Scope_, Tracer } from "effect"
 import {
   type AckOutcome,
   type BackoffPolicy,
-  type JobId,
   isJobStoreError,
+  isMarkedUnrecoverable,
+  JobId,
   type JobNotFoundError,
   type JobRecord,
   JobStore,
   type JobStoreError,
   type LockLostError,
+  nextOccurrence,
   QueueName,
+  type ScheduleRecord,
   type Service as StoreService
 } from "./JobStore.ts"
 
@@ -70,6 +73,8 @@ export interface JobDescriptor<
   readonly exitSchema: Schema.Top & {
     readonly Type: Exit.Exit<Success["Type"], Error["Type"]>
   }
+  /** When present and returning false for a typed error, retries are skipped. */
+  readonly retryable: ((error: Error["Type"]) => boolean) | undefined
 }
 
 /**
@@ -110,6 +115,8 @@ export interface WorkerOptions<StoreId = JobStore> {
   readonly maxStalledCount?: number | undefined
   /** Fallback polling interval when idle and no wake-up arrives (default 5s). */
   readonly pollInterval?: Duration.Input | undefined
+  /** How often to tick due repeatable-job schedules (default 15s). */
+  readonly scheduleSweepInterval?: Duration.Input | undefined
   /** Identifier used in lock tokens (default: random). */
   readonly id?: string | undefined
 }
@@ -149,6 +156,18 @@ interface HandlerEntry {
   readonly encodeExit: (
     exit: Exit.Exit<unknown, unknown>
   ) => Effect.Effect<JobRecord["exit"], unknown>
+  readonly unrecoverableFailure:
+    | ((cause: Cause.Cause<unknown>) => boolean)
+    | undefined
+}
+
+// A cause is unrecoverable when its error or defect was marked via
+// `Job.unrecoverable` (identity-based, so typed channels stay untouched).
+const causeIsMarkedUnrecoverable = (cause: Cause.Cause<unknown>): boolean => {
+  const failure = Cause.findErrorOption(cause)
+  if (Option.isSome(failure) && isMarkedUnrecoverable(failure.value)) return true
+  const die = Cause.findDie(cause)
+  return Result.isSuccess(die) && isMarkedUnrecoverable(die.success.defect)
 }
 
 /**
@@ -204,6 +223,7 @@ export const make = <StoreId = JobStore>(
       ? Duration.toMillis(options.lockRenewInterval)
       : Math.max(1, Math.floor(lockDurationMs / 2))
     const stalledMs = Duration.toMillis(options?.stalledInterval ?? 30_000)
+    const scheduleSweepMs = Duration.toMillis(options?.scheduleSweepInterval ?? 15_000)
     const maxStalledCount = options?.maxStalledCount ?? 1
     const pollMs = Duration.toMillis(options?.pollInterval ?? 5_000)
     const workerId = options?.id ?? `worker-${Math.random().toString(36).slice(2, 10)}`
@@ -211,7 +231,13 @@ export const make = <StoreId = JobStore>(
     const handlers = new Map<string, HandlerEntry>()
     const queueNames = new Map<QueueName, Set<string>>()
     const startedQueues = new Set<QueueName>()
-    const inflight = new Map<JobId, { readonly id: JobId; readonly token: string }>()
+    const inflight = new Map<
+      JobId,
+      { readonly id: JobId; readonly token: string; readonly fiber: Fiber.Fiber<unknown, unknown> }
+    >()
+    // Jobs this worker is interrupting because of a cancel request; their
+    // interrupt-only exits ack as Cancelled instead of shutdown-release.
+    const cancelling = new Set<JobId>()
 
     let tokenCounter = 0
     const nextToken = () => `${workerId}:${++tokenCounter}`
@@ -285,17 +311,49 @@ export const make = <StoreId = JobStore>(
           attempt: record.attemptsMade + 1,
           attemptsMax: record.attemptsMax
         }
-        inflight.set(record.id, { id: record.id, token })
         return Effect.gen(function*() {
-          const exit = yield* Effect.exit(restore(entry.run(record.payload, context)))
+          // The per-run time limit interrupts the handler internally; surface
+          // it as a defect so it flows through normal retry accounting.
+          // timeoutOrElse (not timeout + a catch on TimeoutError) so a
+          // handler's OWN typed TimeoutError failure stays a typed failure.
+          const handlerEffect = record.timeoutMs === undefined
+            ? entry.run(record.payload, context)
+            : entry.run(record.payload, context).pipe(
+              Effect.timeoutOrElse({
+                duration: record.timeoutMs,
+                orElse: () =>
+                  Effect.die(
+                    new Cause.TimeoutError(
+                      `effect-mq: job "${record.name}" timed out after ${record.timeoutMs}ms`
+                    )
+                  )
+              })
+            )
+          // The handler runs in a child fiber so a cross-process cancel can
+          // interrupt THIS job without killing the taker loop; `restore`
+          // keeps the child interruptible while the fork itself is masked.
+          const fiber = yield* Effect.forkChild(restore(handlerEffect))
+          inflight.set(record.id, { id: record.id, token, fiber })
+          const exit = yield* Effect.exit(restore(Fiber.join(fiber)))
           inflight.delete(record.id)
+          const wasCancelled = cancelling.delete(record.id)
+
+          // A cancel-request interrupt is terminal: ack Cancelled (even if a
+          // shutdown races it — cancellation wins, the job must not revive).
+          if (wasCancelled && Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)) {
+            yield* ackSafely(store.ack(record.id, token, { _tag: "Cancelled" }), "ack")
+            return
+          }
 
           // Distinguish worker shutdown from a handler that interrupted
           // itself: entering an interruptible region while an external
           // interrupt is pending fails immediately.
           const shutdown = yield* Effect.exit(restore(Effect.void))
           if (Exit.isFailure(shutdown)) {
-            // Worker shutdown: give the job back without consuming an attempt.
+            // Worker shutdown: stop the handler (the join above may have been
+            // interrupted before the child finished), then give the job back
+            // without consuming an attempt.
+            yield* Fiber.interrupt(fiber)
             yield* ackSafely(store.release(record.id, token), "release")
             return yield* Effect.interrupt
           }
@@ -324,12 +382,18 @@ export const make = <StoreId = JobStore>(
           }
           const exitValue = Exit.isSuccess(encoded) ? encoded.value : undefined
 
+          const unrecoverable = Exit.isFailure(effective) && (
+            causeIsMarkedUnrecoverable(effective.cause) ||
+            entry.unrecoverableFailure?.(effective.cause) === true
+          )
           const outcome: AckOutcome = Exit.isSuccess(effective)
             ? encodable
               // A success whose value can't be encoded must NOT re-run (its
               // side effects already happened) — fail it with the defect.
               ? { _tag: "Complete", exit: exitValue }
               : { _tag: "Fail", exit: exitValue }
+            : unrecoverable
+            ? { _tag: "Fail", exit: exitValue }
             : routeFailure(record, exitValue)
           yield* ackSafely(store.ack(record.id, token, outcome), "ack")
         })
@@ -406,12 +470,28 @@ export const make = <StoreId = JobStore>(
       yield* Effect.sleep(lockRenewMs)
       const entries = Array.from(inflight.values())
       if (entries.length === 0) return
-      const lost = yield* retryStore(store.extendLocks(entries, lockDurationMs))
-      if (lost.length > 0) {
+      const result = yield* retryStore(store.extendLocks(
+        entries.map((entry) => ({ id: entry.id, token: entry.token })),
+        lockDurationMs
+      ))
+      if (result.lost.length > 0) {
         yield* Effect.logWarning(
           "effect-mq: failed to renew locks; jobs may run twice",
-          lost
+          result.lost
         )
+      }
+      // Honour cross-process cancel requests: interrupt the handler fiber;
+      // processJob acks the job as Cancelled.
+      for (const id of result.cancelRequested) {
+        const flight = inflight.get(id)
+        if (flight !== undefined) {
+          cancelling.add(id)
+          // Delivery only — awaiting the handler's exit here would park the
+          // heartbeat behind arbitrary user finalizers and starve every other
+          // in-flight job's lock renewal. processJob's join observes the exit
+          // and acks Cancelled.
+          yield* Effect.sync(() => flight.fiber.interruptUnsafe())
+        }
       }
     }).pipe(
       Effect.catchCause((cause) => Effect.logError("effect-mq: lock renewal failed", cause)),
@@ -429,8 +509,56 @@ export const make = <StoreId = JobStore>(
       Effect.forever
     )
 
+    // Tick one due repeatable-job schedule. The enqueue id is deterministic
+    // per (schedule, slot), so concurrent sweepers across workers dedup
+    // naturally; advanceSchedule is conditional, so double-advances are
+    // no-ops.
+    const sweepSchedule = (schedule: ScheduleRecord) =>
+      Effect.gen(function*() {
+        const now = yield* Clock.currentTimeMillis
+        const slot = schedule.nextRunAt
+        const next = nextOccurrence(schedule, slot, now)
+        if (next === undefined) {
+          return yield* Effect.logError(
+            `effect-mq: schedule "${schedule.key}" has an invalid cron/every configuration; skipping`
+          )
+        }
+        yield* retryStore(store.enqueue({
+          id: JobId(`sched/${schedule.key}/${slot}`),
+          name: schedule.jobName,
+          queue: schedule.queue,
+          payload: schedule.payload,
+          metadata: { ...schedule.metadata, scheduledFor: new Date(slot).toISOString() },
+          priority: schedule.priority,
+          attemptsMax: schedule.attemptsMax,
+          backoff: schedule.backoff,
+          keep: schedule.keep,
+          timeoutMs: schedule.timeoutMs,
+          delayMs: 0
+        }))
+        yield* retryStore(store.advanceSchedule(schedule.key, slot, next))
+      })
+
+    // Each due schedule is swept in isolation so one poison row (bad cron,
+    // storage error) can never starve the rest of the sweep.
+    const scheduleLoop = Effect.gen(function*() {
+      yield* Effect.sleep(scheduleSweepMs)
+      const due = yield* retryStore(store.dueSchedules())
+      for (const schedule of due) {
+        yield* sweepSchedule(schedule).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logError(`effect-mq: sweep of schedule "${schedule.key}" failed`, cause)
+          )
+        )
+      }
+    }).pipe(
+      Effect.catchCause((cause) => Effect.logError("effect-mq: schedule sweep failed", cause)),
+      Effect.forever
+    )
+
     yield* FiberSet.run(fibers, renewalLoop)
     yield* FiberSet.run(fibers, stalledLoop)
+    yield* FiberSet.run(fibers, scheduleLoop)
 
     // SAFETY: the public `register` signature declares Scope, the handler's R
     // and the codec services as requirements; the implementation erases them
@@ -471,6 +599,7 @@ export const make = <StoreId = JobStore>(
                 Context.merge(input, services) as Context.Context<unknown>
               )
             ) as Effect.Effect<A, E>
+          const retryable = job.retryable
           const entry: HandlerEntry = {
             run: (payload, context) =>
               provideCaptured(
@@ -479,7 +608,20 @@ export const make = <StoreId = JobStore>(
                   Effect.flatMap((decoded) => handler(decoded, context))
                 )
               ),
-            encodeExit: (exit) => provideCaptured(encodeExit(exit))
+            encodeExit: (exit) => provideCaptured(encodeExit(exit)),
+            unrecoverableFailure: retryable === undefined ? undefined : (cause) => {
+              const failure = Cause.findErrorOption(cause)
+              if (Option.isNone(failure)) return false
+              try {
+                // SAFETY: the only typed failures a handler can produce are
+                // its declared error type, which is what `retryable` accepts.
+                return !retryable(failure.value as Parameters<typeof retryable>[0])
+              } catch {
+                // A throwing predicate must never leave the job un-acked:
+                // treat the failure as retryable and let the budget decide.
+                return false
+              }
+            }
           }
           handlers.set(name, entry)
           const queue = registerOptions?.queue !== undefined

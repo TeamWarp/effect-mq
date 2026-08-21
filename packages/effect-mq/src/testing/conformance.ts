@@ -35,6 +35,7 @@ const baseRequest = (
   attemptsMax: 1,
   backoff: undefined,
   keep: undefined,
+  timeoutMs: undefined,
   delayMs: 0,
   ...overrides
 })
@@ -320,11 +321,12 @@ export const jobStoreConformance = (
           )
           assert(claim._tag === "Claimed")
 
-          const lost = yield* store.extendLocks(
+          const result = yield* store.extendLocks(
             [{ id, token: "t-1" }, { id: JobId("ghost"), token: "t-9" }],
             20_000
           )
-          expect(lost).toEqual(["ghost"])
+          expect(result.lost).toEqual(["ghost"])
+          expect(result.cancelRequested).toEqual([])
 
           // The extension outlives the original lock duration.
           yield* TestClock.adjust(15_000)
@@ -620,7 +622,8 @@ export const jobStoreConformance = (
             delayed: 1,
             active: 1,
             completed: 0,
-            failed: 0
+            failed: 0,
+            cancelled: 0
           })
           const other = yield* store.counts(QueueName("other"))
           expect(other.waiting).toBe(1)
@@ -648,6 +651,352 @@ export const jobStoreConformance = (
       withStore((store) =>
         Effect.gen(function*() {
           expect(yield* store.getAttempts(JobId("nope"))).toEqual([])
+        })
+      ))
+
+    it.effect("cancel makes waiting and delayed jobs terminal with a ledger entry", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const waiting = yield* store.enqueue(baseRequest())
+          const delayed = yield* store.enqueue(baseRequest({ delayMs: 60_000 }))
+          yield* store.cancel(waiting.id)
+          yield* store.cancel(delayed.id)
+
+          for (const id of [waiting.id, delayed.id]) {
+            const job = yield* store.getJob(id)
+            assert(Option.isSome(job))
+            expect(job.value.state).toBe("cancelled")
+            expect(job.value.finishedAt).toBeDefined()
+            const attempts = yield* store.getAttempts(id)
+            expect(attempts.map((attempt) => attempt.outcome)).toEqual(["cancelled"])
+          }
+          const claim = yield* store.claim(claimOptions())
+          assert(claim._tag === "Empty")
+
+          // Terminal jobs cannot be cancelled again; unknown ids are reported.
+          const again = yield* Effect.flip(store.cancel(waiting.id))
+          expect(again._tag).toBe("JobNotCancellableError")
+          const missing = yield* Effect.flip(store.cancel(JobId("nope")))
+          expect(missing._tag).toBe("JobNotFoundError")
+        })
+      ))
+
+    it.effect("cancel on an active job flags it; the heartbeat reports it; ack Cancelled finishes it", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const { id } = yield* store.enqueue(baseRequest())
+          const claim = yield* store.claim(claimOptions())
+          assert(claim._tag === "Claimed")
+
+          yield* store.cancel(id)
+          const flagged = yield* store.getJob(id)
+          assert(Option.isSome(flagged))
+          expect(flagged.value.state).toBe("active")
+          expect(flagged.value.cancelRequested).toBe(true)
+
+          // The heartbeat surfaces the request instead of extending the lock.
+          const heartbeat = yield* store.extendLocks([{ id, token: "t-1" }], 20_000)
+          expect(heartbeat.cancelRequested).toEqual([id])
+          expect(heartbeat.lost).toEqual([])
+
+          yield* store.ack(id, "t-1", { _tag: "Cancelled" })
+          const done = yield* store.getJob(id)
+          assert(Option.isSome(done))
+          expect(done.value.state).toBe("cancelled")
+          expect(done.value.cancelRequested).toBe(false)
+          const attempts = yield* store.getAttempts(id)
+          expect(attempts.map((attempt) => attempt.outcome)).toEqual(["cancelled"])
+        })
+      ))
+
+    it.effect("release and stall recovery honour a pending cancel request", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          // release path
+          const first = yield* store.enqueue(baseRequest())
+          const claimA = yield* store.claim(claimOptions())
+          assert(claimA._tag === "Claimed")
+          yield* store.cancel(first.id)
+          yield* store.release(first.id, "t-1")
+          const released = yield* store.getJob(first.id)
+          assert(Option.isSome(released))
+          expect(released.value.state).toBe("cancelled")
+
+          // stall path
+          const second = yield* store.enqueue(baseRequest({ payload: { n: 2 } }))
+          const claimB = yield* store.claim(claimOptions({ token: "t-2", lockDurationMs: 1_000 }))
+          assert(claimB._tag === "Claimed")
+          yield* store.cancel(second.id)
+          yield* TestClock.adjust(1_000)
+          const recovered = yield* store.recoverStalled({ maxStalledCount: 5 })
+          // Cancelled-by-recovery jobs are not reported as stalled recoveries.
+          expect(recovered).toEqual([])
+          const swept = yield* store.getJob(second.id)
+          assert(Option.isSome(swept))
+          expect(swept.value.state).toBe("cancelled")
+        })
+      ))
+
+    it.effect("promote runs a delayed job now and rejects other states", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const { id } = yield* store.enqueue(baseRequest({ delayMs: 60_000 }))
+          const early = yield* store.claim(claimOptions())
+          assert(early._tag === "Empty")
+
+          yield* store.promote(id)
+          const claim = yield* store.claim(claimOptions({ token: "t-2" }))
+          assert(claim._tag === "Claimed")
+          expect(claim.job.id).toBe(id)
+
+          const wrongState = yield* Effect.flip(store.promote(id))
+          expect(wrongState._tag).toBe("JobNotPromotableError")
+          const missing = yield* Effect.flip(store.promote(JobId("nope")))
+          expect(missing._tag).toBe("JobNotFoundError")
+        })
+      ))
+
+    it.effect("pause stops claims for a queue until resume", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          yield* store.enqueue(baseRequest())
+          yield* store.pause(QueueName("default"))
+          expect(yield* store.pausedQueues()).toEqual(["default"])
+
+          const paused = yield* store.claim(claimOptions())
+          assert(paused._tag === "Empty")
+
+          // Other queues are unaffected.
+          yield* store.enqueue(baseRequest({ queue: QueueName("other") }))
+          const other = yield* store.claim(claimOptions({ queue: QueueName("other"), token: "t-2" }))
+          assert(other._tag === "Claimed")
+
+          // Resume wakes idle workers and claims flow again.
+          const empty = yield* store.claim(claimOptions({ token: "t-3" }))
+          assert(empty._tag === "Empty")
+          const waiter = yield* Effect.forkChild(
+            store.awaitWake([QueueName("default")], empty.wakeToken)
+          )
+          yield* Effect.yieldNow
+          yield* store.resume(QueueName("default"))
+          yield* Fiber.join(waiter)
+          expect(yield* store.pausedQueues()).toEqual([])
+          const resumed = yield* store.claim(claimOptions({ token: "t-4" }))
+          assert(resumed._tag === "Claimed")
+        })
+      ))
+
+    it.effect("schedules: upsert, list, due, conditional advance, remove", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const schedule: JobStore.ScheduleRecord = {
+            key: JobStore.ScheduleKey("TestJob/hourly"),
+            jobName: "TestJob",
+            queue: QueueName("default"),
+            cron: "0 * * * *",
+            tz: undefined,
+            everyMs: undefined,
+            payload: { n: 1 },
+            metadata: { source: "conformance" },
+            priority: 2,
+            attemptsMax: 3,
+            backoff: { _tag: "fixed", delayMs: 1_000 },
+            keep: undefined,
+            timeoutMs: 5_000,
+            nextRunAt: 60_000
+          }
+          yield* store.upsertSchedule(schedule)
+          expect(yield* store.listSchedules()).toEqual([schedule])
+          expect(yield* store.listSchedules({ jobName: "OtherJob" })).toEqual([])
+
+          // Not due yet (TestClock starts at 0).
+          expect(yield* store.dueSchedules()).toEqual([])
+          yield* TestClock.adjust(60_000)
+          expect(yield* store.dueSchedules()).toEqual([schedule])
+
+          // Upsert replaces in place.
+          yield* store.upsertSchedule({ ...schedule, priority: 9 })
+          expect((yield* store.listSchedules())[0]?.priority).toBe(9)
+
+          // Conditional advance: a stale expectation is a no-op.
+          yield* store.advanceSchedule(schedule.key, 999, 120_000)
+          expect((yield* store.listSchedules())[0]?.nextRunAt).toBe(60_000)
+          yield* store.advanceSchedule(schedule.key, 60_000, 120_000)
+          expect((yield* store.listSchedules())[0]?.nextRunAt).toBe(120_000)
+          expect(yield* store.dueSchedules()).toEqual([])
+
+          expect(yield* store.removeSchedule(schedule.key)).toBe(true)
+          expect(yield* store.removeSchedule(schedule.key)).toBe(false)
+          expect(yield* store.listSchedules()).toEqual([])
+        })
+      ))
+
+    it.effect("completion wins over a pending cancel request", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const { id } = yield* store.enqueue(baseRequest())
+          const claim = yield* store.claim(claimOptions())
+          assert(claim._tag === "Claimed")
+          yield* store.cancel(id)
+
+          yield* store.ack(id, "t-1", { _tag: "Complete", exit: { ok: true } })
+          const job = yield* store.getJob(id)
+          assert(Option.isSome(job))
+          expect(job.value.state).toBe("completed")
+          expect(job.value.cancelRequested).toBe(false)
+        })
+      ))
+
+    it.effect("a natural failure racing a cancel is cancelled, not revived", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const { id } = yield* store.enqueue(baseRequest({ attemptsMax: 5 }))
+          const claim = yield* store.claim(claimOptions())
+          assert(claim._tag === "Claimed")
+          yield* store.cancel(id)
+
+          // The handler failed on its own before the heartbeat could
+          // interrupt it; the retry ack must honour the pending cancel.
+          yield* store.ack(id, "t-1", { _tag: "Retry", exit: { boom: 1 }, delayMs: 1_000 })
+          const job = yield* store.getJob(id)
+          assert(Option.isSome(job))
+          expect(job.value.state).toBe("cancelled")
+          expect(job.value.cancelRequested).toBe(false)
+          const attempts = yield* store.getAttempts(id)
+          expect(attempts.map((attempt) => attempt.outcome)).toEqual(["cancelled"])
+          const nothing = yield* store.claim(claimOptions({ token: "t-2" }))
+          assert(nothing._tag === "Empty")
+        })
+      ))
+
+    it.effect("ack Cancelled with a wrong token fails with LockLostError", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const { id } = yield* store.enqueue(baseRequest())
+          const claim = yield* store.claim(claimOptions())
+          assert(claim._tag === "Claimed")
+          yield* store.cancel(id)
+
+          const wrong = yield* Effect.flip(store.ack(id, "not-mine", { _tag: "Cancelled" }))
+          expect(wrong._tag).toBe("LockLostError")
+          const job = yield* store.getJob(id)
+          assert(Option.isSome(job))
+          expect(job.value.state).toBe("active")
+          expect(job.value.cancelRequested).toBe(true)
+        })
+      ))
+
+    it.effect("cancel applies the keep retention policy", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const keep = { count: 1 }
+          const ids: Array<JobStore.JobId> = []
+          for (let i = 0; i < 3; i++) {
+            const { id } = yield* store.enqueue(baseRequest({ payload: { n: i }, keep }))
+            ids.push(id)
+            yield* store.cancel(id)
+            yield* TestClock.adjust(10)
+          }
+          const listed = yield* store.list({ states: ["cancelled"] })
+          expect(listed.items).toHaveLength(1)
+          expect(listed.items[0]?.id).toBe(ids[2])
+        })
+      ))
+
+    it.effect("upserting an unchanged cadence preserves the next occurrence; a changed one resets it", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const base: JobStore.ScheduleRecord = {
+            key: JobStore.ScheduleKey("TestJob/pulse"),
+            jobName: "TestJob",
+            queue: QueueName("default"),
+            cron: undefined,
+            tz: undefined,
+            everyMs: 60_000,
+            payload: {},
+            metadata: {},
+            priority: 0,
+            attemptsMax: 1,
+            backoff: undefined,
+            keep: undefined,
+            timeoutMs: undefined,
+            nextRunAt: 60_000
+          }
+          yield* store.upsertSchedule(base)
+
+          // A deploy-time re-registration recomputes nextRunAt from "now" —
+          // the store must keep the original grid point.
+          yield* TestClock.adjust(30_000)
+          yield* store.upsertSchedule({ ...base, priority: 5, nextRunAt: 90_000 })
+          const preserved = (yield* store.listSchedules())[0]
+          expect(preserved?.nextRunAt).toBe(60_000)
+          expect(preserved?.priority).toBe(5)
+
+          // Changing the cadence takes the caller's fresh nextRunAt.
+          yield* store.upsertSchedule({ ...base, everyMs: 120_000, nextRunAt: 150_000 })
+          expect((yield* store.listSchedules())[0]?.nextRunAt).toBe(150_000)
+        })
+      ))
+
+    it.effect("schedule records round-trip every/tz fields; due order is by nextRunAt; list filters by queue", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const everySchedule: JobStore.ScheduleRecord = {
+            key: JobStore.ScheduleKey("TestJob/every"),
+            jobName: "TestJob",
+            queue: QueueName("default"),
+            cron: undefined,
+            tz: undefined,
+            everyMs: 90_000,
+            payload: { n: 1 },
+            metadata: {},
+            priority: 0,
+            attemptsMax: 1,
+            backoff: undefined,
+            keep: undefined,
+            timeoutMs: undefined,
+            nextRunAt: 90_000
+          }
+          const cronSchedule: JobStore.ScheduleRecord = {
+            ...everySchedule,
+            key: JobStore.ScheduleKey("TestJob/tz"),
+            queue: QueueName("other"),
+            cron: "0 9 * * *",
+            tz: "America/New_York",
+            everyMs: undefined,
+            nextRunAt: 30_000
+          }
+          yield* store.upsertSchedule(everySchedule)
+          yield* store.upsertSchedule(cronSchedule)
+
+          const byQueue = yield* store.listSchedules({ queue: QueueName("other") })
+          expect(byQueue).toEqual([cronSchedule])
+          expect(byQueue[0]?.tz).toBe("America/New_York")
+          const roundTripped = (yield* store.listSchedules({ queue: QueueName("default") }))[0]
+          expect(roundTripped?.everyMs).toBe(90_000)
+
+          // Both due: ordered by nextRunAt ascending.
+          yield* TestClock.adjust(90_000)
+          const due = yield* store.dueSchedules()
+          expect(due.map((schedule) => schedule.key)).toEqual([
+            "TestJob/tz",
+            "TestJob/every"
+          ])
+        })
+      ))
+
+    it.effect("delayed jobs still promote to waiting while their queue is paused", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const { id } = yield* store.enqueue(baseRequest({ delayMs: 1_000 }))
+          yield* store.pause(QueueName("default"))
+          yield* TestClock.adjust(1_000)
+
+          const claim = yield* store.claim(claimOptions())
+          assert(claim._tag === "Empty")
+          const job = yield* store.getJob(id)
+          assert(Option.isSome(job))
+          expect(job.value.state).toBe("waiting")
         })
       ))
   })

@@ -16,7 +16,7 @@
  *
  * @since 0.1.0
  */
-import { Brand, Context, Data, type Effect, type Option, Predicate } from "effect"
+import { Brand, Context, Cron, Data, type Effect, type Option, Predicate, Result } from "effect"
 
 /**
  * The identifier of an enqueued job. Produced by `enqueue` (either
@@ -48,6 +48,20 @@ export type QueueName = Brand.Branded<string, "effect-mq/QueueName">
 export const QueueName: Brand.Constructor<QueueName> = Brand.nominal<QueueName>()
 
 /**
+ * The identifier of a repeatable-job schedule.
+ *
+ * @since 0.2.0
+ */
+export type ScheduleKey = Brand.Branded<string, "effect-mq/ScheduleKey">
+
+/**
+ * Brand a raw string as a `ScheduleKey`.
+ *
+ * @since 0.2.0
+ */
+export const ScheduleKey: Brand.Constructor<ScheduleKey> = Brand.nominal<ScheduleKey>()
+
+/**
  * The lifecycle states of a job.
  *
  * - `waiting`: runnable now, ordered by (priority desc, enqueue order asc)
@@ -57,7 +71,13 @@ export const QueueName: Brand.Constructor<QueueName> = Brand.nominal<QueueName>(
  *
  * @since 0.1.0
  */
-export type JobState = "waiting" | "delayed" | "active" | "completed" | "failed"
+export type JobState =
+  | "waiting"
+  | "delayed"
+  | "active"
+  | "completed"
+  | "failed"
+  | "cancelled"
 
 /**
  * Retry backoff policy, persisted on the job record so any worker can route
@@ -103,7 +123,7 @@ export interface AttemptRecord {
   readonly startedAt: number | undefined
   /** Ack/recovery time of this run (epoch millis). */
   readonly finishedAt: number
-  readonly outcome: "completed" | "retried" | "failed" | "stalled"
+  readonly outcome: "completed" | "retried" | "failed" | "stalled" | "cancelled"
   /** Schema-encoded `Exit`; undefined for `stalled`. */
   readonly exit: unknown
 }
@@ -131,6 +151,13 @@ export interface JobRecord {
   readonly stalledCount: number
   readonly backoff: BackoffPolicy | undefined
   readonly keep: KeepPolicy | undefined
+  /** Per-run execution time limit; the worker interrupts the handler past it. */
+  readonly timeoutMs: number | undefined
+  /**
+   * Set by `cancel` on an active job; the owning worker interrupts the
+   * handler on its next heartbeat and acks `Cancelled`.
+   */
+  readonly cancelRequested: boolean
   /** Epoch millis before which the job must not be claimed. */
   readonly runAt: number
   readonly enqueuedAt: number
@@ -160,6 +187,7 @@ export interface EnqueueRequest {
   readonly attemptsMax: number
   readonly backoff: BackoffPolicy | undefined
   readonly keep: KeepPolicy | undefined
+  readonly timeoutMs: number | undefined
   readonly delayMs: number
 }
 
@@ -213,6 +241,7 @@ export type AckOutcome =
   | { readonly _tag: "Complete"; readonly exit: unknown }
   | { readonly _tag: "Retry"; readonly delayMs: number; readonly exit: unknown }
   | { readonly _tag: "Fail"; readonly exit: unknown }
+  | { readonly _tag: "Cancelled" }
 
 /**
  * Filters and pagination for `list`. Results are ordered newest-first
@@ -242,6 +271,45 @@ export interface ListResult {
 }
 
 /**
+ * A repeatable-job schedule as persisted by the store. Exactly one of `cron`
+ * (with optional IANA `tz`) or `everyMs` is set. The payload is stored
+ * schema-encoded, like job payloads. `nextRunAt` is maintained by the worker
+ * sweep via `advanceSchedule`; ticks enqueue with the deterministic id
+ * `sched/<key>/<slot>`, so concurrent sweepers dedup naturally.
+ *
+ * @since 0.2.0
+ */
+export interface ScheduleRecord {
+  readonly key: ScheduleKey
+  readonly jobName: string
+  readonly queue: QueueName
+  readonly cron: string | undefined
+  readonly tz: string | undefined
+  readonly everyMs: number | undefined
+  readonly payload: unknown
+  readonly metadata: Readonly<Record<string, string>>
+  readonly priority: number
+  readonly attemptsMax: number
+  readonly backoff: BackoffPolicy | undefined
+  readonly keep: KeepPolicy | undefined
+  readonly timeoutMs: number | undefined
+  /** Epoch millis of the next occurrence to enqueue. */
+  readonly nextRunAt: number
+}
+
+/**
+ * Result of a heartbeat: locks that could not be extended (lost to stall
+ * recovery or another worker) and active jobs with a pending cancel request
+ * (the worker must interrupt them and ack `Cancelled`).
+ *
+ * @since 0.2.0
+ */
+export interface ExtendLocksResult {
+  readonly lost: ReadonlyArray<JobId>
+  readonly cancelRequested: ReadonlyArray<JobId>
+}
+
+/**
  * A transient or fatal driver error (connection loss, serialization, etc.).
  *
  * @since 0.1.0
@@ -259,6 +327,73 @@ export class JobStoreError extends Data.TaggedError("JobStoreError")<{
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- a type guard IS the boundary parser; `unknown` input is its purpose
 export const isJobStoreError = (u: unknown): u is JobStoreError =>
   Predicate.hasProperty(u, "_tag") && u._tag === "JobStoreError"
+
+// Identity-based marking (WeakSet, works on frozen error instances) so the
+// error keeps its declared type and schema round-trip untouched.
+const unrecoverableRegistry = new WeakSet<object>()
+
+/**
+ * Mark an error value as unrecoverable: when a handler fails with it, the
+ * worker skips the remaining retry budget and fails the job immediately. The
+ * error itself is returned unchanged, so typed error channels and schemas
+ * are unaffected. Also exported as `Job.unrecoverable`.
+ *
+ * Marking is identity-based, so it only works for object errors — a
+ * primitive (string/number) failure is returned unmarked and retries
+ * normally; use the definition-level `retryable` predicate for those.
+ *
+ * @since 0.2.0
+ */
+export const unrecoverable = <E>(error: E): E => {
+  if (Object(error) === error) {
+    // SAFETY: `Object(x) === x` is true exactly for object values, which is
+    // what WeakSet membership requires.
+    unrecoverableRegistry.add(error as object)
+  }
+  return error
+}
+
+/**
+ * Whether `unrecoverable` marked this value.
+ *
+ * @internal
+ */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- boundary classifier over arbitrary error values
+export const isMarkedUnrecoverable = (u: unknown): boolean =>
+  // SAFETY: `Object(u) === u` short-circuits to false for primitives, so the
+  // assertion only ever passes object values to the WeakSet.
+  Object(u) === u && unrecoverableRegistry.has(u as object)
+
+/**
+ * The next occurrence of a schedule strictly after `now`. `fromSlot` anchors
+ * `everyMs` schedules (occurrences stay on the `slot + k * every` grid).
+ * Returns undefined for an invalid cron expression.
+ *
+ * @internal
+ */
+export const nextOccurrence = (
+  schedule: Pick<ScheduleRecord, "cron" | "tz" | "everyMs">,
+  fromSlot: number,
+  now: number
+): number | undefined => {
+  if (schedule.cron !== undefined) {
+    const parsed = Cron.parse(schedule.cron, schedule.tz)
+    if (Result.isFailure(parsed)) return undefined
+    // Cron.next throws for parseable-but-unsatisfiable expressions (e.g.
+    // "0 0 30 2 *"); treat those as invalid rather than defecting the sweep.
+    try {
+      return Cron.next(parsed.success, new Date(Math.max(fromSlot, now))).getTime()
+    } catch {
+      return undefined
+    }
+  }
+  if (schedule.everyMs !== undefined && schedule.everyMs > 0) {
+    const behind = Math.max(0, now - fromSlot)
+    const steps = Math.floor(behind / schedule.everyMs) + 1
+    return fromSlot + steps * schedule.everyMs
+  }
+  return undefined
+}
 
 
 /**
@@ -286,6 +421,35 @@ export class JobNotFoundError extends Data.TaggedError("JobNotFoundError")<{
 export class JobNotRetryableError extends Data.TaggedError("JobNotRetryableError")<{
   readonly jobId: JobId
   readonly state: JobState
+}> {}
+
+/**
+ * `cancel` was called on a job that is already terminal.
+ *
+ * @since 0.2.0
+ */
+export class JobNotCancellableError extends Data.TaggedError("JobNotCancellableError")<{
+  readonly jobId: JobId
+  readonly state: JobState
+}> {}
+
+/**
+ * `promote` was called on a job that is not in the `delayed` state.
+ *
+ * @since 0.2.0
+ */
+export class JobNotPromotableError extends Data.TaggedError("JobNotPromotableError")<{
+  readonly jobId: JobId
+  readonly state: JobState
+}> {}
+
+/**
+ * Raised (as a defect) by `awaitResult` when the awaited job was cancelled.
+ *
+ * @since 0.2.0
+ */
+export class JobCancelledError extends Data.TaggedError("JobCancelledError")<{
+  readonly jobId: JobId
 }> {}
 
 /**
@@ -339,7 +503,7 @@ export interface Service {
   readonly extendLocks: (
     locks: ReadonlyArray<{ readonly id: JobId; readonly token: string }>,
     durationMs: number
-  ) => Effect.Effect<ReadonlyArray<JobId>, JobStoreError>
+  ) => Effect.Effect<ExtendLocksResult, JobStoreError>
 
   /**
    * Sweep active jobs whose lock has expired. Each recovered job gets
@@ -390,6 +554,73 @@ export interface Service {
     void,
     JobStoreError | JobNotFoundError | JobNotRetryableError
   >
+
+  /**
+   * Cancel a job. Waiting/delayed jobs become terminal (`cancelled`)
+   * immediately; active jobs get `cancelRequested` set, and the owning
+   * worker interrupts the handler on its next heartbeat. Terminal jobs fail
+   * with `JobNotCancellableError`.
+   */
+  readonly cancel: (
+    id: JobId
+  ) => Effect.Effect<
+    void,
+    JobStoreError | JobNotFoundError | JobNotCancellableError
+  >
+
+  /** Move a delayed job to `waiting` now. */
+  readonly promote: (
+    id: JobId
+  ) => Effect.Effect<
+    void,
+    JobStoreError | JobNotFoundError | JobNotPromotableError
+  >
+
+  /**
+   * Durably pause a queue: claims return `Empty` until `resume` (delayed
+   * jobs still promote to `waiting`, they just aren't handed out). Affects
+   * every worker on the store.
+   */
+  readonly pause: (queue: QueueName) => Effect.Effect<void, JobStoreError>
+
+  /** Undo `pause` and wake idle workers. */
+  readonly resume: (queue: QueueName) => Effect.Effect<void, JobStoreError>
+
+  readonly pausedQueues: () => Effect.Effect<
+    ReadonlyArray<QueueName>,
+    JobStoreError
+  >
+
+  /** Create or replace a repeatable-job schedule (keyed by `schedule.key`). */
+  readonly upsertSchedule: (
+    schedule: ScheduleRecord
+  ) => Effect.Effect<void, JobStoreError>
+
+  /** Remove a schedule. Returns false when the key does not exist. */
+  readonly removeSchedule: (
+    key: ScheduleKey
+  ) => Effect.Effect<boolean, JobStoreError>
+
+  readonly listSchedules: (options?: {
+    readonly jobName?: string | undefined
+    readonly queue?: QueueName | undefined
+  }) => Effect.Effect<ReadonlyArray<ScheduleRecord>, JobStoreError>
+
+  /** Schedules whose `nextRunAt` is due (per the Effect `Clock`). */
+  readonly dueSchedules: () => Effect.Effect<
+    ReadonlyArray<ScheduleRecord>,
+    JobStoreError
+  >
+
+  /**
+   * Advance a schedule's `nextRunAt` from `expectedRunAt` to `nextRunAt`
+   * (conditional, so concurrent sweepers cannot regress it).
+   */
+  readonly advanceSchedule: (
+    key: ScheduleKey,
+    expectedRunAt: number,
+    nextRunAt: number
+  ) => Effect.Effect<void, JobStoreError>
 
   readonly counts: (
     queue?: QueueName

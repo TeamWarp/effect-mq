@@ -6,21 +6,25 @@ Redis/Postgres backends, `effect/unstable/workflow`, `DurableQueue`).
 
 ## P0 — production readiness
 
-- [ ] **Repeatable / cron jobs** (M) — the most-requested queue feature after
+- [x] **Repeatable / cron jobs** (M) — *shipped in 0.2.0 as `Job.schedule`/`Job.unschedule`.*
+  Original notes: — the most-requested queue feature after
   retries. Model on BullMQ v6's `JobScheduler`: a scheduler row per schedule;
   each completion enqueues the next delayed occurrence. Effect ships `Cron` +
   `Schedule.cron`; combined with idempotency keys (`key = cron slot`) this
   gives exactly-one-job-per-tick across processes nearly for free.
-- [ ] **Handler timeout + unrecoverable errors** (S) — `defaults.timeout`
+- [x] **Handler timeout + unrecoverable errors** (S) — *shipped in 0.2.0 (`defaults.timeout`, `Job.unrecoverable`, `retryable`).*
+  Original notes: — `defaults.timeout`
   interrupting the handler cleanly (an Effect-native advantage; BullMQ cannot
   kill a running processor) and routing through normal retry/fail accounting;
   plus an `Unrecoverable` error wrapper that skips remaining retries.
-- [ ] **Admin verbs for dashboards** (M) — `pause`/`resume` (store-level flag
+- [x] **Admin verbs for dashboards** (M) — *shipped in 0.2.0 (`cancel`/`promote`/`pause`/`resume`, heartbeat-driven cancel of running jobs).*
+  Original notes: — `pause`/`resume` (store-level flag
   honored by `claim`), `promote` (delayed → runnable now), and **cancel a
   running job** cross-process (a cancel flag checked by the lock-renewal
   heartbeat, interrupting the handler). Completes the verb set next to the
   existing `retry`/`remove`.
-- [ ] **Per-store history TTL** (S) — store/layer-level retention default
+- [x] **Per-store history TTL** (S) — *shipped in 0.2.0 (`historyTtl` on both stores).*
+  Original notes: — store/layer-level retention default
   applied to ALL terminal records (e.g.
   `DrizzleJobStore.layer({ historyTtl: "90 days" })`), swept periodically by
   the worker's maintenance loop rather than only at ack time. Semantics: the
@@ -29,6 +33,12 @@ Redis/Postgres backends, `effect/unstable/workflow`, `DurableQueue`).
 
 ## P1 — product polish
 
+- [ ] **Atomic schedule ticks** (S) — close the last exactly-once gap in
+  repeatable jobs: today a *pathologically* stale sweeper (lagging longer
+  than the history retention window) could re-enqueue a pruned slot, because
+  dedup rests on the slot job's row existing. Add a store op that claims the
+  slot and enqueues in one transaction (`tickSchedule(key, expectedRunAt,
+  next, request) -> fired`), conformance-pinned.
 - [ ] **Deduplication modes** (M) — beyond id-idempotency: throttle (`ttl`),
   debounce (`extend`), and replace-while-delayed (latest payload wins), per
   BullMQ's dedup-key table. Turns "sync at most once per minute per employer"

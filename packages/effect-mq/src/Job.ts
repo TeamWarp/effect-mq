@@ -30,18 +30,35 @@
  *
  * @since 0.1.0
  */
-import { type Context, Duration, Effect, type Exit, Layer, Option, Schedule, Schema } from "effect"
+import { Clock, type Context, Duration, Effect, type Exit, Layer, Option, Schedule, Schema } from "effect"
 import {
   type BackoffPolicy,
+  JobCancelledError,
   JobId,
+  type JobNotCancellableError,
   JobNotFoundError,
+  type JobNotPromotableError,
   type JobNotRetryableError,
   type JobState,
   JobStore,
   type KeepPolicy,
+  nextOccurrence,
   QueueName,
-  type Service as StoreService
+  ScheduleKey,
+  type ScheduleRecord,
+  type Service as StoreService,
+  unrecoverable
 } from "./JobStore.ts"
+
+export {
+  /**
+   * Mark an error value as unrecoverable: the worker skips the remaining
+   * retry budget and fails the job immediately. Returns the error unchanged.
+   *
+   * @since 0.2.0
+   */
+  unrecoverable
+}
 import { type JobContext, type RegisterOptions, Worker } from "./Worker.ts"
 
 const TypeId = "~effect-mq/Job" as const
@@ -94,6 +111,11 @@ export interface JobOptions {
   readonly backoff?: BackoffInput | undefined
   /** Retention for terminal records. Default: keep forever. */
   readonly keep?: KeepInput | undefined
+  /**
+   * Per-run execution time limit; the worker interrupts the handler fiber
+   * past it and the run counts as a failed attempt (retried per backoff).
+   */
+  readonly timeout?: Duration.Input | undefined
 }
 
 /**
@@ -118,6 +140,28 @@ interface ResolvedDefaults {
   readonly attempts: number
   readonly backoff: BackoffPolicy | undefined
   readonly keep: KeepPolicy | undefined
+  readonly timeoutMs: number | undefined
+}
+
+/**
+ * Options for `Job.schedule`. Exactly one of `cron` (with optional IANA `tz`)
+ * or `every` must be set. `cron` schedules first fire at the next matching
+ * occurrence; `every` schedules first fire one interval from now.
+ *
+ * @since 0.2.0
+ */
+export interface ScheduleOptions<PayloadInput> {
+  readonly cron?: string | undefined
+  readonly tz?: string | undefined
+  readonly every?: Duration.Input | undefined
+  readonly payload: PayloadInput
+  /** Queryable business context, merged over the definition's `metadata`. */
+  readonly metadata?: Readonly<Record<string, string>> | undefined
+  readonly priority?: number | undefined
+  readonly attempts?: number | undefined
+  readonly backoff?: BackoffInput | undefined
+  readonly keep?: KeepInput | undefined
+  readonly timeout?: Duration.Input | undefined
 }
 
 /**
@@ -144,8 +188,8 @@ export interface JobAttempt<A, E> {
   readonly attempt: number
   readonly startedAt: number | undefined
   readonly finishedAt: number
-  readonly outcome: "completed" | "retried" | "failed" | "stalled"
-  /** Absent for `stalled` entries. */
+  readonly outcome: "completed" | "retried" | "failed" | "stalled" | "cancelled"
+  /** Absent for `stalled` and `cancelled` entries. */
   readonly exit: Option.Option<Exit.Exit<A, E>>
 }
 
@@ -185,6 +229,7 @@ export interface Job<
   >
   readonly idempotencyKey: ((payload: Payload["Type"]) => string) | undefined
   readonly metadata: ((payload: Payload["Type"]) => Readonly<Record<string, string>>) | undefined
+  readonly retryable: ((error: Error["Type"]) => boolean) | undefined
   readonly defaults: ResolvedDefaults
 
   /**
@@ -247,6 +292,43 @@ export interface Job<
   readonly retry: (
     jobId: JobId
   ) => Effect.Effect<void, JobNotFoundError | JobNotRetryableError, StoreId>
+
+  /**
+   * Cancel a job: waiting/delayed become terminal (`cancelled`) immediately;
+   * a running job's handler fiber is interrupted by its worker on the next
+   * heartbeat (latency ≤ `lockRenewInterval`).
+   */
+  readonly cancel: (
+    jobId: JobId
+  ) => Effect.Effect<void, JobNotFoundError | JobNotCancellableError, StoreId>
+
+  /** Run a delayed job now. */
+  readonly promote: (
+    jobId: JobId
+  ) => Effect.Effect<void, JobNotFoundError | JobNotPromotableError, StoreId>
+
+  /**
+   * Create or replace a durable repeatable schedule for this job. Ticks
+   * enqueue with a slot-deterministic id, so schedules are exactly-once per
+   * occurrence across all workers (assuming history retention windows
+   * comfortably exceed the sweep interval — a pruned tick job cannot dedup a
+   * pathologically stale sweeper). Missed occurrences (downtime) collapse
+   * into a single catch-up run.
+   *
+   * Re-registering with an *unchanged* cadence (same `cron`/`tz`/`every`) is
+   * a no-op for the next occurrence — deploy-time re-registration neither
+   * re-anchors `every` grids nor drops a pending catch-up run. Changing the
+   * cadence resets the next occurrence.
+   */
+  readonly schedule: (
+    key: string,
+    options: ScheduleOptions<Payload["~type.make.in"]>
+  ) => Effect.Effect<ScheduleKey, never, StoreId | Payload["EncodingServices"]>
+
+  /** Remove a schedule created by `schedule`. False when it did not exist. */
+  readonly unschedule: (
+    key: string
+  ) => Effect.Effect<boolean, never, StoreId>
 
   /**
    * Attach the handler that processes this job, as a layer to provide on top
@@ -333,6 +415,9 @@ const Proto = {
               keep: options?.keep !== undefined
                 ? normalizeKeep(options.keep)
                 : this.defaults.keep,
+              timeoutMs: options?.timeout !== undefined
+                ? Duration.toMillis(options.timeout)
+                : this.defaults.timeoutMs,
               delayMs: options?.delay !== undefined
                 ? Duration.toMillis(options.delay)
                 : this.defaults.delayMs
@@ -418,6 +503,9 @@ const Proto = {
           return yield* Effect.die(new JobNotFoundError({ jobId }))
         }
         const { exit, failedReason, state } = status.value
+        if (state === "cancelled") {
+          return yield* Effect.die(new JobCancelledError({ jobId }))
+        }
         if (state === "completed" || state === "failed") {
           if (Option.isSome(exit)) {
             return yield* exit.value
@@ -458,6 +546,84 @@ const Proto = {
       )
   },
 
+  cancel(this: AnyWithProps, jobId: JobId) {
+    return Effect.flatMap(this.store, (store) =>
+      store.cancel(jobId).pipe(
+        Effect.catchTag("JobStoreError", (error) => Effect.die(error))
+      )).pipe(
+        Effect.withSpan(`${this._tag}.cancel`, { attributes: { jobId } }, { captureStackTrace: false })
+      )
+  },
+
+  promote(this: AnyWithProps, jobId: JobId) {
+    return Effect.flatMap(this.store, (store) =>
+      store.promote(jobId).pipe(
+        Effect.catchTag("JobStoreError", (error) => Effect.die(error))
+      )).pipe(
+        Effect.withSpan(`${this._tag}.promote`, { attributes: { jobId } }, { captureStackTrace: false })
+      )
+  },
+
+  schedule(this: AnyWithProps, key: string, options: ScheduleOptions<never>) {
+    const self = this
+    return Effect.gen(function*() {
+      const hasCron = options.cron !== undefined
+      const hasEvery = options.every !== undefined
+      if (hasCron === hasEvery) {
+        return yield* Effect.die(
+          new Error(`effect-mq: schedule "${key}" must set exactly one of \`cron\` or \`every\``)
+        )
+      }
+      const everyMs = options.every !== undefined ? Duration.toMillis(options.every) : undefined
+      const now = yield* Clock.currentTimeMillis
+      const nextRunAt = nextOccurrence(
+        { cron: options.cron, tz: options.tz, everyMs },
+        now,
+        now
+      )
+      if (nextRunAt === undefined) {
+        return yield* Effect.die(
+          new Error(`effect-mq: schedule "${key}" has an invalid cron expression: "${options.cron}"`)
+        )
+      }
+      const payload = self.payloadSchema.make(options.payload)
+      const encoded = yield* Schema.encodeEffect(self.payloadJsonSchema)(payload).pipe(Effect.orDie)
+      const scheduleKey = ScheduleKey(`${self._tag}/${key}`)
+      const record: ScheduleRecord = {
+        key: scheduleKey,
+        jobName: self._tag,
+        queue: self.queue,
+        cron: options.cron,
+        tz: options.tz,
+        everyMs,
+        payload: encoded,
+        metadata: { ...self.metadata?.(payload), ...options.metadata },
+        priority: options.priority ?? self.defaults.priority,
+        attemptsMax: Math.max(1, options.attempts ?? self.defaults.attempts),
+        backoff: options.backoff !== undefined
+          ? normalizeBackoff(options.backoff)
+          : self.defaults.backoff,
+        keep: options.keep !== undefined ? normalizeKeep(options.keep) : self.defaults.keep,
+        timeoutMs: options.timeout !== undefined
+          ? Duration.toMillis(options.timeout)
+          : self.defaults.timeoutMs,
+        nextRunAt
+      }
+      const store = yield* self.store
+      yield* store.upsertSchedule(record).pipe(Effect.orDie)
+      return scheduleKey
+    }).pipe(
+      Effect.withSpan(`${this._tag}.schedule`, { attributes: { key } }, { captureStackTrace: false })
+    )
+  },
+
+  unschedule(this: AnyWithProps, key: string) {
+    return Effect.flatMap(this.store, (store) =>
+      store.removeSchedule(ScheduleKey(`${this._tag}/${key}`)).pipe(Effect.orDie)).pipe(
+        Effect.withSpan(`${this._tag}.unschedule`, { attributes: { key } }, { captureStackTrace: false })
+      )
+  },
+
   toLayer(
     this: AnyWithProps,
     handler: (payload: any, context: JobContext) => Effect.Effect<any, any, any>,
@@ -476,6 +642,10 @@ const boundMethods = [
   "awaitResult",
   "execute",
   "retry",
+  "cancel",
+  "promote",
+  "schedule",
+  "unschedule",
   "toLayer"
 ] as const
 
@@ -490,6 +660,7 @@ const makeProto = (options: {
   readonly exitSchema: Schema.Top
   readonly idempotencyKey: ((payload: any) => string) | undefined
   readonly metadata: ((payload: any) => Readonly<Record<string, string>>) | undefined
+  readonly retryable: ((error: any) => boolean) | undefined
   readonly defaults: ResolvedDefaults
 }): any => {
   function JobDefinition() {}
@@ -550,6 +721,15 @@ export const make = <
           : Payload["Type"]
       ) => Readonly<Record<string, string>>)
       | undefined
+    /**
+     * When present, a typed handler failure for which this returns false
+     * skips the remaining retry budget (see also `Job.unrecoverable`).
+     */
+    readonly retryable?:
+      | ((
+        error: Error["Type"]
+      ) => boolean)
+      | undefined
     /** The queue this job runs on. Default `"default"`. */
     readonly queue?: string | undefined
     /**
@@ -593,6 +773,7 @@ export const make = <
     exitSchema,
     idempotencyKey: options.idempotencyKey,
     metadata: options.metadata,
+    retryable: options.retryable,
     defaults: {
       delayMs: options.defaults?.delay !== undefined
         ? Duration.toMillis(options.defaults.delay)
@@ -600,7 +781,10 @@ export const make = <
       priority: options.defaults?.priority ?? 0,
       attempts: Math.max(1, options.defaults?.attempts ?? 1),
       backoff: normalizeBackoff(options.defaults?.backoff),
-      keep: normalizeKeep(options.defaults?.keep)
+      keep: normalizeKeep(options.defaults?.keep),
+      timeoutMs: options.defaults?.timeout !== undefined
+        ? Duration.toMillis(options.defaults.timeout)
+        : undefined
     }
   })
 }

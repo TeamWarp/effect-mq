@@ -10,13 +10,16 @@
  *
  * @since 0.1.0
  */
-import { Clock, type Context, Deferred, Effect, Exit, Layer, Option } from "effect"
+import { Clock, type Context, Deferred, Duration, Effect, Exit, Layer, Option, type Scope } from "effect"
 import {
   type AttemptRecord,
   type ClaimResult,
   type EnqueueRequest,
+  type ExtendLocksResult,
   JobId,
+  JobNotCancellableError,
   JobNotFoundError,
+  JobNotPromotableError,
   JobNotRetryableError,
   type JobRecord,
   type JobState,
@@ -24,6 +27,8 @@ import {
   type ListResult,
   LockLostError,
   type QueueName,
+  type ScheduleKey,
+  type ScheduleRecord,
   type Service
 } from "./JobStore.ts"
 
@@ -40,6 +45,8 @@ interface MemJob {
   stalledCount: number
   readonly backoff: JobRecord["backoff"]
   readonly keep: JobRecord["keep"]
+  readonly timeoutMs: number | undefined
+  cancelRequested: boolean
   runAt: number
   readonly enqueuedAt: number
   processedAt: number | undefined
@@ -51,6 +58,8 @@ interface MemJob {
   lockToken: string | undefined
   lockExpiresAt: number | undefined
 }
+
+const TERMINAL_STATES: ReadonlySet<JobState> = new Set(["completed", "failed", "cancelled"])
 
 const snapshot = (job: MemJob): JobRecord => ({
   id: job.id,
@@ -65,6 +74,8 @@ const snapshot = (job: MemJob): JobRecord => ({
   stalledCount: job.stalledCount,
   backoff: job.backoff,
   keep: job.keep,
+  timeoutMs: job.timeoutMs,
+  cancelRequested: job.cancelRequested,
   runAt: job.runAt,
   enqueuedAt: job.enqueuedAt,
   processedAt: job.processedAt,
@@ -83,13 +94,15 @@ const metadataMatches = (
   return true
 }
 
-/**
- * Build a fresh in-memory `JobStore` implementation.
- *
- * @since 0.1.0
- */
-export const make: Effect.Effect<Service> = Effect.sync(() => {
+interface MemoryStore {
+  readonly service: Service
+  readonly sweepHistory: (now: number, ttlMs: number) => void
+}
+
+const makeStoreUnsafe = (): MemoryStore => {
   const jobs = new Map<string, MemJob>()
+  const schedules = new Map<ScheduleKey, ScheduleRecord>()
+  const paused = new Set<QueueName>()
   let seq = 0
   let idCounter = 0
   let wakeVersion = 0
@@ -133,6 +146,15 @@ export const make: Effect.Effect<Service> = Effect.sync(() => {
     })
   }
 
+  const markCancelled = (job: MemJob, now: number) => {
+    clearLock(job)
+    job.cancelRequested = false
+    job.state = "cancelled"
+    job.finishedAt = now
+    recordAttempt(job, "cancelled", now, undefined)
+    applyKeep(job, now)
+  }
+
   // Terminal retention: keep at most `count` and drop older than `ageMs`
   // among terminal jobs sharing this job's name + state.
   const applyKeep = (job: MemJob, now: number) => {
@@ -158,7 +180,19 @@ export const make: Effect.Effect<Service> = Effect.sync(() => {
     }
   }
 
-  return JobStore.of({
+  const sweepHistory = (now: number, ttlMs: number) => {
+    for (const job of jobs.values()) {
+      if (
+        TERMINAL_STATES.has(job.state) &&
+        job.finishedAt !== undefined &&
+        job.finishedAt <= now - ttlMs
+      ) {
+        jobs.delete(job.id)
+      }
+    }
+  }
+
+  const service: Service = JobStore.of({
     enqueue: (request: EnqueueRequest) =>
       Effect.gen(function*() {
         const now = yield* Clock.currentTimeMillis
@@ -184,6 +218,8 @@ export const make: Effect.Effect<Service> = Effect.sync(() => {
           stalledCount: 0,
           backoff: request.backoff,
           keep: request.keep,
+          timeoutMs: request.timeoutMs,
+          cancelRequested: false,
           runAt: now + Math.max(0, request.delayMs),
           enqueuedAt: now,
           processedAt: undefined,
@@ -222,7 +258,7 @@ export const make: Effect.Effect<Service> = Effect.sync(() => {
             }
           }
         }
-        if (best === undefined) {
+        if (best === undefined || paused.has(options.queue)) {
           const empty: ClaimResult = { _tag: "Empty", nextRunAt, wakeToken: wakeVersion }
           return empty
         }
@@ -248,6 +284,7 @@ export const make: Effect.Effect<Service> = Effect.sync(() => {
         job.attemptsMade += 1
         switch (outcome._tag) {
           case "Complete": {
+            job.cancelRequested = false
             job.state = "completed"
             job.exit = outcome.exit
             job.finishedAt = now
@@ -256,6 +293,7 @@ export const make: Effect.Effect<Service> = Effect.sync(() => {
             break
           }
           case "Fail": {
+            job.cancelRequested = false
             job.state = "failed"
             job.exit = outcome.exit
             job.finishedAt = now
@@ -263,7 +301,22 @@ export const make: Effect.Effect<Service> = Effect.sync(() => {
             applyKeep(job, now)
             break
           }
+          case "Cancelled": {
+            job.cancelRequested = false
+            job.state = "cancelled"
+            job.finishedAt = now
+            recordAttempt(job, "cancelled", now, undefined)
+            applyKeep(job, now)
+            break
+          }
           case "Retry": {
+            if (job.cancelRequested) {
+              // A cancel raced a natural failure before the heartbeat could
+              // interrupt the run: cancellation wins over revival (mirrors
+              // release/recoverStalled).
+              markCancelled(job, now)
+              break
+            }
             recordAttempt(job, "retried", now, outcome.exit)
             job.runAt = now + Math.max(0, outcome.delayMs)
             job.state = outcome.delayMs > 0 ? "delayed" : "waiting"
@@ -276,12 +329,19 @@ export const make: Effect.Effect<Service> = Effect.sync(() => {
 
     release: (id, token) =>
       Effect.gen(function*() {
+        const now = yield* Clock.currentTimeMillis
         const job = jobs.get(id)
         if (job === undefined) {
           return yield* new JobNotFoundError({ jobId: id })
         }
         if (job.state !== "active" || job.lockToken !== token) {
           return yield* new LockLostError({ jobId: id })
+        }
+        if (job.cancelRequested) {
+          // A cancel arrived while the worker was shutting down: honour it
+          // instead of reviving the job.
+          markCancelled(job, now)
+          return
         }
         clearLock(job)
         job.state = "waiting"
@@ -292,19 +352,23 @@ export const make: Effect.Effect<Service> = Effect.sync(() => {
       Effect.gen(function*() {
         const now = yield* Clock.currentTimeMillis
         const lost: Array<JobId> = []
+        const cancelRequested: Array<JobId> = []
         for (const lock of locks) {
           const job = jobs.get(lock.id)
           if (
-            job !== undefined &&
-            job.state === "active" &&
-            job.lockToken === lock.token
+            job === undefined ||
+            job.state !== "active" ||
+            job.lockToken !== lock.token
           ) {
-            job.lockExpiresAt = now + durationMs
-          } else {
             lost.push(lock.id)
+          } else if (job.cancelRequested) {
+            cancelRequested.push(lock.id)
+          } else {
+            job.lockExpiresAt = now + durationMs
           }
         }
-        return lost
+        const result: ExtendLocksResult = { lost, cancelRequested }
+        return result
       }),
 
     recoverStalled: (options) =>
@@ -317,6 +381,11 @@ export const make: Effect.Effect<Service> = Effect.sync(() => {
             job.lockExpiresAt === undefined ||
             job.lockExpiresAt > now
           ) {
+            continue
+          }
+          if (job.cancelRequested) {
+            // The owning worker died before honouring the cancel: finish it.
+            markCancelled(job, now)
             continue
           }
           clearLock(job)
@@ -414,6 +483,7 @@ export const make: Effect.Effect<Service> = Effect.sync(() => {
         job.state = "waiting"
         job.attemptsMade = 0
         job.stalledCount = 0
+        job.cancelRequested = false
         job.exit = undefined
         job.failedReason = undefined
         job.finishedAt = undefined
@@ -423,6 +493,101 @@ export const make: Effect.Effect<Service> = Effect.sync(() => {
         signalWake()
       }),
 
+    cancel: (id) =>
+      Effect.gen(function*() {
+        const now = yield* Clock.currentTimeMillis
+        const job = jobs.get(id)
+        if (job === undefined) {
+          return yield* new JobNotFoundError({ jobId: id })
+        }
+        switch (job.state) {
+          case "waiting":
+          case "delayed": {
+            markCancelled(job, now)
+            return
+          }
+          case "active": {
+            job.cancelRequested = true
+            return
+          }
+          default: {
+            return yield* new JobNotCancellableError({ jobId: id, state: job.state })
+          }
+        }
+      }),
+
+    promote: (id) =>
+      Effect.gen(function*() {
+        const now = yield* Clock.currentTimeMillis
+        const job = jobs.get(id)
+        if (job === undefined) {
+          return yield* new JobNotFoundError({ jobId: id })
+        }
+        if (job.state !== "delayed") {
+          return yield* new JobNotPromotableError({ jobId: id, state: job.state })
+        }
+        job.state = "waiting"
+        job.runAt = now
+        signalWake()
+      }),
+
+    pause: (queue) =>
+      Effect.sync(() => {
+        paused.add(queue)
+      }),
+
+    resume: (queue) =>
+      Effect.sync(() => {
+        if (paused.delete(queue)) {
+          signalWake()
+        }
+      }),
+
+    pausedQueues: () => Effect.sync(() => Array.from(paused)),
+
+    upsertSchedule: (schedule) =>
+      Effect.sync(() => {
+        // An unchanged cadence keeps its next occurrence: deploy-time
+        // re-registration must not re-anchor `every` grids or drop a pending
+        // catch-up run. A changed cadence takes the caller's fresh nextRunAt.
+        const existing = schedules.get(schedule.key)
+        const sameCadence = existing !== undefined &&
+          existing.cron === schedule.cron &&
+          existing.tz === schedule.tz &&
+          existing.everyMs === schedule.everyMs
+        schedules.set(
+          schedule.key,
+          sameCadence ? { ...schedule, nextRunAt: existing.nextRunAt } : schedule
+        )
+        signalWake()
+      }),
+
+    removeSchedule: (key) => Effect.sync(() => schedules.delete(key)),
+
+    listSchedules: (options) =>
+      Effect.sync(() =>
+        Array.from(schedules.values()).filter((schedule) =>
+          (options?.jobName === undefined || schedule.jobName === options.jobName) &&
+          (options?.queue === undefined || schedule.queue === options.queue)
+        )
+      ),
+
+    dueSchedules: () =>
+      Effect.gen(function*() {
+        const now = yield* Clock.currentTimeMillis
+        return Array.from(schedules.values())
+          .filter((schedule) => schedule.nextRunAt <= now)
+          .toSorted((a, b) => a.nextRunAt - b.nextRunAt)
+      }),
+
+    advanceSchedule: (key, expectedRunAt, nextRunAt) =>
+      Effect.sync(() => {
+        const schedule = schedules.get(key)
+        if (schedule !== undefined && schedule.nextRunAt === expectedRunAt) {
+          schedules.set(key, { ...schedule, nextRunAt })
+        }
+      }),
+
     counts: (queue) =>
       Effect.sync(() => {
         const counts = {
@@ -430,7 +595,8 @@ export const make: Effect.Effect<Service> = Effect.sync(() => {
           delayed: 0,
           active: 0,
           completed: 0,
-          failed: 0
+          failed: 0,
+          cancelled: 0
         } satisfies Record<JobState, number>
         for (const job of jobs.values()) {
           if (queue !== undefined && job.queue !== queue) continue
@@ -447,15 +613,70 @@ export const make: Effect.Effect<Service> = Effect.sync(() => {
         return true
       })
   })
-})
+
+  return { service, sweepHistory }
+}
 
 /**
- * A fresh in-memory `JobStore` layer. Pass a named store key to provide a
- * `JobStore.named(...)` slot instead of the default.
+ * @since 0.2.0
+ */
+export interface MemoryJobStoreOptions {
+  /**
+   * Store-level retention ceiling: terminal records (completed, failed,
+   * cancelled) older than this are removed by a periodic sweep. Per-job
+   * `keep` policies may only be stricter.
+   */
+  readonly historyTtl?: Duration.Input | undefined
+  /** Sweep cadence (default 1 minute). */
+  readonly historySweepInterval?: Duration.Input | undefined
+}
+
+/**
+ * Build a fresh in-memory `JobStore` implementation (no history sweeper —
+ * use `makeWith` for `historyTtl` support).
  *
  * @since 0.1.0
  */
-export const layer: Layer.Layer<JobStore> = Layer.effect(JobStore, make)
+export const make: Effect.Effect<Service> = Effect.sync(() => makeStoreUnsafe().service)
+
+/**
+ * Build a fresh in-memory `JobStore` with options; the history sweeper (when
+ * configured) lives in the surrounding `Scope`.
+ *
+ * @since 0.2.0
+ */
+export const makeWith = (
+  options?: MemoryJobStoreOptions | undefined
+): Effect.Effect<Service, never, Scope.Scope> =>
+  Effect.gen(function*() {
+    const { service, sweepHistory } = makeStoreUnsafe()
+    if (options?.historyTtl !== undefined) {
+      const ttlMs = Duration.toMillis(options.historyTtl)
+      const intervalMs = Duration.toMillis(options.historySweepInterval ?? "1 minute")
+      yield* Effect.gen(function*() {
+        yield* Effect.sleep(intervalMs)
+        const now = yield* Clock.currentTimeMillis
+        sweepHistory(now, ttlMs)
+      }).pipe(Effect.forever, Effect.forkScoped)
+    }
+    return service
+  })
+
+/**
+ * A fresh in-memory `JobStore` layer.
+ *
+ * @since 0.1.0
+ */
+export const layer: Layer.Layer<JobStore> = Layer.effect(JobStore, makeWith())
+
+/**
+ * An in-memory layer with options (e.g. `historyTtl`).
+ *
+ * @since 0.2.0
+ */
+export const layerWith = (
+  options?: MemoryJobStoreOptions | undefined
+): Layer.Layer<JobStore> => Layer.effect(JobStore, makeWith(options))
 
 /**
  * An in-memory layer for a specific store key.
@@ -463,5 +684,6 @@ export const layer: Layer.Layer<JobStore> = Layer.effect(JobStore, make)
  * @since 0.1.0
  */
 export const layerFor = <Id>(
-  store: Context.Key<Id, Service>
-): Layer.Layer<Id> => Layer.effect(store, make)
+  store: Context.Key<Id, Service>,
+  options?: MemoryJobStoreOptions | undefined
+): Layer.Layer<Id> => Layer.effect(store, makeWith(options))

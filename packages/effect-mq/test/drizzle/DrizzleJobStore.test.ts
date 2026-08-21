@@ -3,8 +3,8 @@ import { PgClient } from "@effect/sql-pg"
 import { jobStoreConformance } from "../../src/testing/index.ts"
 import { assert, describe, expect, it } from "@effect/vitest"
 import { getTableConfig } from "drizzle-orm/pg-core"
-import { Effect, Exit, Fiber, Layer, Option, Schema } from "effect"
-import { DrizzleJobStore, mqJobAttempts, mqJobs } from "../../src/drizzle/index.ts"
+import { Effect, Exit, Fiber, Layer, Option, Schedule, Schema } from "effect"
+import { DrizzleJobStore, mqJobAttempts, mqJobs, mqQueueControl, mqSchedules } from "../../src/drizzle/index.ts"
 import { createTablesSql, freshStoreEffect, freshStoreLayer, freshTableNames, pgAvailable, pgClientLive, pgUrl } from "./support.ts"
 
 const available = await pgAvailable()
@@ -23,14 +23,19 @@ if (!available) {
       Effect.gen(function*() {
         const client = yield* PgClient.PgClient
         const names = freshTableNames()
-        for (const statement of createTablesSql(names.jobs, names.attempts)) {
+        for (
+          const statement of createTablesSql(names.jobs, names.attempts, names.schedules, names.queues)
+        ) {
           yield* client.unsafe(statement).pipe(Effect.orDie)
         }
         yield* Effect.addFinalizer(() =>
-          client.unsafe(`DROP TABLE IF EXISTS "${names.attempts}", "${names.jobs}" CASCADE`).pipe(Effect.ignore)
+          client.unsafe(
+            `DROP TABLE IF EXISTS "${names.attempts}", "${names.jobs}", "${names.schedules}", "${names.queues}" CASCADE`
+          ).pipe(Effect.ignore)
         )
 
         const typeMap = new Map<string, string>([
+          ["PgBoolean", "boolean"],
           ["PgText", "text"],
           ["PgInteger", "integer"],
           ["PgBigInt53", "bigint"],
@@ -40,7 +45,9 @@ if (!available) {
         for (
           const [table, tableName] of [
             [mqJobs(names.jobs), names.jobs],
-            [mqJobAttempts(mqJobs(names.jobs), names.attempts), names.attempts]
+            [mqJobAttempts(mqJobs(names.jobs), names.attempts), names.attempts],
+            [mqSchedules(names.schedules), names.schedules],
+            [mqQueueControl(names.queues), names.queues]
           ] as const
         ) {
           const config = getTableConfig(table)
@@ -134,6 +141,7 @@ if (!available) {
             attemptsMax: 1,
             backoff: undefined,
             keep: undefined,
+            timeoutMs: undefined,
             delayMs: 0
           })
           expect((yield* durable.counts()).waiting).toBe(1)
@@ -146,6 +154,66 @@ if (!available) {
             )
           )
         )
+      }).pipe(Effect.scoped, Effect.provide(pgClientLive())))
+
+    it.live("historyTtl sweeps terminal rows; live rows survive", () =>
+      Effect.gen(function*() {
+        const client = yield* PgClient.PgClient
+        const names = freshTableNames()
+        const jobs = mqJobs(names.jobs)
+        const attempts = mqJobAttempts(jobs, names.attempts)
+        const schedules = mqSchedules(names.schedules)
+        const queues = mqQueueControl(names.queues)
+        for (
+          const statement of createTablesSql(names.jobs, names.attempts, names.schedules, names.queues)
+        ) {
+          yield* client.unsafe(statement).pipe(Effect.orDie)
+        }
+        yield* Effect.addFinalizer(() =>
+          client.unsafe(
+            `DROP TABLE IF EXISTS "${names.attempts}", "${names.jobs}", "${names.schedules}", "${names.queues}" CASCADE`
+          ).pipe(Effect.ignore)
+        )
+        const store = yield* DrizzleJobStore.make({
+          jobs,
+          attempts,
+          schedules,
+          queues,
+          historyTtl: "80 millis",
+          historySweepInterval: "40 millis"
+        }).pipe(Effect.orDie)
+
+        const base = {
+          id: undefined,
+          queue: JobStore.QueueName("default"),
+          payload: {},
+          metadata: {},
+          priority: 0,
+          attemptsMax: 1,
+          backoff: undefined,
+          keep: undefined,
+          timeoutMs: undefined,
+          delayMs: 0
+        }
+        const done = yield* store.enqueue({ ...base, name: "Swept" })
+        const claim = yield* store.claim({
+          queue: JobStore.QueueName("default"),
+          names: ["Swept"],
+          token: "t-ttl",
+          lockDurationMs: 5_000
+        })
+        assert(claim._tag === "Claimed")
+        yield* store.ack(done.id, "t-ttl", { _tag: "Complete", exit: undefined })
+        const waiting = yield* store.enqueue({ ...base, name: "Waits" })
+
+        // Poll until the sweeper fires (bounded — the suite must not hang).
+        yield* store.getJob(done.id).pipe(
+          Effect.flatMap((record) =>
+            Option.isNone(record) ? Effect.void : Effect.fail(new Error("not swept yet"))
+          ),
+          Effect.retry({ schedule: Schedule.spaced("40 millis"), times: 50 })
+        )
+        expect(Option.isSome(yield* store.getJob(waiting.id))).toBe(true)
       }).pipe(Effect.scoped, Effect.provide(pgClientLive())))
 
     it.effect("payloads and exits survive Postgres storage as decodable JSON", () =>
@@ -184,7 +252,12 @@ if (!available) {
         // instance A's local wakeVersion bump can't help — only the NOTIFY
         // delivered through LISTEN can wake it.
         const a = yield* freshStoreEffect
-        const b = yield* DrizzleJobStore.make({ jobs: a.jobs, attempts: a.attempts })
+        const b = yield* DrizzleJobStore.make({
+          jobs: a.jobs,
+          attempts: a.attempts,
+          schedules: a.schedules,
+          queues: a.queues
+        })
 
         const empty = yield* a.store.claim({
           queue: JobStore.QueueName("default"),
@@ -211,6 +284,7 @@ if (!available) {
           attemptsMax: 1,
           backoff: undefined,
           keep: undefined,
+          timeoutMs: undefined,
           delayMs: 0
         })
         const woken = yield* Fiber.join(waiter)
@@ -231,6 +305,7 @@ if (!available) {
             attemptsMax: 1,
             backoff: undefined,
             keep: undefined,
+            timeoutMs: undefined,
             delayMs: 0
           })
         }
@@ -255,14 +330,20 @@ if (!available) {
       Effect.gen(function*() {
         const names = freshTableNames()
         const client = yield* PgClient.PgClient
-        for (const statement of createTablesSql(names.jobs, names.attempts)) {
+        for (
+          const statement of createTablesSql(names.jobs, names.attempts, names.schedules, names.queues)
+        ) {
           yield* client.unsafe(statement).pipe(Effect.orDie)
         }
         yield* Effect.addFinalizer(() =>
-          client.unsafe(`DROP TABLE IF EXISTS "${names.attempts}", "${names.jobs}" CASCADE`).pipe(Effect.ignore)
+          client.unsafe(
+            `DROP TABLE IF EXISTS "${names.attempts}", "${names.jobs}", "${names.schedules}", "${names.queues}" CASCADE`
+          ).pipe(Effect.ignore)
         )
         const jobs = mqJobs(names.jobs)
         const attempts = mqJobAttempts(jobs, names.attempts)
+        const schedules = mqSchedules(names.schedules)
+        const queues = mqQueueControl(names.queues)
 
         const Durable = JobStore.named("pg-live-durable")
         const Flaky = Job.make("PgFlaky", {
@@ -280,7 +361,7 @@ if (!available) {
         const stack = handlers.pipe(
           Layer.provideMerge(Worker.layer({ store: Durable, pollInterval: "100 millis" })),
           Layer.provideMerge(
-            DrizzleJobStore.layer({ jobs, attempts, store: Durable }).pipe(Layer.orDie)
+            DrizzleJobStore.layer({ jobs, attempts, schedules, queues, store: Durable }).pipe(Layer.orDie)
           ),
           Layer.provide(pgClientLive())
         )
@@ -308,12 +389,14 @@ if (!available) {
         const names = freshTableNames()
         const jobs = mqJobs(names.jobs)
         const attempts = mqJobAttempts(jobs, names.attempts)
-        const result = yield* Effect.exit(DrizzleJobStore.make({ jobs, attempts }))
+        const schedules = mqSchedules(names.schedules)
+        const queues = mqQueueControl(names.queues)
+        const result = yield* Effect.exit(DrizzleJobStore.make({ jobs, attempts, schedules, queues }))
         assert(Exit.isFailure(result))
         expect(JSON.stringify(result.cause)).toContain("drizzle-kit generate")
 
         // validate: false defers the failure to first use.
-        const store = yield* DrizzleJobStore.make({ jobs, attempts, validate: false })
+        const store = yield* DrizzleJobStore.make({ jobs, attempts, schedules, queues, validate: false })
         const first = yield* Effect.exit(store.counts())
         assert(Exit.isFailure(first))
       }).pipe(Effect.scoped, Effect.provide(pgClientLive())))
