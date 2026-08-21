@@ -86,6 +86,7 @@ const jobsColumns = <JobName extends string>() => ({
   keep: jsonb("keep").$type<KeepPolicy>(),
   timeoutMs: bigint("timeout_ms", { mode: "number" }),
   cancelRequested: boolean("cancel_requested").notNull().default(false),
+  dedupeKey: text("dedupe_key"),
   runAt: timestamp("run_at", { withTimezone: true, mode: "date" }).notNull(),
   enqueuedAt: timestamp("enqueued_at", { withTimezone: true, mode: "date" }).notNull(),
   processedAt: timestamp("processed_at", { withTimezone: true, mode: "date" }),
@@ -184,6 +185,28 @@ export const mqSchedules = (
     ...options?.extraConfig?.(table) ?? []
   ])
 
+const dedupeColumns = () => ({
+  name: text("name").notNull(),
+  key: text("key").notNull(),
+  jobId: text("job_id").notNull().$type<JobId>(),
+  /** Set for ttl/throttle windows; NULL rows live as long as their job is pending. */
+  windowExpiresAt: timestamp("window_expires_at", { withTimezone: true, mode: "date" })
+})
+
+/**
+ * Dedup-key registry (one row per job name + dedup key; see `DedupePolicy`).
+ *
+ * @since 0.3.0
+ */
+export const mqDedupe = (
+  tableName = "effect_mq_dedupe",
+  options?: MqTableOptions<ReturnType<typeof dedupeColumns>>
+) =>
+  pgTable(tableName, dedupeColumns(), (table) => [
+    primaryKey({ columns: [table.name, table.key] }),
+    ...options?.extraConfig?.(table) ?? []
+  ])
+
 const queueControlColumns = () => ({
   queue: text("queue").primaryKey().$type<QueueName>(),
   paused: boolean("paused").notNull().default(false)
@@ -221,3 +244,8 @@ export type MqSchedulesTable = ReturnType<typeof mqSchedules>
  * @since 0.2.0
  */
 export type MqQueueControlTable = ReturnType<typeof mqQueueControl>
+
+/**
+ * @since 0.3.0
+ */
+export type MqDedupeTable = ReturnType<typeof mqDedupe>

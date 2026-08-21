@@ -85,6 +85,8 @@ What you get out of the box:
   can't do to a running processor.
 - **Unrecoverable errors** — `Job.unrecoverable(error)` or a `retryable`
   predicate skips the remaining retry budget when retrying can't help.
+- **Deduplication** — pending-dedup, throttle, debounce, and
+  replace-while-delayed via a dedup key that never touches your job ids.
 
 ## Repeatable jobs
 
@@ -177,6 +179,41 @@ repeatable-schedule tick ids stay deterministic (exactly-once depends on
 them). Collisions are retried a bounded number of times, then the enqueue
 fails; bring real entropy.
 
+## Deduplication
+
+Dedup is a **separate key**, not id derivation — your ids (explicit,
+`idGenerator`, or store-assigned) are never rewritten. Keys are scoped per
+job name and picked per definition or per enqueue:
+
+```ts
+class SyncBenefits extends Job.make("sync-benefits", {
+  payload: { employerId: Schema.String },
+  dedupe: ({ employerId }) => employerId          // string shorthand = { key }
+}) {}
+
+// Per-enqueue, with modes:
+yield* SyncBenefits.enqueue(payload, { dedupe: { key: "emp-1", ttl: "1 minute" } })
+```
+
+Four behaviors, composable from three fields:
+
+| Options | Behavior |
+| --- | --- |
+| `{ key }` | dedupe while the keyed job is pending; finishing frees the key |
+| `{ key, ttl }` | throttle: at most one job per window, even after completion |
+| `{ key, ttl, extend: true }` | debounce: every dropped enqueue pushes the window out |
+| `{ key, replace: true }` | while the keyed job is still delayed, the newest payload/metadata/priority/attempts/backoff/keep/timeout/delay replace it (same id; a `ttl` window re-arms) |
+
+A deduplicated enqueue returns the keyed job's id (`duplicate: true` at the
+store level). `idempotencyKey` still exists and is different on purpose: it
+makes the job id *itself* deterministic (permanent identity, joinable from
+your domain tables), while `dedupe` is temporal policy with its own lifecycle.
+
+Postgres users: dedup adds one table and one jobs column — add
+`export const jobDedupe = mqDedupe()` to your schema and `drizzle-kit
+generate` diffs both (the table and the new `dedupe_key` column) into one
+migration. Memory and Redis need nothing.
+
 ## Postgres through drizzle
 
 The Postgres store runs on drizzle v1's Effect driver
@@ -196,7 +233,7 @@ migrations** — no library-run DDL, no parallel migration system:
 
 ```ts
 // db/schema.ts
-import { mqJobAttempts, mqJobs, mqQueueControl, mqSchedules } from "effect-mq/drizzle-postgres"
+import { mqDedupe, mqJobAttempts, mqJobs, mqQueueControl, mqSchedules } from "effect-mq/drizzle-postgres"
 
 // The `name` column is typed to your job tags (derived, not hand-written):
 type JobNames = typeof GenerateInvoice._tag | typeof SendEmail._tag
@@ -205,6 +242,7 @@ export const jobs = mqJobs<JobNames>()          // default table: effect_mq_jobs
 export const jobAttempts = mqJobAttempts(jobs)  // default: effect_mq_job_attempts
 export const jobSchedules = mqSchedules()       // default: effect_mq_schedules
 export const jobQueues = mqQueueControl()       // default: effect_mq_queue_control
+export const jobDedupe = mqDedupe()             // default: effect_mq_dedupe
 ```
 
 Need more indexes (the built-ins cover claiming, listing, metadata
@@ -233,13 +271,14 @@ When a future effect-mq version changes the layout, the factory changes and
 import { DrizzleJobStore } from "effect-mq/drizzle-postgres"
 import { PgClient } from "@effect/sql-pg"
 import { Layer, Redacted } from "effect"
-import { jobAttempts, jobQueues, jobs, jobSchedules } from "./db/schema.ts"
+import { jobAttempts, jobDedupe, jobQueues, jobs, jobSchedules } from "./db/schema.ts"
 
 const JobStoreLive = DrizzleJobStore.layer({
   jobs,
   attempts: jobAttempts,
   schedules: jobSchedules,
-  queues: jobQueues
+  queues: jobQueues,
+  dedupe: jobDedupe
 }).pipe(
   Layer.provide(PgClient.layer({ url: Redacted.make(process.env.DATABASE_URL!) }))
 )
@@ -382,9 +421,8 @@ suite in this repo runs the same conformance tests against a real database.
 
 ## Roadmap
 
-Next up: richer deduplication (throttle/debounce), trace propagation, a
-cross-process event stream, batch enqueue, drizzle schema customization, and
-parent-child fan-out. Full prioritized list:
+Next up: trace propagation, a cross-process event stream, batch enqueue,
+custom drizzle columns, and parent-child fan-out. Full prioritized list:
 [ROADMAP.md](https://github.com/TeamWarp/effect-mq/blob/main/ROADMAP.md).
 
 ## License

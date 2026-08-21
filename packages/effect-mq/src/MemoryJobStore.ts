@@ -38,17 +38,18 @@ interface MemJob {
   readonly id: JobId
   readonly name: string
   readonly queue: QueueName
-  readonly payload: unknown
-  readonly metadata: Readonly<Record<string, string>>
+  payload: unknown
+  metadata: Readonly<Record<string, string>>
   state: JobState
-  readonly priority: number
-  readonly attemptsMax: number
+  priority: number
+  attemptsMax: number
   attemptsMade: number
   stalledCount: number
-  readonly backoff: JobRecord["backoff"]
-  readonly keep: JobRecord["keep"]
-  readonly timeoutMs: number | undefined
+  backoff: JobRecord["backoff"]
+  keep: JobRecord["keep"]
+  timeoutMs: number | undefined
   cancelRequested: boolean
+  readonly dedupeKey: string | undefined
   runAt: number
   readonly enqueuedAt: number
   processedAt: number | undefined
@@ -78,6 +79,7 @@ const snapshot = (job: MemJob): JobRecord => ({
   keep: job.keep,
   timeoutMs: job.timeoutMs,
   cancelRequested: job.cancelRequested,
+  dedupeKey: job.dedupeKey,
   runAt: job.runAt,
   enqueuedAt: job.enqueuedAt,
   processedAt: job.processedAt,
@@ -105,6 +107,10 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
   const jobs = new Map<string, MemJob>()
   const schedules = new Map<ScheduleKey, ScheduleRecord>()
   const paused = new Set<QueueName>()
+  // Dedup registry: one entry per (name, key). `expiresAt` is set for
+  // ttl/throttle windows; pending-mode entries live as long as their job.
+  const dedupes = new Map<string, { jobId: JobId; expiresAt: number | undefined }>()
+  const dedupeMapKey = (name: string, key: string) => `${name}\u0000${key}`
   let seq = 0
   let idCounter = 0
   let wakeVersion = 0
@@ -148,12 +154,27 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
     })
   }
 
+  // A job leaving the pending states frees its pending-mode dedup entry;
+  // live throttle windows deliberately outlast the job.
+  const releaseDedupe = (job: MemJob, now: number) => {
+    if (job.dedupeKey === undefined) return
+    const key = dedupeMapKey(job.name, job.dedupeKey)
+    const entry = dedupes.get(key)
+    if (
+      entry !== undefined && entry.jobId === job.id &&
+      (entry.expiresAt === undefined || entry.expiresAt <= now)
+    ) {
+      dedupes.delete(key)
+    }
+  }
+
   const markCancelled = (job: MemJob, now: number) => {
     clearLock(job)
     job.cancelRequested = false
     job.state = "cancelled"
     job.finishedAt = now
     recordAttempt(job, "cancelled", now, undefined)
+    releaseDedupe(job, now)
     applyKeep(job, now)
   }
 
@@ -192,12 +213,61 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
         jobs.delete(job.id)
       }
     }
+    // Dead dedup entries: expired window, or a pointer at a vanished job.
+    for (const [key, entry] of dedupes) {
+      const alive = entry.expiresAt !== undefined
+        ? entry.expiresAt > now
+        : jobs.has(entry.jobId) && !TERMINAL_STATES.has(jobs.get(entry.jobId)?.state ?? "completed")
+      if (!alive) dedupes.delete(key)
+    }
   }
 
   const service: Service = JobStore.of({
     enqueue: (request: EnqueueRequest) =>
       Effect.gen(function*() {
         const now = yield* Clock.currentTimeMillis
+        if (request.id !== undefined && jobs.has(request.id)) {
+          return { id: request.id, duplicate: true }
+        }
+        // The dedup decision tree runs BEFORE id generation, so a
+        // deduplicated enqueue never consults the id generator.
+        if (request.dedupe !== undefined) {
+          const mapKey = dedupeMapKey(request.name, request.dedupe.key)
+          const entry = dedupes.get(mapKey)
+          if (entry !== undefined) {
+            const keyed = jobs.get(entry.jobId)
+            const windowLive = entry.expiresAt !== undefined && now < entry.expiresAt
+            // Latest-wins while the keyed job is still delayed.
+            if (request.dedupe.replace && keyed !== undefined && keyed.state === "delayed") {
+              keyed.payload = request.payload
+              keyed.metadata = request.metadata
+              keyed.priority = request.priority
+              keyed.attemptsMax = request.attemptsMax
+              keyed.backoff = request.backoff
+              keyed.keep = request.keep
+              keyed.timeoutMs = request.timeoutMs
+              keyed.runAt = now + Math.max(0, request.delayMs)
+              // A landed replace re-arms the ttl window.
+              if (request.dedupe.ttlMs !== undefined) {
+                entry.expiresAt = now + request.dedupe.ttlMs
+              }
+              signalWake()
+              return { id: keyed.id, duplicate: true }
+            }
+            if (windowLive) {
+              if (request.dedupe.extend && request.dedupe.ttlMs !== undefined) {
+                entry.expiresAt = now + request.dedupe.ttlMs
+              }
+              return { id: entry.jobId, duplicate: true }
+            }
+            const pending = keyed !== undefined && !TERMINAL_STATES.has(keyed.state)
+            if (entry.expiresAt === undefined && pending) {
+              return { id: entry.jobId, duplicate: true }
+            }
+            // Dead entry (expired window / finished job): fall through and
+            // let the new job take over the key below.
+          }
+        }
         let id = request.id
         if (id === undefined) {
           const generate = options?.idGenerator
@@ -222,8 +292,6 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
               })
             }
           }
-        } else if (jobs.has(id)) {
-          return { id, duplicate: true }
         }
         jobs.set(id, {
           id,
@@ -240,6 +308,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
           keep: request.keep,
           timeoutMs: request.timeoutMs,
           cancelRequested: false,
+          dedupeKey: request.dedupe?.key,
           runAt: now + Math.max(0, request.delayMs),
           enqueuedAt: now,
           processedAt: undefined,
@@ -251,6 +320,12 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
           lockToken: undefined,
           lockExpiresAt: undefined
         })
+        if (request.dedupe !== undefined) {
+          dedupes.set(dedupeMapKey(request.name, request.dedupe.key), {
+            jobId: id,
+            expiresAt: request.dedupe.ttlMs !== undefined ? now + request.dedupe.ttlMs : undefined
+          })
+        }
         signalWake()
         return { id, duplicate: false }
       }),
@@ -309,6 +384,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
             job.exit = outcome.exit
             job.finishedAt = now
             recordAttempt(job, "completed", now, outcome.exit)
+            releaseDedupe(job, now)
             applyKeep(job, now)
             break
           }
@@ -318,6 +394,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
             job.exit = outcome.exit
             job.finishedAt = now
             recordAttempt(job, "failed", now, outcome.exit)
+            releaseDedupe(job, now)
             applyKeep(job, now)
             break
           }
@@ -326,6 +403,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
             job.state = "cancelled"
             job.finishedAt = now
             recordAttempt(job, "cancelled", now, undefined)
+            releaseDedupe(job, now)
             applyKeep(job, now)
             break
           }
@@ -415,6 +493,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
             job.state = "failed"
             job.finishedAt = now
             job.failedReason = "job stalled more than allowable limit"
+            releaseDedupe(job, now)
             recovered.push({ id: job.id, failed: true })
           } else {
             job.state = "waiting"

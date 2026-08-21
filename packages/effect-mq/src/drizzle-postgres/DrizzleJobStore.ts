@@ -22,7 +22,7 @@ import { asc, eq, sql } from "drizzle-orm"
 import * as PgDrizzle from "drizzle-orm/effect-postgres"
 import { getTableConfig } from "drizzle-orm/pg-core"
 import { Clock, type Context, Deferred, Duration, Effect, Layer, Option, type Scope, Stream } from "effect"
-import type { MqJobAttemptsTable, MqJobsTable, MqQueueControlTable, MqSchedulesTable } from "./schema.ts"
+import type { MqDedupeTable, MqJobAttemptsTable, MqJobsTable, MqQueueControlTable, MqSchedulesTable } from "./schema.ts"
 
 const { JobId } = JobStore
 
@@ -38,6 +38,8 @@ export interface DrizzleJobStoreOptions<StoreId = JobStore.JobStore> {
   readonly schedules: MqSchedulesTable
   /** The queue pause/resume flags table (from `mqQueueControl`). */
   readonly queues: MqQueueControlTable
+  /** The dedup-key registry table (from `mqDedupe`). */
+  readonly dedupe: MqDedupeTable
   /** Bind to a `JobStore.named(...)` key; default: the default `JobStore`. */
   readonly store?: Context.Key<StoreId, JobStore.Service> | undefined
   /**
@@ -92,6 +94,7 @@ type JobRow = {
   readonly keep: JobStore.KeepPolicy | null
   readonly timeoutMs: number | string | null
   readonly cancelRequested: boolean
+  readonly dedupeKey: string | null
   readonly runAt: Date
   readonly enqueuedAt: Date
   readonly processedAt: Date | null
@@ -149,6 +152,7 @@ const toRecord = (row: JobRow): JobStore.JobRecord => ({
   keep: row.keep ?? undefined,
   timeoutMs: row.timeoutMs === null || row.timeoutMs === undefined ? undefined : Number(row.timeoutMs),
   cancelRequested: row.cancelRequested,
+  dedupeKey: row.dedupeKey ?? undefined,
   runAt: row.runAt.getTime(),
   enqueuedAt: row.enqueuedAt.getTime(),
   processedAt: row.processedAt?.getTime(),
@@ -173,6 +177,7 @@ export const make = (
     const attempts = options.attempts
     const schedules = options.schedules
     const queues = options.queues
+    const dedupe = options.dedupe
     const jobsName = getTableConfig(jobs).name
     const attemptsName = getTableConfig(attempts).name
     const wakeChannel = `effect_mq_wake_${jobsName}`
@@ -182,7 +187,8 @@ export const make = (
         db.select({ id: jobs.id }).from(jobs).limit(0),
         db.select({ jobId: attempts.jobId }).from(attempts).limit(0),
         db.select({ key: schedules.key }).from(schedules).limit(0),
-        db.select({ queue: queues.queue }).from(queues).limit(0)
+        db.select({ queue: queues.queue }).from(queues).limit(0),
+        db.select({ key: dedupe.key }).from(dedupe).limit(0)
       ]).pipe(
         Effect.mapError(storeError(
           `effect-mq: tables "${jobsName}"/"${attemptsName}" are missing or mismatched — ` +
@@ -226,6 +232,15 @@ export const make = (
           DELETE FROM ${jobs}
           WHERE ${jobs.state} IN ('completed', 'failed', 'cancelled')
             AND ${jobs.finishedAt} <= ${new Date(now.getTime() - ttlMs)}
+        `)
+        // Dead dedup rows: expired windows, or pointers at vanished jobs.
+        yield* db.execute(sql`
+          DELETE FROM ${dedupe}
+          WHERE (${dedupe.windowExpiresAt} IS NOT NULL AND ${dedupe.windowExpiresAt} <= ${now})
+             OR (${dedupe.windowExpiresAt} IS NULL AND NOT EXISTS (
+               SELECT 1 FROM ${jobs} WHERE ${jobs.id} = ${dedupe.jobId}
+                 AND ${jobs.state} IN ('waiting', 'delayed', 'active')
+             ))
         `)
       }).pipe(
         Effect.catchCause((cause) => Effect.logWarning("effect-mq: history sweep failed", cause)),
@@ -307,53 +322,202 @@ export const make = (
         )
       )
 
+    // The shared INSERT: store-assigned ids come from the configured
+    // generator (or the seq sequence); loop on the (unlikely) collision with
+    // an existing id — ON CONFLICT DO NOTHING makes the retry safe. Returns
+    // the result or undefined when the caller-supplied id already exists.
+    const insertJob = (
+      exec: Pick<Db, "execute">,
+      request: JobStore.EnqueueRequest,
+      now: Date
+    ) =>
+      Effect.gen(function*() {
+        const runAt = new Date(now.getTime() + Math.max(0, request.delayMs))
+        const state = request.delayMs > 0 ? "delayed" : "waiting"
+        const generate = options.idGenerator
+        for (let i = 0; i < 5; i++) {
+          const generated = request.id === undefined && generate !== undefined
+            ? yield* Effect.suspend(() => {
+              const raw = generate(request)
+              return Effect.isEffect(raw) ? raw : Effect.succeed(raw)
+            })
+            : undefined
+          const idExpr = request.id !== undefined
+            ? sql`${request.id}`
+            : generated !== undefined
+            ? sql`${generated}`
+            : sql`'j-' || ${seqExpr}::text`
+          const rows = rowsOf(yield* exec.execute<{ id: string }>(sql`
+            INSERT INTO ${jobs} (id, name, queue, state, priority, payload, metadata,
+              attempts_max, backoff, keep, timeout_ms, dedupe_key, run_at, enqueued_at)
+            VALUES (${idExpr}, ${request.name}, ${request.queue}, ${state}, ${request.priority},
+              ${JSON.stringify(request.payload ?? null)}::jsonb, ${JSON.stringify(request.metadata)}::jsonb,
+              ${request.attemptsMax},
+              ${request.backoff === undefined ? null : JSON.stringify(request.backoff)}::jsonb,
+              ${request.keep === undefined ? null : JSON.stringify(request.keep)}::jsonb,
+              ${request.timeoutMs ?? null}, ${request.dedupe?.key ?? null}, ${runAt}, ${now})
+            ON CONFLICT (id) DO NOTHING
+            RETURNING ${jobs.id} AS id
+          `).pipe(Effect.mapError(storeError("enqueue failed"))))
+          const inserted = rows[0]
+          if (inserted !== undefined) {
+            return { id: JobId(inserted.id), duplicate: false }
+          }
+          if (request.id !== undefined) {
+            return { id: request.id, duplicate: true }
+          }
+          // generated id collided with an existing user id; try again
+        }
+        return yield* new JobStore.JobStoreError({
+          message: "enqueue failed: could not generate a unique job id"
+        })
+      })
+
+    // Enqueue with a dedup policy: one transaction locks the (name, key) row
+    // and applies the decision tree (replace-while-delayed, throttle window,
+    // pending dedup) before falling through to a fresh insert.
+    const enqueueDeduped = (request: JobStore.EnqueueRequest, policy: JobStore.DedupePolicy) =>
+      db.transaction((tx) =>
+        Effect.gen(function*() {
+          const now = yield* nowDate
+          // The explicit-id duplicate check precedes the dedup tree, matching
+          // the memory and redis drivers.
+          if (request.id !== undefined) {
+            const existing = rowsOf(yield* tx.execute<{ id: string }>(sql`
+              SELECT ${jobs.id} AS id FROM ${jobs} WHERE ${jobs.id} = ${request.id}
+            `))
+            if (existing.length > 0) {
+              return { id: request.id, duplicate: true, wake: false }
+            }
+          }
+          // A SELECT FOR UPDATE on a missing row locks nothing, so two
+          // concurrent first-enqueues would both insert. The no-op upsert
+          // always takes the row lock: a fresh placeholder (job_id = '')
+          // reads as "no entry" and falls through to the insert below.
+          const rows = rowsOf(yield* tx.execute<{ jobId: string; windowExpiresAt: Date | null }>(sql`
+            INSERT INTO ${dedupe} (name, key, job_id, window_expires_at)
+            VALUES (${request.name}, ${policy.key}, '', NULL)
+            ON CONFLICT (name, key) DO UPDATE SET name = EXCLUDED.name
+            RETURNING ${dedupe.jobId} AS "jobId", ${dedupe.windowExpiresAt} AS "windowExpiresAt"
+          `))
+          const entry = rows[0]
+          if (entry !== undefined && entry.jobId !== "") {
+            // Plain read (no FOR UPDATE): locking the job row here would
+            // invert the jobs-then-dedupe lock order every terminal
+            // transition uses and deadlock under load. The replace branch
+            // compensates with a state-conditional UPDATE.
+            const keyed = rowsOf(yield* tx.execute<{ state: JobStore.JobState }>(sql`
+              SELECT ${jobs.state} AS state FROM ${jobs} WHERE ${jobs.id} = ${entry.jobId}
+            `))
+            const keyedState = keyed[0]?.state
+            const windowLive = entry.windowExpiresAt !== null &&
+              entry.windowExpiresAt.getTime() > now.getTime()
+            const bumpWindow = policy.extend && policy.ttlMs !== undefined
+              ? tx.execute(sql`
+                UPDATE ${dedupe} SET window_expires_at = ${new Date(now.getTime() + policy.ttlMs)}
+                WHERE ${dedupe.name} = ${request.name} AND ${dedupe.key} = ${policy.key}
+              `).pipe(Effect.asVoid)
+              : Effect.void
+            // Latest-wins while the keyed job is still delayed. The UPDATE
+            // re-checks the state so a concurrent claim degrades this to a
+            // plain dedup instead of rewriting an active job.
+            if (policy.replace && keyedState === "delayed") {
+              const replaced = rowsOf(yield* tx.execute<{ id: string }>(sql`
+                UPDATE ${jobs} SET
+                  payload = ${JSON.stringify(request.payload ?? null)}::jsonb,
+                  metadata = ${JSON.stringify(request.metadata)}::jsonb,
+                  priority = ${request.priority},
+                  attempts_max = ${request.attemptsMax},
+                  backoff = ${request.backoff === undefined ? null : JSON.stringify(request.backoff)}::jsonb,
+                  keep = ${request.keep === undefined ? null : JSON.stringify(request.keep)}::jsonb,
+                  timeout_ms = ${request.timeoutMs ?? null},
+                  run_at = ${new Date(now.getTime() + Math.max(0, request.delayMs))}
+                WHERE ${jobs.id} = ${entry.jobId} AND ${jobs.state} = 'delayed'
+                RETURNING ${jobs.id} AS id
+              `))
+              if (replaced.length > 0) {
+                // A landed replace re-arms the ttl window (the entry must
+                // outlive the chain it is deduplicating).
+                if (policy.ttlMs !== undefined) {
+                  yield* tx.execute(sql`
+                    UPDATE ${dedupe} SET window_expires_at = ${new Date(now.getTime() + policy.ttlMs)}
+                    WHERE ${dedupe.name} = ${request.name} AND ${dedupe.key} = ${policy.key}
+                  `)
+                }
+                return { id: JobId(entry.jobId), duplicate: true, wake: true }
+              }
+              return { id: JobId(entry.jobId), duplicate: true, wake: false }
+            }
+            if (windowLive) {
+              yield* bumpWindow
+              return { id: JobId(entry.jobId), duplicate: true, wake: false }
+            }
+            const pending = keyedState !== undefined && keyedState !== "completed" &&
+              keyedState !== "failed" && keyedState !== "cancelled"
+            if (entry.windowExpiresAt === null && pending) {
+              return { id: JobId(entry.jobId), duplicate: true, wake: false }
+            }
+            // Dead entry: the new job takes over the key below.
+          }
+          const result = yield* insertJob(tx, request, now)
+          if (!result.duplicate) {
+            yield* tx.execute(sql`
+              INSERT INTO ${dedupe} (name, key, job_id, window_expires_at)
+              VALUES (${request.name}, ${policy.key}, ${result.id},
+                ${policy.ttlMs === undefined ? null : new Date(now.getTime() + policy.ttlMs)})
+              ON CONFLICT (name, key) DO UPDATE SET
+                job_id = EXCLUDED.job_id, window_expires_at = EXCLUDED.window_expires_at
+            `)
+          }
+          return { ...result, wake: !result.duplicate }
+        })
+      ).pipe(
+        // Residual lock-order inversions (replace vs cancel of the same
+        // delayed job) surface as Postgres deadlocks (40P01); one side is
+        // killed and safe to retry.
+        Effect.retry({
+          times: 3,
+          while: (error) => String(error).includes("40P01") || String(error).includes("deadlock detected")
+        }),
+        Effect.mapError((error) =>
+          error instanceof JobStore.JobStoreError ? error : storeError("enqueue failed")(error)
+        )
+      )
+
+    // A job leaving the pending states frees its pending-mode dedup row; live
+    // throttle windows deliberately outlast the job.
+    const releaseDedupe = (
+      exec: Pick<Db, "execute">,
+      name: string,
+      dedupeKey: string | null,
+      jobId: string,
+      now: Date
+    ) =>
+      dedupeKey === null
+        ? Effect.void
+        : exec.execute(sql`
+          DELETE FROM ${dedupe}
+          WHERE ${dedupe.name} = ${name} AND ${dedupe.key} = ${dedupeKey}
+            AND ${dedupe.jobId} = ${jobId}
+            AND (${dedupe.windowExpiresAt} IS NULL OR ${dedupe.windowExpiresAt} <= ${now})
+        `).pipe(Effect.asVoid)
+
     const store: JobStore.Service = {
       enqueue: (request) =>
         Effect.gen(function*() {
-          const now = yield* nowDate
-          const runAt = new Date(now.getTime() + Math.max(0, request.delayMs))
-          const state = request.delayMs > 0 ? "delayed" : "waiting"
-          // Store-assigned ids come from the configured generator (or the
-          // seq sequence); loop on the (unlikely) collision with an existing
-          // id — ON CONFLICT DO NOTHING makes the retry safe.
-          const generate = options.idGenerator
-          for (let i = 0; i < 5; i++) {
-            const generated = request.id === undefined && generate !== undefined
-              ? yield* Effect.suspend(() => {
-                const raw = generate(request)
-                return Effect.isEffect(raw) ? raw : Effect.succeed(raw)
-              })
-              : undefined
-            const idExpr = request.id !== undefined
-              ? sql`${request.id}`
-              : generated !== undefined
-              ? sql`${generated}`
-              : sql`'j-' || ${seqExpr}::text`
-            const rows = rowsOf(yield* db.execute<{ id: string }>(sql`
-              INSERT INTO ${jobs} (id, name, queue, state, priority, payload, metadata,
-                attempts_max, backoff, keep, timeout_ms, run_at, enqueued_at)
-              VALUES (${idExpr}, ${request.name}, ${request.queue}, ${state}, ${request.priority},
-                ${JSON.stringify(request.payload ?? null)}::jsonb, ${JSON.stringify(request.metadata)}::jsonb,
-                ${request.attemptsMax},
-                ${request.backoff === undefined ? null : JSON.stringify(request.backoff)}::jsonb,
-                ${request.keep === undefined ? null : JSON.stringify(request.keep)}::jsonb,
-                ${request.timeoutMs ?? null}, ${runAt}, ${now})
-              ON CONFLICT (id) DO NOTHING
-              RETURNING ${jobs.id} AS id
-            `).pipe(Effect.mapError(storeError("enqueue failed"))))
-            const inserted = rows[0]
-            if (inserted !== undefined) {
+          if (request.dedupe !== undefined) {
+            const result = yield* enqueueDeduped(request, request.dedupe)
+            if (result.wake) {
               yield* wakeUp
-              return { id: JobId(inserted.id), duplicate: false }
             }
-            if (request.id !== undefined) {
-              return { id: request.id, duplicate: true }
-            }
-            // generated id collided with an existing user id; try again
+            return { id: result.id, duplicate: result.duplicate }
           }
-          return yield* new JobStore.JobStoreError({
-            message: "enqueue failed: could not generate a unique job id"
-          })
+          const now = yield* nowDate
+          const result = yield* insertJob(db, request, now)
+          if (!result.duplicate) {
+            yield* wakeUp
+          }
+          return result
         }),
 
       claim: (claimOptions) =>
@@ -396,7 +560,7 @@ export const make = (
                 ${jobs.attemptsMax} AS "attemptsMax", ${jobs.attemptsMade} AS "attemptsMade",
                 ${jobs.stalledCount} AS "stalledCount", ${jobs.backoff} AS "backoff",
                 ${jobs.keep} AS "keep", ${jobs.timeoutMs} AS "timeoutMs",
-                ${jobs.cancelRequested} AS "cancelRequested",
+                ${jobs.cancelRequested} AS "cancelRequested", ${jobs.dedupeKey} AS "dedupeKey",
                 ${jobs.runAt} AS "runAt", ${jobs.enqueuedAt} AS "enqueuedAt",
                 ${jobs.processedAt} AS "processedAt", ${jobs.finishedAt} AS "finishedAt",
                 ${jobs.exit} AS "exit", ${jobs.failedReason} AS "failedReason"
@@ -443,13 +607,19 @@ export const make = (
                   seq = CASE WHEN ${jobs.cancelRequested} THEN ${jobs.seq} ELSE ${seqExpr} END,
                   cancel_requested = FALSE`
             const rows = rowsOf(yield* tx.execute<
-              { processedAt: Date | null; name: string; state: string; keep: JobStore.KeepPolicy | null }
+              {
+                processedAt: Date | null
+                name: string
+                state: string
+                keep: JobStore.KeepPolicy | null
+                dedupeKey: string | null
+              }
             >(sql`
               UPDATE ${jobs} SET ${update},
                 attempts_made = ${jobs.attemptsMade} + 1, lock_token = NULL, lock_expires_at = NULL
               WHERE ${jobs.id} = ${id} AND ${jobs.state} = 'active' AND ${jobs.lockToken} = ${token}
               RETURNING ${jobs.processedAt} AS "processedAt", ${jobs.name} AS "name",
-                ${jobs.state} AS "state", ${jobs.keep} AS "keep"
+                ${jobs.state} AS "state", ${jobs.keep} AS "keep", ${jobs.dedupeKey} AS "dedupeKey"
             `))
             const row = rows[0]
             if (row === undefined) {
@@ -472,6 +642,7 @@ export const make = (
               outcome._tag === "Cancelled" || cancelledRetry ? undefined : outcome.exit
             )
             if (outcome._tag !== "Retry" || cancelledRetry) {
+              yield* releaseDedupe(tx, row.name, row.dedupeKey, id, now)
               yield* applyKeep(tx, row, now)
             }
           })
@@ -499,6 +670,7 @@ export const make = (
                   processedAt: Date | null
                   name: string
                   keep: JobStore.KeepPolicy | null
+                  dedupeKey: string | null
                 }
               >(sql`
                 UPDATE ${jobs} SET
@@ -508,12 +680,14 @@ export const make = (
                   lock_token = NULL, lock_expires_at = NULL
                 WHERE ${jobs.id} = ${id} AND ${jobs.state} = 'active' AND ${jobs.lockToken} = ${token}
                 RETURNING ${jobs.id} AS id, (${jobs.state} = 'cancelled') AS cancelled,
-                  ${jobs.processedAt} AS "processedAt", ${jobs.name} AS "name", ${jobs.keep} AS "keep"
+                  ${jobs.processedAt} AS "processedAt", ${jobs.name} AS "name", ${jobs.keep} AS "keep",
+                  ${jobs.dedupeKey} AS "dedupeKey"
               `))
               const row = rows[0]
               if (row === undefined) return undefined
               if (row.cancelled) {
                 yield* insertAttempt(tx, id, "cancelled", row.processedAt, now, undefined)
+                yield* releaseDedupe(tx, row.name, row.dedupeKey, id, now)
                 yield* applyKeep(tx, { name: row.name, state: "cancelled", keep: row.keep }, now)
               }
               return row.cancelled
@@ -578,6 +752,7 @@ export const make = (
                 processedAt: Date | null
                 name: string
                 keep: JobStore.KeepPolicy | null
+                dedupeKey: string | null
               }
             >(sql`
               UPDATE ${jobs} SET
@@ -598,7 +773,7 @@ export const make = (
                 cancel_requested = FALSE
               WHERE ${jobs.state} = 'active' AND ${jobs.lockExpiresAt} <= ${now}::timestamptz
               RETURNING ${jobs.id} AS "id", ${jobs.state} AS "state", ${jobs.processedAt} AS "processedAt",
-                ${jobs.name} AS "name", ${jobs.keep} AS "keep"
+                ${jobs.name} AS "name", ${jobs.keep} AS "keep", ${jobs.dedupeKey} AS "dedupeKey"
             `))
             const recovered: Array<{ id: JobStore.JobId; failed: boolean }> = []
             for (const row of rows) {
@@ -610,6 +785,9 @@ export const make = (
                 now,
                 undefined
               )
+              if (row.state === "cancelled" || row.state === "failed") {
+                yield* releaseDedupe(tx, row.name, row.dedupeKey, row.id, now)
+              }
               if (row.state === "cancelled") {
                 yield* applyKeep(tx, { name: row.name, state: "cancelled", keep: row.keep }, now)
               } else {
@@ -740,6 +918,7 @@ export const make = (
                 processedAt: Date | null
                 name: string
                 keep: JobStore.KeepPolicy | null
+                dedupeKey: string | null
               }
             >(sql`
               UPDATE ${jobs} SET
@@ -748,7 +927,8 @@ export const make = (
                 cancel_requested = CASE WHEN ${jobs.state} = 'active' THEN TRUE ELSE ${jobs.cancelRequested} END
               WHERE ${jobs.id} = ${id} AND ${jobs.state} IN ('waiting', 'delayed', 'active')
               RETURNING ${jobs.id} AS id, ${jobs.state} AS state,
-                ${jobs.processedAt} AS "processedAt", ${jobs.name} AS "name", ${jobs.keep} AS "keep"
+                ${jobs.processedAt} AS "processedAt", ${jobs.name} AS "name", ${jobs.keep} AS "keep",
+                ${jobs.dedupeKey} AS "dedupeKey"
             `))
             const row = rows[0]
             if (row === undefined) {
@@ -763,6 +943,7 @@ export const make = (
             }
             if (row.state === "cancelled") {
               yield* insertAttempt(tx, id, "cancelled", row.processedAt, now, undefined)
+              yield* releaseDedupe(tx, row.name, row.dedupeKey, id, now)
               yield* applyKeep(tx, { name: row.name, state: "cancelled", keep: row.keep }, now)
             }
           })

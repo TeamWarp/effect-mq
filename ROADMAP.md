@@ -39,10 +39,11 @@ Redis/Postgres backends, `effect/unstable/workflow`, `DurableQueue`).
   dedup rests on the slot job's row existing. Add a store op that claims the
   slot and enqueues in one transaction (`tickSchedule(key, expectedRunAt,
   next, request) -> fired`), conformance-pinned.
-- [ ] **Deduplication modes** (M) — beyond id-idempotency: throttle (`ttl`),
-  debounce (`extend`), and replace-while-delayed (latest payload wins), per
-  BullMQ's dedup-key table. Turns "sync at most once per minute per employer"
-  into one enqueue option.
+- [x] **Deduplication modes** (M) — *shipped in 0.3.0*: `dedupe: { key,
+  ttl?, extend?, replace? }` at the definition or enqueue level — pending
+  dedup, throttle, debounce, and replace-while-delayed, all conformance-
+  pinned across the three drivers. The dedup key is separate from the job id
+  by design (ids are never rewritten).
 - [ ] **Trace propagation** (S) — persist `traceId`/`spanId`/`sampled` at
   enqueue and restore the handler's span parent from it
   (`Tracer.externalSpan`, exactly as `DurableQueue` does), so producer →

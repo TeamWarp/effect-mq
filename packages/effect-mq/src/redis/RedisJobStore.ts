@@ -81,6 +81,7 @@ const toRecord = (hash: ReadonlyMap<string, string>): JobStore.JobRecord => ({
   keep: optionalJson<JobStore.KeepPolicy>(hash.get("keep")),
   timeoutMs: optionalNumber(hash.get("timeoutMs")),
   cancelRequested: hash.get("cancelRequested") === "1",
+  dedupeKey: optionalString(hash.get("dedupeKey")),
   runAt: Number(hash.get("runAt") ?? 0),
   enqueuedAt: Number(hash.get("enqueuedAt") ?? 0),
   processedAt: optionalNumber(hash.get("processedAt")),
@@ -192,7 +193,7 @@ export const make = (
       yield* Effect.gen(function*() {
         yield* Effect.sleep(intervalMs)
         const now = yield* Clock.currentTimeMillis
-        while ((yield* evalSweepHistory(prefix, now - ttlMs, 500)) !== "0") {
+        while ((yield* evalSweepHistory(prefix, now - ttlMs, 500, now)) !== "0") {
           // bounded batches until the window is clean
         }
       }).pipe(
@@ -228,7 +229,11 @@ export const make = (
         request.keep === undefined ? "" : JSON.stringify(request.keep),
         request.timeoutMs === undefined ? "" : String(request.timeoutMs),
         Math.max(0, request.delayMs),
-        now
+        now,
+        request.dedupe?.key ?? "",
+        request.dedupe?.ttlMs === undefined ? "" : String(request.dedupe.ttlMs),
+        request.dedupe?.extend === true ? "1" : "0",
+        request.dedupe?.replace === true ? "1" : "0"
       )
 
     const store: JobStore.Service = {

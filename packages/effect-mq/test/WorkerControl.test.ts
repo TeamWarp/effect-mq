@@ -27,6 +27,7 @@ const rawRequest = (name: string, id?: string): JobStore.EnqueueRequest => ({
   backoff: undefined,
   keep: undefined,
   timeoutMs: undefined,
+  dedupe: undefined,
   delayMs: 0
 })
 
@@ -526,6 +527,68 @@ describe("repeatable schedules", () => {
       expect(Exit.hasDies(both)).toBe(true)
       const invalid = yield* Effect.exit(Bad.schedule("x", { cron: "not a cron", payload: {} }))
       expect(Exit.hasDies(invalid)).toBe(true)
+    }).pipe(Effect.provide(MemoryJobStore.layer)))
+})
+
+describe("deduplication", () => {
+  it.effect("definition-level dedupe derives from the payload; per-call overrides win", () =>
+    Effect.gen(function*() {
+      const store = yield* MemoryJobStore.make
+      const storeLayer = Layer.succeed(JobStore.JobStore, store)
+      class Sync extends Job.make("Sync", {
+        payload: { employerId: Schema.String },
+        dedupe: ({ employerId }) => employerId
+      }) {}
+
+      yield* Effect.gen(function*() {
+        const first = yield* Sync.enqueue({ employerId: "e1" })
+        const deduped = yield* Sync.enqueue({ employerId: "e1" })
+        expect(deduped).toBe(first)
+
+        const different = yield* Sync.enqueue({ employerId: "e2" })
+        expect(different).not.toBe(first)
+
+        // A per-call dedupe replaces the definition's derived key entirely.
+        const overridden = yield* Sync.enqueue({ employerId: "e1" }, { dedupe: "custom" })
+        expect(overridden).not.toBe(first)
+      }).pipe(Effect.provide(storeLayer))
+    }))
+
+  it.effect("dedupe works alongside idGenerator without touching the generated id", () =>
+    Effect.gen(function*() {
+      let n = 0
+      const store = yield* MemoryJobStore.makeWith({
+        idGenerator: () => `job_${++n}`
+      })
+      const request = {
+        id: undefined,
+        name: "Gen",
+        queue: QueueName("default"),
+        payload: {},
+        metadata: {},
+        priority: 0,
+        attemptsMax: 1,
+        backoff: undefined,
+        keep: undefined,
+        timeoutMs: undefined,
+        dedupe: { key: "k", ttlMs: undefined, extend: false, replace: false },
+        delayMs: 0
+      }
+      const first = yield* store.enqueue(request)
+      expect(first).toEqual({ id: "job_1", duplicate: false })
+      // Deduplicated: the generator is not consulted, the id not rewritten.
+      const second = yield* store.enqueue(request)
+      expect(second).toEqual({ id: "job_1", duplicate: true })
+      expect(n).toBe(1)
+    }).pipe(Effect.scoped))
+
+  it.effect("dedupe extend without a ttl dies with a clear error", () =>
+    Effect.gen(function*() {
+      class Bad extends Job.make("Bad", { payload: {} }) {}
+      const result = yield* Effect.exit(
+        Bad.enqueue({}, { dedupe: { key: "x", extend: true } })
+      )
+      expect(Exit.hasDies(result)).toBe(true)
     }).pipe(Effect.provide(MemoryJobStore.layer)))
 })
 

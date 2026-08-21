@@ -30,9 +30,10 @@
  *
  * @since 0.1.0
  */
-import { Clock, type Context, Duration, Effect, type Exit, Layer, Option, Schedule, Schema } from "effect"
+import { Clock, type Context, Duration, Effect, type Exit, Layer, Option, Predicate, Schedule, Schema } from "effect"
 import {
   type BackoffPolicy,
+  type DedupePolicy,
   JobCancelledError,
   JobId,
   type JobNotCancellableError,
@@ -121,6 +122,47 @@ export interface JobOptions {
 /**
  * @since 0.1.0
  */
+/**
+ * Deduplication input for `Job.make({ dedupe })` and per-enqueue overrides.
+ * A bare string is shorthand for `{ key }`. Dedup never changes the job id —
+ * it is a separate, name-scoped key:
+ *
+ * - `{ key }`: dedupe while the keyed job is pending; done jobs free the key.
+ * - `{ key, ttl }`: throttle — at most one job per window.
+ * - `{ key, ttl, extend: true }`: debounce — dropped enqueues push the
+ *   window out.
+ * - `{ key, replace: true }`: while the keyed job is still delayed, the new
+ *   enqueue's content replaces it (latest wins).
+ *
+ * @since 0.3.0
+ */
+export type DedupeInput = string | {
+  readonly key: string
+  readonly ttl?: Duration.Input | undefined
+  readonly extend?: boolean | undefined
+  readonly replace?: boolean | undefined
+}
+
+const normalizeDedupe = (input: DedupeInput | undefined): DedupePolicy | undefined => {
+  if (input === undefined) return undefined
+  const config = Predicate.isString(input) ? { key: input } : input
+  if (config.key === "") {
+    throw new Error("effect-mq: dedupe `key` must be non-empty")
+  }
+  if (config.extend === true && config.ttl === undefined) {
+    throw new Error("effect-mq: dedupe `extend` requires a `ttl`")
+  }
+  return {
+    key: config.key,
+    ttlMs: config.ttl !== undefined ? Duration.toMillis(config.ttl) : undefined,
+    extend: config.extend === true,
+    replace: config.replace === true
+  }
+}
+
+/**
+ * @since 0.1.0
+ */
 export interface EnqueueOptions extends JobOptions {
   /**
    * Explicit job id. Enqueueing an id that already exists is a no-op that
@@ -132,6 +174,8 @@ export interface EnqueueOptions extends JobOptions {
   readonly queue?: string | undefined
   /** Queryable business context, merged over the definition's `metadata`. */
   readonly metadata?: Readonly<Record<string, string>> | undefined
+  /** Deduplicate by key (see `DedupeInput`); overrides the definition's `dedupe`. */
+  readonly dedupe?: DedupeInput | undefined
 }
 
 interface ResolvedDefaults {
@@ -228,6 +272,7 @@ export interface Job<
     >
   >
   readonly idempotencyKey: ((payload: Payload["Type"]) => string) | undefined
+  readonly dedupe: ((payload: Payload["Type"]) => DedupeInput) | undefined
   readonly metadata: ((payload: Payload["Type"]) => Readonly<Record<string, string>>) | undefined
   readonly retryable: ((error: Error["Type"]) => boolean) | undefined
   readonly defaults: ResolvedDefaults
@@ -395,6 +440,9 @@ const Proto = {
         ...this.metadata?.(payload),
         ...options?.metadata
       }
+      const dedupe = normalizeDedupe(
+        options?.dedupe ?? this.dedupe?.(payload)
+      )
       return Schema.encodeEffect(this.payloadJsonSchema)(payload).pipe(
         Effect.orDie,
         Effect.flatMap((encoded) =>
@@ -418,6 +466,7 @@ const Proto = {
               timeoutMs: options?.timeout !== undefined
                 ? Duration.toMillis(options.timeout)
                 : this.defaults.timeoutMs,
+              dedupe,
               delayMs: options?.delay !== undefined
                 ? Duration.toMillis(options.delay)
                 : this.defaults.delayMs
@@ -659,6 +708,7 @@ const makeProto = (options: {
   readonly errorSchema: Schema.Top
   readonly exitSchema: Schema.Top
   readonly idempotencyKey: ((payload: any) => string) | undefined
+  readonly dedupe: ((payload: any) => DedupeInput) | undefined
   readonly metadata: ((payload: any) => Readonly<Record<string, string>>) | undefined
   readonly retryable: ((error: any) => boolean) | undefined
   readonly defaults: ResolvedDefaults
@@ -710,6 +760,17 @@ export const make = <
         payload: Payload extends Schema.Struct.Fields ? Schema.Struct.Type<Payload>
           : Payload["Type"]
       ) => string)
+      | undefined
+    /**
+     * Derive a dedup key (and optional throttle/debounce/replace behavior)
+     * from the payload. Unlike `idempotencyKey`, this never changes the job
+     * id — see `DedupeInput` for the mode semantics.
+     */
+    readonly dedupe?:
+      | ((
+        payload: Payload extends Schema.Struct.Fields ? Schema.Struct.Type<Payload>
+          : Payload["Type"]
+      ) => DedupeInput)
       | undefined
     /**
      * Derive queryable business context from the payload (flat string map, so
@@ -772,6 +833,7 @@ export const make = <
     errorSchema,
     exitSchema,
     idempotencyKey: options.idempotencyKey,
+    dedupe: options.dedupe,
     metadata: options.metadata,
     retryable: options.retryable,
     defaults: {

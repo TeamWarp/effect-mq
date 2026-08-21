@@ -26,6 +26,8 @@
  * - `p:counts`                  HASH `<queue>|<state>` -> integer
  * - `p:paused`                  SET of paused queues
  * - `p:schedules` / `p:schedule:<key>`  ZSET by nextRunAt + HASH per record
+ * - `p:dedupe:<name>\0<key>`   HASH {jobId, expiresAt} + `p:dedupes` index
+ *                               ZSET (score = window expiry, +inf = pending)
  *
  * @since 0.2.0
  */
@@ -117,6 +119,20 @@ local function applyKeep(name, state, keepJson, now)
     for i = count + 1, #arr do deleteJob(arr[i].id) end
   end
 end
+local function dedupeStoreKey(name, key) return prefix .. ":dedupe:" .. name .. "\0" .. key end
+-- A job leaving the pending states frees its pending-mode dedup entry; live
+-- throttle windows deliberately outlast the job.
+local function releaseDedupe(name, dkey, jobId, now)
+  if dkey == nil or dkey == false or dkey == "" then return end
+  local sk = dedupeStoreKey(name, dkey)
+  if redis.call("HGET", sk, "jobId") == jobId then
+    local exp = redis.call("HGET", sk, "expiresAt")
+    if exp == "" or tonumber(exp) <= now then
+      redis.call("DEL", sk)
+      redis.call("ZREM", prefix .. ":dedupes", name .. "\0" .. dkey)
+    end
+  end
+end
 -- Move an active job (whose lock bookkeeping was already cleared by the
 -- caller) to the terminal cancelled state.
 local function finishCancelled(id, queue, name, startedAt, now, nowStr)
@@ -128,6 +144,7 @@ local function finishCancelled(id, queue, name, startedAt, now, nowStr)
   redis.call("ZADD", prefix .. ":finished", now, id)
   redis.call("ZADD", terminalKey(name, "cancelled"), now, id)
   appendAttempt(id, "cancelled", startedAt, nowStr, "")
+  releaseDedupe(name, redis.call("HGET", jk, "dedupeKey"), id, now)
   applyKeep(name, "cancelled", redis.call("HGET", jk, "keep"), now)
 end
 `
@@ -153,7 +170,11 @@ export const enqueue = Redis.script(
     keepJson: string,
     timeoutMs: string,
     delayMs: number,
-    now: number
+    now: number,
+    dedupeKey: string,
+    dedupeTtlMs: string,
+    dedupeExtend: string,
+    dedupeReplace: string
   ) => [
     prefix,
     idMode,
@@ -168,7 +189,11 @@ export const enqueue = Redis.script(
     keepJson,
     timeoutMs,
     delayMs,
-    now
+    now,
+    dedupeKey,
+    dedupeTtlMs,
+    dedupeExtend,
+    dedupeReplace
   ],
   {
     numberOfKeys: 0,
@@ -183,7 +208,53 @@ if idMode == "user" or idMode == "generated" then
     if idMode == "user" then return '{"duplicate":true,"id":' .. cjson.encode(id) .. '}' end
     return '{"collision":true}'
   end
-else
+end
+-- Dedup decision tree: replace-while-delayed, throttle window, pending dedup.
+local dKey = ARGV[15]
+local name = ARGV[4]
+if dKey ~= "" then
+  local sk = dedupeStoreKey(name, dKey)
+  local entryJob = redis.call("HGET", sk, "jobId")
+  if entryJob then
+    local expStr = redis.call("HGET", sk, "expiresAt")
+    local windowLive = expStr ~= "" and tonumber(expStr) > now
+    local keyedState = redis.call("HGET", jobKey(entryJob), "state")
+    local function bumpWindow()
+      if ARGV[17] == "1" and ARGV[16] ~= "" then
+        local windowEnd = now + tonumber(ARGV[16])
+        redis.call("HSET", sk, "expiresAt", fmt(windowEnd))
+        redis.call("ZADD", prefix .. ":dedupes", windowEnd, name .. "\0" .. dKey)
+      end
+    end
+    -- Latest-wins while the keyed job is still delayed.
+    if ARGV[18] == "1" and keyedState == "delayed" then
+      local kjk = jobKey(entryJob)
+      local newRunAt = now + delayMs
+      redis.call("HSET", kjk, "payload", ARGV[6], "metadata", ARGV[7], "priority", ARGV[8],
+        "attemptsMax", ARGV[9], "backoff", ARGV[10], "keep", ARGV[11], "timeoutMs", ARGV[12],
+        "runAt", fmt(newRunAt))
+      redis.call("ZADD", delayedKey(redis.call("HGET", kjk, "queue")), newRunAt, entryJob)
+      -- A landed replace re-arms the ttl window.
+      if ARGV[16] ~= "" then
+        local windowEnd = now + tonumber(ARGV[16])
+        redis.call("HSET", sk, "expiresAt", fmt(windowEnd))
+        redis.call("ZADD", prefix .. ":dedupes", windowEnd, name .. "\0" .. dKey)
+      end
+      return '{"id":' .. cjson.encode(entryJob) .. ',"duplicate":true,"wake":true}'
+    end
+    if windowLive then
+      bumpWindow()
+      return '{"id":' .. cjson.encode(entryJob) .. ',"duplicate":true}'
+    end
+    local pending = keyedState ~= false and keyedState ~= "completed"
+      and keyedState ~= "failed" and keyedState ~= "cancelled"
+    if expStr == "" and pending then
+      return '{"id":' .. cjson.encode(entryJob) .. ',"duplicate":true}'
+    end
+    -- Dead entry: the new job takes over the key below.
+  end
+end
+if idMode == "auto" then
   id = ""
   for i = 1, 5 do
     local candidate = "j-" .. fmt(redis.call("INCR", prefix .. ":seq"))
@@ -202,7 +273,7 @@ redis.call("HSET", jobKey(id),
   "payload", ARGV[6], "metadata", ARGV[7], "state", state,
   "priority", ARGV[8], "attemptsMax", ARGV[9], "attemptsMade", "0", "stalledCount", "0",
   "backoff", ARGV[10], "keep", ARGV[11], "timeoutMs", ARGV[12],
-  "cancelRequested", "0", "runAt", fmt(runAt), "enqueuedAt", nowStr,
+  "cancelRequested", "0", "dedupeKey", dKey, "runAt", fmt(runAt), "enqueuedAt", nowStr,
   "processedAt", "", "finishedAt", "", "exit", "", "failedReason", "",
   "lockToken", "", "lockExpiresAt", "", "seq", fmt(seq))
 redis.call("ZADD", prefix .. ":all", now, id)
@@ -212,6 +283,14 @@ else
   redis.call("ZADD", delayedKey(queue), runAt, id)
 end
 countsAdd(queue, state, 1)
+if dKey ~= "" then
+  local sk = dedupeStoreKey(name, dKey)
+  redis.call("DEL", sk)
+  redis.call("HSET", sk, "jobId", id,
+    "expiresAt", ARGV[16] == "" and "" or fmt(now + tonumber(ARGV[16])))
+  redis.call("ZADD", prefix .. ":dedupes",
+    ARGV[16] == "" and "inf" or tostring(now + tonumber(ARGV[16])), name .. "\0" .. dKey)
+end
 -- Wake on EVERY insert (delayed too): idle workers must re-claim to learn
 -- the new nextRunAt, exactly like the memory and Postgres drivers.
 return '{"id":' .. cjson.encode(id) .. ',"duplicate":false,"wake":true}'
@@ -343,6 +422,7 @@ local function finish(newState, storeExit, outcome, ledgerExit)
   redis.call("ZADD", prefix .. ":finished", now, id)
   redis.call("ZADD", terminalKey(name, newState), now, id)
   appendAttempt(id, outcome, startedAt, nowStr, ledgerExit)
+  releaseDedupe(name, redis.call("HGET", jk, "dedupeKey"), id, now)
   applyKeep(name, newState, redis.call("HGET", jk, "keep"), now)
 end
 
@@ -473,6 +553,7 @@ for _, id in ipairs(expired) do
         countsAdd(queue, "failed", 1)
         redis.call("ZADD", prefix .. ":finished", now, id)
         redis.call("ZADD", terminalKey(name, "failed"), now, id)
+        releaseDedupe(name, redis.call("HGET", jk, "dedupeKey"), id, now)
         recovered[#recovered + 1] = { id = id, failed = true }
       else
         local seq = tonumber(redis.call("HGET", jk, "seq")) or 0
@@ -673,6 +754,7 @@ countsAdd(queue, "cancelled", 1)
 redis.call("ZADD", prefix .. ":finished", now, id)
 redis.call("ZADD", terminalKey(name, "cancelled"), now, id)
 appendAttempt(id, "cancelled", redis.call("HGET", jk, "processedAt"), nowStr, "")
+releaseDedupe(name, redis.call("HGET", jk, "dedupeKey"), id, now)
 applyKeep(name, "cancelled", redis.call("HGET", jk, "keep"), now)
 return '{"ok":true}'
 `
@@ -850,13 +932,36 @@ return "1"
  * caller loops until 0).
  */
 export const sweepHistory = Redis.script(
-  (prefix: string, cutoff: number, limit: number) => [prefix, cutoff, limit],
+  (prefix: string, cutoff: number, limit: number, now: number) => [prefix, cutoff, limit, now],
   {
     numberOfKeys: 0,
     lua: `${HELPERS}
 local old = redis.call("ZRANGEBYSCORE", prefix .. ":finished", "-inf", tonumber(ARGV[2]), "LIMIT", 0, tonumber(ARGV[3]))
 for _, id in ipairs(old) do deleteJob(id) end
-return tostring(#old)
+-- Dead dedup entries: expired windows first, then pending pointers (+inf)
+-- whose job is gone or terminal.
+local now = tonumber(ARGV[4])
+local index = prefix .. ":dedupes"
+local expired = redis.call("ZRANGEBYSCORE", index, "-inf", now, "LIMIT", 0, tonumber(ARGV[3]))
+for _, member in ipairs(expired) do
+  redis.call("DEL", prefix .. ":dedupe:" .. member)
+  redis.call("ZREM", index, member)
+end
+local removedPending = 0
+local pendings = redis.call("ZRANGEBYSCORE", index, "inf", "inf", "LIMIT", 0, tonumber(ARGV[3]))
+for _, member in ipairs(pendings) do
+  local sk = prefix .. ":dedupe:" .. member
+  local jobId = redis.call("HGET", sk, "jobId")
+  local state = jobId and redis.call("HGET", jobKey(jobId), "state")
+  if not state or state == "completed" or state == "failed" or state == "cancelled" then
+    redis.call("DEL", sk)
+    redis.call("ZREM", index, member)
+    removedPending = removedPending + 1
+  end
+end
+-- Report ALL work done so the caller keeps sweeping until the whole backlog
+-- (jobs AND dedup entries) is clean, not just until jobs run dry.
+return tostring(#old + #expired + removedPending)
 `
   }
 ).withReturnType<string>()

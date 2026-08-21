@@ -36,6 +36,7 @@ const baseRequest = (
   backoff: undefined,
   keep: undefined,
   timeoutMs: undefined,
+  dedupe: undefined,
   delayMs: 0,
   ...overrides
 })
@@ -1051,6 +1052,187 @@ export const jobStoreConformance = (
           yield* store.upsertSchedule(schedule)
           const stored = (yield* store.listSchedules())[0]
           expect(stored?.payload).toEqual(payload)
+        })
+      ))
+
+    it.effect("dedupe never changes the job id, and keys are scoped per name", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const dedupe = { key: "emp-1", ttlMs: undefined, extend: false, replace: false }
+          const first = yield* store.enqueue(baseRequest({ id: JobId("my-ulid-1"), dedupe }))
+          expect(first).toEqual({ id: "my-ulid-1", duplicate: false })
+          const job = yield* store.getJob(first.id)
+          assert(Option.isSome(job))
+          expect(job.value.dedupeKey).toBe("emp-1")
+
+          // Same key, same name: deduplicated to the FIRST job's id.
+          const second = yield* store.enqueue(baseRequest({ id: JobId("my-ulid-2"), dedupe }))
+          expect(second).toEqual({ id: "my-ulid-1", duplicate: true })
+          expect(Option.isNone(yield* store.getJob(JobId("my-ulid-2")))).toBe(true)
+
+          // Same key, different name: no interference.
+          const other = yield* store.enqueue(baseRequest({ name: "OtherJob", dedupe }))
+          expect(other.duplicate).toBe(false)
+        })
+      ))
+
+    it.effect("pending dedupe holds while the keyed job is unfinished and frees on completion", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const dedupe = { key: "k", ttlMs: undefined, extend: false, replace: false }
+          const first = yield* store.enqueue(baseRequest({ dedupe }))
+          expect((yield* store.enqueue(baseRequest({ dedupe }))).duplicate).toBe(true)
+
+          // Still deduped while active.
+          const claim = yield* store.claim(claimOptions())
+          assert(claim._tag === "Claimed")
+          expect((yield* store.enqueue(baseRequest({ dedupe }))).duplicate).toBe(true)
+
+          // A terminal ack frees the key immediately.
+          yield* store.ack(first.id, "t-1", { _tag: "Complete", exit: undefined })
+          const fresh = yield* store.enqueue(baseRequest({ dedupe }))
+          expect(fresh.duplicate).toBe(false)
+          expect(fresh.id).not.toBe(first.id)
+        })
+      ))
+
+    it.effect("cancellation also frees a pending dedupe key", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const dedupe = { key: "k", ttlMs: undefined, extend: false, replace: false }
+          const first = yield* store.enqueue(baseRequest({ dedupe }))
+          yield* store.cancel(first.id)
+          expect((yield* store.enqueue(baseRequest({ dedupe }))).duplicate).toBe(false)
+        })
+      ))
+
+    it.effect("a ttl dedupe window throttles even past completion, then expires", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const dedupe = { key: "k", ttlMs: 60_000, extend: false, replace: false }
+          const first = yield* store.enqueue(baseRequest({ dedupe }))
+          const claim = yield* store.claim(claimOptions())
+          assert(claim._tag === "Claimed")
+          yield* store.ack(first.id, "t-1", { _tag: "Complete", exit: undefined })
+
+          // Completed, but the window still throttles...
+          yield* TestClock.adjust(30_000)
+          expect((yield* store.enqueue(baseRequest({ dedupe }))).duplicate).toBe(true)
+
+          // ...and a plain (non-extend) window is NOT pushed out by drops.
+          yield* TestClock.adjust(30_000)
+          const fresh = yield* store.enqueue(baseRequest({ dedupe }))
+          expect(fresh.duplicate).toBe(false)
+          expect(fresh.id).not.toBe(first.id)
+        })
+      ))
+
+    it.effect("an extend dedupe window is pushed out by each deduplicated enqueue", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const dedupe = { key: "k", ttlMs: 60_000, extend: true, replace: false }
+          yield* store.enqueue(baseRequest({ dedupe }))
+
+          yield* TestClock.adjust(45_000)
+          expect((yield* store.enqueue(baseRequest({ dedupe }))).duplicate).toBe(true)
+
+          // 75s after the FIRST enqueue — past the original window, inside
+          // the extended one.
+          yield* TestClock.adjust(30_000)
+          expect((yield* store.enqueue(baseRequest({ dedupe }))).duplicate).toBe(true)
+
+          // Past the latest extension: free again.
+          yield* TestClock.adjust(60_001)
+          expect((yield* store.enqueue(baseRequest({ dedupe }))).duplicate).toBe(false)
+        })
+      ))
+
+    it.effect("replace dedupe rewrites a still-delayed job in place, latest content wins", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const dedupe = { key: "k", ttlMs: undefined, extend: false, replace: true }
+          const first = yield* store.enqueue(
+            baseRequest({ dedupe, payload: { n: 1 }, priority: 1, delayMs: 60_000 })
+          )
+
+          const replaced = yield* store.enqueue(
+            baseRequest({ dedupe, payload: { n: 2 }, priority: 7, delayMs: 5_000 })
+          )
+          expect(replaced).toEqual({ id: first.id, duplicate: true })
+          const job = yield* store.getJob(first.id)
+          assert(Option.isSome(job))
+          expect(job.value.payload).toEqual({ n: 2 })
+          expect(job.value.priority).toBe(7)
+          expect(job.value.state).toBe("delayed")
+
+          // The rewritten delay is live: due after 5s, not the original 60s.
+          yield* TestClock.adjust(5_000)
+          const claim = yield* store.claim(claimOptions())
+          assert(claim._tag === "Claimed")
+          expect(claim.job.id).toBe(first.id)
+          expect(claim.job.payload).toEqual({ n: 2 })
+
+          // Once claimed (active), replace degrades to plain dedup.
+          const during = yield* store.enqueue(baseRequest({ dedupe, payload: { n: 3 } }))
+          expect(during).toEqual({ id: first.id, duplicate: true })
+          const active = yield* store.getJob(first.id)
+          assert(Option.isSome(active))
+          expect(active.value.payload).toEqual({ n: 2 })
+        })
+      ))
+
+    it.effect("an existing explicit id wins over the dedup tree in every driver", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const key = { key: "k", ttlMs: undefined, extend: false, replace: false }
+          // X runs under key k and completes, freeing the key but staying in
+          // history.
+          const x = yield* store.enqueue(baseRequest({ id: JobId("X"), dedupe: key }))
+          const claim = yield* store.claim(claimOptions())
+          assert(claim._tag === "Claimed")
+          yield* store.ack(x.id, "t-1", { _tag: "Complete", exit: undefined })
+
+          // J takes over the key, delayed.
+          const j = yield* store.enqueue(
+            baseRequest({ dedupe: key, payload: { n: 9 }, delayMs: 60_000 })
+          )
+
+          // A retried enqueue of X (id exists) must return X untouched — the
+          // id check precedes the dedup tree, so J is neither returned nor
+          // replaced.
+          const retried = yield* store.enqueue(baseRequest({
+            id: JobId("X"),
+            payload: { n: 1 },
+            dedupe: { ...key, replace: true }
+          }))
+          expect(retried).toEqual({ id: "X", duplicate: true })
+          const job = yield* store.getJob(j.id)
+          assert(Option.isSome(job))
+          expect(job.value.payload).toEqual({ n: 9 })
+          expect(job.value.state).toBe("delayed")
+        })
+      ))
+
+    it.effect("a landed replace re-arms the ttl window", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const dedupe = { key: "k", ttlMs: 60_000, extend: false, replace: true }
+          const first = yield* store.enqueue(baseRequest({ dedupe, delayMs: 300_000 }))
+
+          // 50s in: replace lands; the window restarts from here.
+          yield* TestClock.adjust(50_000)
+          const replaced = yield* store.enqueue(
+            baseRequest({ dedupe, payload: { n: 2 }, delayMs: 300_000 })
+          )
+          expect(replaced).toEqual({ id: first.id, duplicate: true })
+
+          // 100s after the FIRST enqueue — past the original window, inside
+          // the re-armed one: still the same job.
+          yield* TestClock.adjust(50_000)
+          const again = yield* store.enqueue(
+            baseRequest({ dedupe, payload: { n: 3 }, delayMs: 300_000 })
+          )
+          expect(again).toEqual({ id: first.id, duplicate: true })
         })
       ))
 

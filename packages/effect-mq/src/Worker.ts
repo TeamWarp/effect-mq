@@ -534,6 +534,7 @@ export const make = <StoreId = JobStore>(
           backoff: schedule.backoff,
           keep: schedule.keep,
           timeoutMs: schedule.timeoutMs,
+          dedupe: undefined,
           delayMs: 0
         }))
         yield* retryStore(store.advanceSchedule(schedule.key, slot, next))

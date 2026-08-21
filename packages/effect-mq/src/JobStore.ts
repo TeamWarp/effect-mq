@@ -158,6 +158,8 @@ export interface JobRecord {
    * handler on its next heartbeat and acks `Cancelled`.
    */
   readonly cancelRequested: boolean
+  /** The dedup key this job was enqueued under, if any (see `DedupePolicy`). */
+  readonly dedupeKey: string | undefined
   /** Epoch millis before which the job must not be claimed. */
   readonly runAt: number
   readonly enqueuedAt: number
@@ -167,6 +169,36 @@ export interface JobRecord {
   readonly exit: unknown
   /** Set when the store itself failed the job (e.g. exceeded stall limit). */
   readonly failedReason: string | undefined
+}
+
+/**
+ * Deduplication policy carried on an enqueue request, scoped per job name.
+ * Dedup NEVER changes the job id — ids come from the caller, the idempotency
+ * key, or the store's id generator; the dedup key is a separate value with
+ * its own lifecycle:
+ *
+ * - `{ key }` (no ttl): dedupe while the keyed job is pending (waiting,
+ *   delayed, or active); a terminal keyed job frees the key.
+ * - `{ key, ttlMs }`: throttle — at most one job per key per window,
+ *   regardless of the keyed job's completion.
+ * - `extend` (requires `ttlMs`): each deduplicated enqueue pushes the window
+ *   out (debounce).
+ * - `replace`: while the keyed job is still *delayed*, the new enqueue's
+ *   payload/metadata/priority/attempts/backoff/keep/timeout/delay replace the
+ *   existing job's (id and ledger preserved), and a `ttlMs` window is
+ *   re-armed from the replace; in every other state normal dedup applies.
+ *
+ * A deduplicated (or replaced) enqueue returns the keyed job's id with
+ * `duplicate: true`.
+ *
+ * @since 0.3.0
+ */
+export interface DedupePolicy {
+  /** Non-empty; producers validate before the request reaches a driver. */
+  readonly key: string
+  readonly ttlMs: number | undefined
+  readonly extend: boolean
+  readonly replace: boolean
 }
 
 /**
@@ -188,6 +220,8 @@ export interface EnqueueRequest {
   readonly backoff: BackoffPolicy | undefined
   readonly keep: KeepPolicy | undefined
   readonly timeoutMs: number | undefined
+  /** Deduplicate against other enqueues sharing `dedupe.key` (same name). */
+  readonly dedupe: DedupePolicy | undefined
   readonly delayMs: number
 }
 

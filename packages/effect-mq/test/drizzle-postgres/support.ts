@@ -2,7 +2,7 @@ import * as JobStore from "../../src/JobStore.ts"
 import { PgClient } from "@effect/sql-pg"
 import { Effect, Layer, Redacted } from "effect"
 import * as net from "node:net"
-import { DrizzleJobStore, mqJobAttempts, mqJobs, mqQueueControl, mqSchedules } from "../../src/drizzle-postgres/index.ts"
+import { DrizzleJobStore, mqDedupe, mqJobAttempts, mqJobs, mqQueueControl, mqSchedules } from "../../src/drizzle-postgres/index.ts"
 
 export const pgUrl = process.env.EFFECT_MQ_PG_URL ??
   "postgres://postgres:postgres@localhost:5433/effect_mq_test"
@@ -35,7 +35,8 @@ export const createTablesSql = (
   jobs: string,
   attempts: string,
   schedules: string,
-  queues: string
+  queues: string,
+  dedupe: string
 ): ReadonlyArray<string> => [
   `CREATE TABLE "${jobs}" (
     id text PRIMARY KEY,
@@ -53,6 +54,7 @@ export const createTablesSql = (
     keep jsonb,
     timeout_ms bigint,
     cancel_requested boolean NOT NULL DEFAULT false,
+    dedupe_key text,
     run_at timestamptz NOT NULL,
     enqueued_at timestamptz NOT NULL,
     processed_at timestamptz,
@@ -97,6 +99,13 @@ export const createTablesSql = (
   `CREATE TABLE "${queues}" (
     queue text PRIMARY KEY,
     paused boolean NOT NULL DEFAULT false
+  )`,
+  `CREATE TABLE "${dedupe}" (
+    name text NOT NULL,
+    key text NOT NULL,
+    job_id text NOT NULL,
+    window_expires_at timestamptz,
+    PRIMARY KEY (name, key)
   )`
 ]
 
@@ -107,7 +116,8 @@ export const freshTableNames = () => {
     jobs: `mq_jobs_${suffix}`,
     attempts: `mq_att_${suffix}`,
     schedules: `mq_sched_${suffix}`,
-    queues: `mq_q_${suffix}`
+    queues: `mq_q_${suffix}`,
+    dedupe: `mq_dd_${suffix}`
   }
 }
 
@@ -122,16 +132,19 @@ export const freshStoreEffect = Effect.gen(function*() {
   const attempts = mqJobAttempts(jobs, names.attempts)
   const schedules = mqSchedules(names.schedules)
   const queues = mqQueueControl(names.queues)
-  for (const statement of createTablesSql(names.jobs, names.attempts, names.schedules, names.queues)) {
+  const dedupe = mqDedupe(names.dedupe)
+  for (
+    const statement of createTablesSql(names.jobs, names.attempts, names.schedules, names.queues, names.dedupe)
+  ) {
     yield* client.unsafe(statement)
   }
   yield* Effect.addFinalizer(() =>
     client.unsafe(
-      `DROP TABLE IF EXISTS "${names.attempts}", "${names.jobs}", "${names.schedules}", "${names.queues}" CASCADE`
+      `DROP TABLE IF EXISTS "${names.attempts}", "${names.jobs}", "${names.schedules}", "${names.queues}", "${names.dedupe}" CASCADE`
     ).pipe(Effect.ignore)
   )
-  const store = yield* DrizzleJobStore.make({ jobs, attempts, schedules, queues })
-  return { store, jobs, attempts, schedules, queues, names }
+  const store = yield* DrizzleJobStore.make({ jobs, attempts, schedules, queues, dedupe })
+  return { store, jobs, attempts, schedules, queues, dedupe, names }
 }).pipe(Effect.orDie)
 
 export const freshStoreLayer = (): Layer.Layer<JobStore.JobStore> =>
