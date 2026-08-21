@@ -192,6 +192,23 @@ export interface EnqueueRequest {
 }
 
 /**
+ * Generator for store-assigned job ids, used when `EnqueueRequest.id` is
+ * undefined (custom ids and idempotency keys always win, and schedule tick
+ * ids stay slot-deterministic). May be effectful (e.g. draw from Effect's
+ * `Random`). The store retries a bounded number of times when a generated id
+ * collides with an existing job, then fails the enqueue with
+ * `JobStoreError` — generators must have enough entropy that collisions are
+ * pathological, not routine.
+ *
+ * @example `({ name }) => \`${name}_${ulid()}\``
+ *
+ * @since 0.2.0
+ */
+export type IdGenerator = (
+  request: EnqueueRequest
+) => string | Effect.Effect<string>
+
+/**
  * @since 0.1.0
  */
 export interface EnqueueResult {

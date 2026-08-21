@@ -157,6 +157,25 @@ MemoryJobStore.layerWith({ historyTtl: "7 days" })
 DrizzleJobStore.layer({ jobs, attempts, schedules, queues, historyTtl: "90 days" })
 ```
 
+## Custom job ids
+
+Store-assigned ids default to a compact sequence (`j-<n>`). Bring your own
+generator when you want globally unique or prefixed ids:
+
+```ts
+import { ulid } from "ulid"
+
+DrizzleJobStore.layer({
+  jobs, attempts, schedules, queues,
+  idGenerator: ({ name }) => `${name}_${ulid()}`   // sync or Effect-returning
+})
+```
+
+The generator only runs for store-assigned ids — `idempotencyKey` ids and
+repeatable-schedule tick ids stay deterministic (exactly-once depends on
+them). Collisions are retried a bounded number of times, then the enqueue
+fails; bring real entropy.
+
 ## Postgres through drizzle
 
 The Postgres store runs on drizzle v1's Effect driver

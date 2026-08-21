@@ -16,6 +16,7 @@ import {
   type ClaimResult,
   type EnqueueRequest,
   type ExtendLocksResult,
+  type IdGenerator,
   JobId,
   JobNotCancellableError,
   JobNotFoundError,
@@ -26,6 +27,7 @@ import {
   JobStore,
   type ListResult,
   LockLostError,
+  JobStoreError,
   type QueueName,
   type ScheduleKey,
   type ScheduleRecord,
@@ -99,7 +101,7 @@ interface MemoryStore {
   readonly sweepHistory: (now: number, ttlMs: number) => void
 }
 
-const makeStoreUnsafe = (): MemoryStore => {
+const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemoryStore => {
   const jobs = new Map<string, MemJob>()
   const schedules = new Map<ScheduleKey, ScheduleRecord>()
   const paused = new Set<QueueName>()
@@ -198,10 +200,28 @@ const makeStoreUnsafe = (): MemoryStore => {
         const now = yield* Clock.currentTimeMillis
         let id = request.id
         if (id === undefined) {
-          // Store-assigned ids must never collide with user-supplied ones.
-          do {
-            id = JobId(`j-${++idCounter}`)
-          } while (jobs.has(id))
+          const generate = options?.idGenerator
+          if (generate === undefined) {
+            // Store-assigned ids must never collide with user-supplied ones.
+            do {
+              id = JobId(`j-${++idCounter}`)
+            } while (jobs.has(id))
+          } else {
+            // A user generator gets a bounded number of collision retries; a
+            // healthy generator's entropy makes even one retry pathological.
+            for (let i = 0; i < 5 && id === undefined; i++) {
+              const raw = generate(request)
+              const candidate = JobId(Effect.isEffect(raw) ? yield* raw : raw)
+              if (!jobs.has(candidate)) {
+                id = candidate
+              }
+            }
+            if (id === undefined) {
+              return yield* new JobStoreError({
+                message: "enqueue failed: could not generate a unique job id"
+              })
+            }
+          }
         } else if (jobs.has(id)) {
           return { id, duplicate: true }
         }
@@ -629,6 +649,11 @@ export interface MemoryJobStoreOptions {
   readonly historyTtl?: Duration.Input | undefined
   /** Sweep cadence (default 1 minute). */
   readonly historySweepInterval?: Duration.Input | undefined
+  /**
+   * Generator for store-assigned job ids (e.g. `() => \`job_${ulid()}\``).
+   * Default: a `j-<n>` counter. See `JobStore.IdGenerator`.
+   */
+  readonly idGenerator?: IdGenerator | undefined
 }
 
 /**
@@ -649,7 +674,7 @@ export const makeWith = (
   options?: MemoryJobStoreOptions | undefined
 ): Effect.Effect<Service, never, Scope.Scope> =>
   Effect.gen(function*() {
-    const { service, sweepHistory } = makeStoreUnsafe()
+    const { service, sweepHistory } = makeStoreUnsafe(options)
     if (options?.historyTtl !== undefined) {
       const ttlMs = Duration.toMillis(options.historyTtl)
       const intervalMs = Duration.toMillis(options.historySweepInterval ?? "1 minute")

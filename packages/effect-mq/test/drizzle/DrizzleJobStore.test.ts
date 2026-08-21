@@ -156,6 +156,64 @@ if (!available) {
         )
       }).pipe(Effect.scoped, Effect.provide(pgClientLive())))
 
+    it.effect("store-assigned ids come from the configured idGenerator; collisions fail after bounded retries", () =>
+      Effect.gen(function*() {
+        const client = yield* PgClient.PgClient
+        const names = freshTableNames()
+        const jobs = mqJobs(names.jobs)
+        const attempts = mqJobAttempts(jobs, names.attempts)
+        const schedules = mqSchedules(names.schedules)
+        const queues = mqQueueControl(names.queues)
+        for (
+          const statement of createTablesSql(names.jobs, names.attempts, names.schedules, names.queues)
+        ) {
+          yield* client.unsafe(statement).pipe(Effect.orDie)
+        }
+        yield* Effect.addFinalizer(() =>
+          client.unsafe(
+            `DROP TABLE IF EXISTS "${names.attempts}", "${names.jobs}", "${names.schedules}", "${names.queues}" CASCADE`
+          ).pipe(Effect.ignore)
+        )
+        let n = 0
+        const store = yield* DrizzleJobStore.make({
+          jobs,
+          attempts,
+          schedules,
+          queues,
+          idGenerator: ({ name }) => `job_${name}_${++n}`
+        }).pipe(Effect.orDie)
+
+        const base = {
+          id: undefined,
+          queue: JobStore.QueueName("default"),
+          payload: {},
+          metadata: {},
+          priority: 0,
+          attemptsMax: 1,
+          backoff: undefined,
+          keep: undefined,
+          timeoutMs: undefined,
+          delayMs: 0
+        }
+        const first = yield* store.enqueue({ ...base, name: "Gen" })
+        expect(first.id).toBe("job_Gen_1")
+
+        // User-supplied ids never consult the generator.
+        const custom = yield* store.enqueue({ ...base, name: "Gen", id: JobStore.JobId("mine") })
+        expect(custom.id).toBe("mine")
+        expect(n).toBe(1)
+
+        // Occupy every id the replayed generator will propose: the bounded
+        // retry loop must exhaust and fail rather than spin.
+        for (let i = 2; i <= 5; i++) {
+          yield* store.enqueue({ ...base, name: "Gen", id: JobStore.JobId(`job_Gen_${i}`) })
+        }
+        n = 0
+        const again = yield* Effect.flip(store.enqueue({ ...base, name: "Gen" }))
+        expect(again._tag).toBe("JobStoreError")
+        expect(n).toBe(5)
+      }).pipe(Effect.scoped, Effect.provide(pgClientLive())))
+
     it.live("historyTtl sweeps terminal rows; live rows survive", () =>
       Effect.gen(function*() {
         const client = yield* PgClient.PgClient

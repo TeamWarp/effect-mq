@@ -48,6 +48,11 @@ export interface DrizzleJobStoreOptions<StoreId = JobStore.JobStore> {
   /** History sweep cadence (default 1 minute). */
   readonly historySweepInterval?: Duration.Input | undefined
   /**
+   * Generator for store-assigned job ids (e.g. `() => \`job_${ulid()}\``).
+   * Default: `j-<seq>` from the jobs sequence. See `JobStore.IdGenerator`.
+   */
+  readonly idGenerator?: JobStore.IdGenerator | undefined
+  /**
    * Probe the tables at startup and fail fast when the schema is missing
    * (default true). Migrations are owned by your drizzle-kit pipeline.
    */
@@ -308,11 +313,21 @@ export const make = (
           const now = yield* nowDate
           const runAt = new Date(now.getTime() + Math.max(0, request.delayMs))
           const state = request.delayMs > 0 ? "delayed" : "waiting"
-          // Store-assigned ids come from the seq sequence; loop on the
-          // (unlikely) collision with a user-supplied id.
+          // Store-assigned ids come from the configured generator (or the
+          // seq sequence); loop on the (unlikely) collision with an existing
+          // id — ON CONFLICT DO NOTHING makes the retry safe.
+          const generate = options.idGenerator
           for (let i = 0; i < 5; i++) {
+            const generated = request.id === undefined && generate !== undefined
+              ? yield* Effect.suspend(() => {
+                const raw = generate(request)
+                return Effect.isEffect(raw) ? raw : Effect.succeed(raw)
+              })
+              : undefined
             const idExpr = request.id !== undefined
               ? sql`${request.id}`
+              : generated !== undefined
+              ? sql`${generated}`
               : sql`'j-' || ${seqExpr}::text`
             const rows = rowsOf(yield* db.execute<{ id: string }>(sql`
               INSERT INTO ${jobs} (id, name, queue, state, priority, payload, metadata,
