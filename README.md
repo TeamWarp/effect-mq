@@ -89,6 +89,9 @@ The store conformance suite (`effect-mq/testing`) runs against the
 in-memory driver, real Postgres, and real Redis — under `TestClock` in all
 cases, because drivers take all time as parameters from the Effect `Clock`.
 
+Release history lives in [CHANGELOG.md](./CHANGELOG.md); planned work in
+[ROADMAP.md](./ROADMAP.md).
+
 ## Releasing
 
 CI (`.github/workflows/ci.yml`) runs check/lint/tests (with Postgres and

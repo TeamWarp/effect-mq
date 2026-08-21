@@ -398,6 +398,43 @@ store un-encoded. For `Schema.Redacted` fields, Effect's semantics apply:
 
 Both behaviors are pinned by tests.
 
+## Reference: knobs at a glance
+
+Everything a job definition, an enqueue, and a worker can be tuned with:
+
+**`Job.make(name, options)`** — `payload` (schema or struct fields),
+`success`/`error` schemas, `idempotencyKey(payload)`, `dedupe(payload)`,
+`metadata(payload)`, `retryable(error)`, `queue`, `store`, and `defaults`
+(any per-enqueue option below).
+
+**Per enqueue** (`enqueue`/`execute` options) — `jobId`, `queue`,
+`metadata`, `dedupe`, `delay`, `priority` (higher first), `attempts`,
+`backoff` (`fixed`/`exponential`), `keep` (`count`/`age`), `timeout`.
+
+**Job verbs** — `enqueue`, `execute` (enqueue + await the typed result),
+`poll`, `awaitResult`, `attempts` (the decoded run ledger), `retry`,
+`cancel`, `promote`, `schedule`/`unschedule`, `toLayer` (register the
+handler).
+
+**`Worker.layer(options)`** — all durations take `Duration.Input`:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `store` | default `JobStore` | which named store this worker claims from |
+| `concurrency` | 1 | taker fibers per queue |
+| `queues` | — | per-queue overrides: `{ email: { concurrency: 5 } }` |
+| `lockDuration` | 30s | how long a claim's lock lasts before it counts as stalled |
+| `lockRenewInterval` | half of `lockDuration` | heartbeat cadence (also delivers cross-process cancels) |
+| `stalledInterval` | 30s | how often to sweep for stalled jobs |
+| `maxStalledCount` | 1 | stalls tolerated before a job is failed outright |
+| `pollInterval` | 5s | idle fallback when no wake-up arrives (~500ms is a good Postgres setting) |
+| `scheduleSweepInterval` | 15s | how often to tick due repeatable-job schedules |
+| `id` | random | identifier used in lock tokens |
+
+**Store construction** — every driver accepts `idGenerator`, `historyTtl`,
+and `historySweepInterval`; drizzle-postgres additionally takes the table
+instances (+ `validate`), Redis a key `prefix`.
+
 ## Writing a storage driver
 
 Implement the `JobStore` service (one atomic seam: `enqueue`, `claim`, `ack`,
@@ -423,7 +460,9 @@ suite in this repo runs the same conformance tests against a real database.
 
 Next up: trace propagation, a cross-process event stream, batch enqueue,
 custom drizzle columns, and parent-child fan-out. Full prioritized list:
-[ROADMAP.md](https://github.com/TeamWarp/effect-mq/blob/main/ROADMAP.md).
+[ROADMAP.md](https://github.com/TeamWarp/effect-mq/blob/main/ROADMAP.md);
+release history:
+[CHANGELOG.md](https://github.com/TeamWarp/effect-mq/blob/main/CHANGELOG.md).
 
 ## License
 
