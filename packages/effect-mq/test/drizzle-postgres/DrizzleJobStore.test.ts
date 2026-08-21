@@ -2,7 +2,7 @@ import { Job, JobStore, Worker } from "../../src/index.ts"
 import { PgClient } from "@effect/sql-pg"
 import { jobStoreConformance } from "../../src/testing/index.ts"
 import { assert, describe, expect, it } from "@effect/vitest"
-import { getTableConfig } from "drizzle-orm/pg-core"
+import { getTableConfig, index } from "drizzle-orm/pg-core"
 import { Effect, Exit, Fiber, Layer, Option, Schedule, Schema } from "effect"
 import { DrizzleJobStore, mqJobAttempts, mqJobs, mqQueueControl, mqSchedules } from "../../src/drizzle-postgres/index.ts"
 import { createTablesSql, freshStoreEffect, freshStoreLayer, freshTableNames, pgAvailable, pgClientLive, pgUrl } from "./support.ts"
@@ -468,6 +468,35 @@ if (!available) {
       void rejects
       expect(accepts).toBe("generate-invoice")
       expect(getTableConfig(table).name).toBe("typed_jobs")
+    })
+
+    it("extraConfig appends user indexes to the built-in ones on every factory", () => {
+      const jobs = mqJobs("extra_idx_jobs", {
+        extraConfig: (t) => [
+          index("extra_idx_jobs_name_recent_idx").on(t.name, t.enqueuedAt.desc())
+        ]
+      })
+      const jobIndexes = getTableConfig(jobs).indexes.map((entry) => entry.config.name)
+      // The six built-ins survive, the user's index is appended.
+      expect(jobIndexes).toHaveLength(7)
+      expect(jobIndexes).toContain("extra_idx_jobs_name_recent_idx")
+      expect(jobIndexes).toContain("extra_idx_jobs_ready_idx")
+
+      const attempts = mqJobAttempts(jobs, "extra_idx_attempts", {
+        extraConfig: (t) => [index("extra_idx_attempts_outcome_idx").on(t.outcome, t.finishedAt)]
+      })
+      expect(getTableConfig(attempts).indexes.map((entry) => entry.config.name))
+        .toEqual(["extra_idx_attempts_outcome_idx"])
+
+      const schedules = mqSchedules("extra_idx_sched", {
+        extraConfig: (t) => [index("extra_idx_sched_queue_idx").on(t.queue)]
+      })
+      expect(getTableConfig(schedules).indexes).toHaveLength(2)
+
+      const queues = mqQueueControl("extra_idx_queues", {
+        extraConfig: (t) => [index("extra_idx_queues_paused_idx").on(t.paused)]
+      })
+      expect(getTableConfig(queues).indexes).toHaveLength(1)
     })
   })
 }

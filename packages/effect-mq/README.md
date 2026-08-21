@@ -207,6 +207,18 @@ export const jobSchedules = mqSchedules()       // default: effect_mq_schedules
 export const jobQueues = mqQueueControl()       // default: effect_mq_queue_control
 ```
 
+Need more indexes (the built-ins cover claiming, listing, metadata
+containment, and `name`/`state`/`finishedAt` history)? Every factory takes an
+`extraConfig` callback — the same shape as drizzle's third `pgTable` argument —
+appended after the built-in indexes and owned by your migrations like
+everything else:
+
+```ts
+export const jobs = mqJobs<JobNames>("effect_mq_jobs", {
+  extraConfig: (t) => [index("jobs_name_recent_idx").on(t.name, t.enqueuedAt.desc())]
+})
+```
+
 ```
 drizzle-kit generate   # emits the CREATE TABLE migration next to your others
 drizzle-kit migrate

@@ -56,7 +56,9 @@ Redis/Postgres backends, `effect/unstable/workflow`, `DurableQueue`).
 - [ ] **Batch enqueue** (S) — `enqueueMany` in one round trip (one INSERT with
   multi-row VALUES); flagged as an easy perf win during the storage research.
 - [ ] **Drizzle schema customization + typed queue registry** (M, pair
-  these) — three related factory features:
+  these) — factory features (*custom indexes shipped in 0.2.1*: every factory
+  takes `extraConfig: (table) => [index(...).on(...)]`, appended after the
+  built-ins). Remaining:
   - *Custom columns*: `mqJobs<Names>(name, { extend: {...} })` with extras
     flowing through the generics (the driver already INSERTs an explicit
     column list, so extras need only be nullable/defaulted; the drift guard
