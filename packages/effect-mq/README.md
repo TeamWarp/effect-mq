@@ -14,7 +14,8 @@ One package, tree-shakeable modules:
 | Import | Contents | Extra peers |
 | --- | --- | --- |
 | `effect-mq` | `Job`, `JobStore`, `MemoryJobStore`, `Worker` | — |
-| `effect-mq/drizzle` | drizzle schema factories + the Postgres `JobStore` | `drizzle-orm` (v1), `@effect/sql-pg` |
+| `effect-mq/drizzle-postgres` | drizzle-postgres schema factories + the Postgres `JobStore` | `drizzle-orm` (v1), `@effect/sql-pg` |
+| `effect-mq/redis` | the Redis `JobStore` (Lua-script atomicity) | a `Redis` service (`@effect/platform-node`/`-bun`) |
 | `effect-mq/testing` | the `JobStore` conformance suite for driver authors | `@effect/vitest` |
 
 ## Five-minute tour
@@ -115,21 +116,21 @@ Because handlers are Effect fibers, the runtime can *actually stop them* —
 these verbs interrupt cleanly (finalizers run) instead of abandoning work:
 
 ```ts
-class SyncBenefits extends Job.make("sync-benefits", {
-  payload: { employerId: Schema.String },
-  error: SyncError,
+class GenerateInvoice extends Job.make("generate-invoice", {
+  payload: { invoiceId: Schema.String },
+  error: InvoiceError,
   defaults: { attempts: 5, timeout: "2 minutes" },  // per-run limit
-  retryable: (e) => e.reason !== "employer-deleted" // skip retries when futile
+  retryable: (e) => e.reason !== "invoice-voided"   // skip retries when futile
 }) {}
 
 // Inside a handler, mark a specific failure as not worth retrying:
-Effect.fail(Job.unrecoverable(new SyncError({ reason: "plan misconfigured" })))
+Effect.fail(Job.unrecoverable(new InvoiceError({ reason: "customer deleted" })))
 
 // From anywhere (a dashboard, another process):
-yield* SyncBenefits.cancel(jobId)   // waiting/delayed: terminal immediately;
-                                    // running: the worker's next heartbeat
-                                    // interrupts the handler fiber
-yield* SyncBenefits.promote(jobId)  // delayed -> runnable now
+yield* GenerateInvoice.cancel(jobId)   // waiting/delayed: terminal immediately;
+                                       // running: the worker's next heartbeat
+                                       // interrupts the handler fiber
+yield* GenerateInvoice.promote(jobId)  // delayed -> runnable now
 
 // Store-level (definition-free) equivalents for generic dashboards:
 const store = yield* JobStore.JobStore
@@ -195,10 +196,10 @@ migrations** — no library-run DDL, no parallel migration system:
 
 ```ts
 // db/schema.ts
-import { mqJobAttempts, mqJobs, mqQueueControl, mqSchedules } from "effect-mq/drizzle"
+import { mqJobAttempts, mqJobs, mqQueueControl, mqSchedules } from "effect-mq/drizzle-postgres"
 
 // The `name` column is typed to your job tags (derived, not hand-written):
-type JobNames = typeof SyncBenefits._tag | typeof GenerateReport._tag
+type JobNames = typeof GenerateInvoice._tag | typeof SendEmail._tag
 
 export const jobs = mqJobs<JobNames>()          // default table: effect_mq_jobs
 export const jobAttempts = mqJobAttempts(jobs)  // default: effect_mq_job_attempts
@@ -217,7 +218,7 @@ When a future effect-mq version changes the layout, the factory changes and
 ### 2. Provide the store layer
 
 ```ts
-import { DrizzleJobStore } from "effect-mq/drizzle"
+import { DrizzleJobStore } from "effect-mq/drizzle-postgres"
 import { PgClient } from "@effect/sql-pg"
 import { Layer, Redacted } from "effect"
 import { jobAttempts, jobQueues, jobs, jobSchedules } from "./db/schema.ts"
@@ -241,8 +242,8 @@ Product UIs read the tables directly with drizzle — fully typed:
 
 ```ts
 db.select().from(jobs).where(and(
-  eq(jobs.name, "sync-benefits"),                    // a typo is a compile error
-  sql`${jobs.metadata} @> ${{ employerId }}::jsonb`  // GIN-indexed containment
+  eq(jobs.name, "generate-invoice"),                 // a typo is a compile error
+  sql`${jobs.metadata} @> ${{ customerId }}::jsonb`  // GIN-indexed containment
 ))
 
 db.select().from(jobAttempts)
@@ -258,6 +259,38 @@ Worker tip: `awaitWake` is LISTEN/NOTIFY-driven, and the worker's
 `pollInterval` is the fallback — `Worker.layer({ pollInterval: "500 millis" })`
 is a good Postgres setting.
 
+## Redis store
+
+The Redis store (`effect-mq/redis`) implements every `JobStore` operation as
+one atomic Lua script, so it is safe across any number of producer and worker
+processes. It builds on Effect's client-agnostic `Redis` service — provide it
+from your platform package (no extra peers beyond what you already run):
+
+```ts
+import { RedisJobStore } from "effect-mq/redis"
+import { NodeRedis } from "@effect/platform-node"   // node-redis under the hood
+// import { BunRedis } from "@effect/platform-bun"  // Bun.redis under the hood
+import { Layer } from "effect"
+
+const JobStoreLive = RedisJobStore.layer({
+  prefix: "myapp-jobs",          // key namespace (default "effect-mq")
+  historyTtl: "30 days"          // optional retention ceiling
+}).pipe(
+  Layer.provide(NodeRedis.layer({ url: process.env.REDIS_URL }))
+)
+```
+
+Wake-ups ride pub/sub (`<prefix>:wake`), so idle workers in other processes
+pick new jobs up promptly; the worker's `pollInterval` is the fallback. Notes:
+
+- Keys are plain-prefixed (no hash tags) — point it at a single Redis /
+  Valkey node or a cluster-unaware proxy, not Redis Cluster.
+- `list` filters scan server-side in Lua: fine for dashboards, not for
+  millions of terminal rows — set `historyTtl`/`keep` accordingly. `counts`
+  is O(1) (maintained counters).
+- The same conformance suite that runs against Postgres runs against a real
+  Redis in this repo, TestClock included (scripts take time via ARGV).
+
 ## Multiple stores on different infrastructure
 
 Bind jobs to *named stores* so business-critical runs live in Postgres while
@@ -267,17 +300,17 @@ disposable ones live elsewhere — enforced by the type system:
 import { Job, JobStore, MemoryJobStore, Worker } from "effect-mq"
 
 const Durable = JobStore.named("durable")       // -> Postgres in prod
-const Ephemeral = JobStore.named("ephemeral")   // -> memory/Redis
+const Ephemeral = JobStore.named("ephemeral")   // -> Redis or memory
 
-class SyncBenefits extends Job.make("sync-benefits", {
-  payload: { employerId: Schema.String },
-  idempotencyKey: ({ employerId }) => employerId,
+class GenerateInvoice extends Job.make("generate-invoice", {
+  payload: { invoiceId: Schema.String },
+  idempotencyKey: ({ invoiceId }) => invoiceId,
   store: Durable
 }) {}
 
 // Forgetting the Durable layer is now a COMPILE error at every enqueue site.
 // Workers bind to one store:
-const durableWorkers = SyncBenefits.toLayer(handler).pipe(
+const durableWorkers = GenerateInvoice.toLayer(handler).pipe(
   Layer.provide(Worker.layer({ store: Durable }))     // local provide: several
 )                                                     // workers can coexist
 ```
@@ -290,11 +323,11 @@ a **store** is an infrastructure/durability domain hosting many queues.
 
 Two kinds of "business context", two homes:
 
-- **Ops UI** ("list sync runs for employer X, retry that one"): use the
+- **Ops UI** ("list invoice runs for customer X, retry that one"): use the
   `metadata` projection — a flat `Record<string, string>` derived from the
   payload, indexed by every driver, filterable via `store.list` or raw SQL.
-- **Domain history** ("what did this sync actually change"): your own table,
-  joined by the *deterministic* job id from `idempotencyKey`. The queue's
+- **Domain history** ("what did this invoice run actually produce"): your own
+  table, joined by the *deterministic* job id from `idempotencyKey`. The queue's
   retention (`keep`) can then prune freely while your business history lives
   forever. Don't let queue infrastructure own business data lifecycles.
 
@@ -338,8 +371,8 @@ suite in this repo runs the same conformance tests against a real database.
 ## Roadmap
 
 Next up: richer deduplication (throttle/debounce), trace propagation, a
-cross-process event stream, batch enqueue, drizzle schema customization, a
-Redis store, and parent-child fan-out. Full prioritized list:
+cross-process event stream, batch enqueue, drizzle schema customization, and
+parent-child fan-out. Full prioritized list:
 [ROADMAP.md](https://github.com/TeamWarp/effect-mq/blob/main/ROADMAP.md).
 
 ## License

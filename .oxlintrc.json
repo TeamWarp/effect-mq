@@ -98,7 +98,8 @@
     },
     {
       "files": [
-        "packages/effect-mq/test/drizzle/**"
+        "packages/effect-mq/test/drizzle-postgres/**",
+        "packages/effect-mq/test/redis/**"
       ],
       "rules": {
         "vitest/no-conditional-tests": "off",

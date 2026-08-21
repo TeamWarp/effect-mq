@@ -30,8 +30,9 @@
   "exports": {
     "./package.json": "./package.json",
     ".": "./src/index.ts",
-    "./drizzle": "./src/drizzle/index.ts",
-    "./testing": "./src/testing/index.ts"
+    "./drizzle-postgres": "./src/drizzle-postgres/index.ts",
+    "./testing": "./src/testing/index.ts",
+    "./redis": "./src/redis/index.ts"
   },
   "publishConfig": {
     "access": "public",
@@ -68,6 +69,8 @@
     "drizzle-orm": "catalog:",
     "effect": "catalog:",
     "pg": "catalog:",
-    "typescript": "catalog:"
+    "typescript": "catalog:",
+    "@effect/platform-node": "catalog:",
+    "redis": "catalog:"
   }
 }

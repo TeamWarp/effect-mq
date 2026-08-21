@@ -908,16 +908,16 @@ describe("named stores (multi-store routing)", () => {
       const durableStore = yield* MemoryJobStore.make
       const defaultStore = yield* MemoryJobStore.make
 
-      const SyncBenefits = Job.make("SyncBenefits", {
-        payload: { employerId: Schema.String },
+      const GenerateInvoice = Job.make("GenerateInvoice", {
+        payload: { invoiceId: Schema.String },
         success: Schema.String,
         store: Durable,
-        metadata: ({ employerId }) => ({ employerId })
+        metadata: ({ invoiceId }) => ({ invoiceId })
       })
-      const handlers = SyncBenefits.toLayer(({ employerId }) => Effect.succeed(`synced ${employerId}`))
+      const handlers = GenerateInvoice.toLayer(({ invoiceId }) => Effect.succeed(`generated ${invoiceId}`))
 
       const result = yield* Effect.gen(function*() {
-        const fiber = yield* Effect.forkChild(SyncBenefits.execute({ employerId: "emp-1" }))
+        const fiber = yield* Effect.forkChild(GenerateInvoice.execute({ invoiceId: "inv-1" }))
         yield* settle
         yield* TestClock.adjust("1 second")
         return yield* Fiber.join(fiber)
@@ -931,11 +931,11 @@ describe("named stores (multi-store routing)", () => {
         )
       )
 
-      expect(result).toBe("synced emp-1")
+      expect(result).toBe("generated inv-1")
       // The run lives in the durable store only, with its metadata projection.
       expect((yield* durableStore.counts()).completed).toBe(1)
       expect((yield* defaultStore.counts()).completed).toBe(0)
-      const listed = yield* durableStore.list({ metadata: { employerId: "emp-1" } })
+      const listed = yield* durableStore.list({ metadata: { invoiceId: "inv-1" } })
       expect(listed.items).toHaveLength(1)
     }))
 
@@ -1108,17 +1108,17 @@ describe("review gap coverage", () => {
   it.effect("poll exposes the metadata projection", () =>
     Effect.gen(function*() {
       const Tagged = Job.make("Tagged", {
-        payload: { employerId: Schema.String },
-        metadata: ({ employerId }) => ({ employerId })
+        payload: { invoiceId: Schema.String },
+        metadata: ({ invoiceId }) => ({ invoiceId })
       })
       yield* Effect.gen(function*() {
         const id = yield* Tagged.enqueue(
-          { employerId: "emp-9" },
+          { invoiceId: "emp-9" },
           { metadata: { source: "api" } }
         )
         const status = yield* Tagged.poll(id)
         assert(Option.isSome(status))
-        expect(status.value.metadata).toEqual({ employerId: "emp-9", source: "api" })
+        expect(status.value.metadata).toEqual({ invoiceId: "emp-9", source: "api" })
       }).pipe(Effect.provide(MemoryJobStore.layer))
     }))
 })

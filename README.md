@@ -28,8 +28,9 @@ const producer = Effect.gen(function*() {
 ## Highlights
 
 - **One package, tree-shakeable modules** — `effect-mq` (core),
-  `effect-mq/drizzle` (Postgres store + schema factories),
-  `effect-mq/testing` (driver conformance kit). Extra peers are optional.
+  `effect-mq/drizzle-postgres` (Postgres store + schema factories),
+  `effect-mq/redis` (Redis store), `effect-mq/testing` (driver conformance
+  kit). Extra peers are optional.
 - **At-least-once** with token-guarded locks, heartbeat renewal, and stalled
   recovery; **durable retries** routed through the store, never held in a
   worker's memory.
@@ -46,10 +47,13 @@ const producer = Effect.gen(function*() {
 - **Fiber-native control**: handler `timeout`s, cross-process `cancel` of
   running jobs (the handler fiber is interrupted, finalizers run), `promote`,
   queue `pause`/`resume`, and unrecoverable errors that skip the retry budget.
-- **Drizzle-native Postgres**: the job tables are drizzle schema factories you
-  re-export — drizzle-kit owns migrations; queries are fully typed including
-  the job-name union. `FOR UPDATE SKIP LOCKED` claims, LISTEN/NOTIFY
-  wake-ups, Node and Bun.
+- **Drizzle-native Postgres**: the job tables are drizzle-postgres schema
+  factories you re-export — drizzle-kit owns migrations; queries are fully
+  typed including the job-name union. `FOR UPDATE SKIP LOCKED` claims,
+  LISTEN/NOTIFY wake-ups, Node and Bun.
+- **Redis store**: every operation is one atomic Lua script over Effect's
+  client-agnostic `Redis` service (`@effect/platform-node`/`-bun` provide
+  it); pub/sub wake-ups; the same conformance suite runs against it.
 - **Redaction-aware persistence**: everything is stored schema-encoded;
   `Schema.Redacted` round-trips (handlers get `Redacted` values),
   `disallowJsonEncode` refuses persistence entirely.
@@ -58,9 +62,10 @@ const producer = Effect.gen(function*() {
 
 ```
 packages/effect-mq        the published package (src + tests, incl. the
-                          Postgres suite under test/drizzle)
+                          Postgres and Redis suites under test/)
 examples/basic            runnable end-to-end demo: bun src/main.ts
-docker-compose.yml        Postgres 17 on port 5433 for the drizzle test suite
+docker-compose.yml        Postgres 17 (5433) + Redis 8 (6380) for the
+                          storage test suites
 tools/oxlint/anti-slop    local lint plugin enforcing honest types
 ```
 
@@ -71,20 +76,21 @@ bun install
 bun run check     # TypeScript 7, per package
 bun run lint      # oxlint (incl. anti-slop rules)
 bun run test      # vitest 4 + @effect/vitest, TestClock-driven
-                  # (the Postgres suite self-skips without a database)
+                  # (storage suites self-skip without their backing service)
 bun run test:pg   # docker compose up + the Postgres suite
+bun run test:redis  # docker compose up + the Redis suite
 bun run ready     # check + lint + test
 bun run build     # emit dist (tsc, .ts imports rewritten to .js)
 ```
 
-The store conformance suite (`effect-mq/testing`) runs against both the
-in-memory driver and real Postgres — under `TestClock` in both cases, because
-drivers take all time as bind parameters from the Effect `Clock`.
+The store conformance suite (`effect-mq/testing`) runs against the
+in-memory driver, real Postgres, and real Redis — under `TestClock` in all
+cases, because drivers take all time as parameters from the Effect `Clock`.
 
 ## Releasing
 
-CI (`.github/workflows/ci.yml`) runs check/lint/tests (with a Postgres service
-container) on every push and PR. Publishing to npm happens on version tags:
+CI (`.github/workflows/ci.yml`) runs check/lint/tests (with Postgres and
+Redis service containers) on every push and PR. Publishing to npm happens on version tags:
 
 ```sh
 # bump "version" in packages/effect-mq/package.json, then

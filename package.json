@@ -14,8 +14,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "ready": "bun run check && bun run lint && bun run test",
-    "test:pg": "docker compose up -d --wait && vitest run --project effect-mq packages/effect-mq/test/drizzle",
-    "build": "bun run --filter 'effect-mq' build"
+    "test:pg": "docker compose up -d --wait && vitest run --project effect-mq packages/effect-mq/test/drizzle-postgres",
+    "build": "bun run --filter 'effect-mq' build",
+    "test:redis": "docker compose up -d --wait && vitest run --project effect-mq packages/effect-mq/test/redis"
   },
   "devDependencies": {
     "@effect/vitest": "catalog:",
@@ -40,6 +41,8 @@
     "drizzle-kit": "1.0.0-rc.5-ab785fc",
     "pg": "8.23.0",
     "@types/pg": "8.15.6",
-    "@effect/sql-pg": "4.0.0-rc.111"
+    "@effect/sql-pg": "4.0.0-rc.111",
+    "@effect/platform-node": "4.0.0-rc.111",
+    "redis": "6.2.1"
   }
 }

@@ -9,7 +9,7 @@
  * // schema.ts
  * import { mqJobAttempts, mqJobs } from "effect-mq/drizzle"
  *
- * type DurableJobs = typeof SyncBenefits._tag | typeof GenerateReport._tag
+ * type DurableJobs = typeof GenerateInvoice._tag | typeof GenerateReport._tag
  * export const jobs = mqJobs<DurableJobs>()
  * export const jobAttempts = mqJobAttempts(jobs)
  * ```
@@ -34,7 +34,7 @@ type KeepPolicy = JobStore.KeepPolicy
 type AttemptOutcome = JobStore.AttemptRecord["outcome"]
 /**
  * The jobs table factory. `JobName` types the `name` column — derive it from
- * your job definitions: `mqJobs<typeof SyncBenefits._tag | typeof Report._tag>()`.
+ * your job definitions: `mqJobs<typeof GenerateInvoice._tag | typeof Report._tag>()`.
  *
  * @since 0.1.0
  */

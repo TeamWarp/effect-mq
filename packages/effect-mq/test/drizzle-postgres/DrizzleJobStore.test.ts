@@ -4,7 +4,7 @@ import { jobStoreConformance } from "../../src/testing/index.ts"
 import { assert, describe, expect, it } from "@effect/vitest"
 import { getTableConfig } from "drizzle-orm/pg-core"
 import { Effect, Exit, Fiber, Layer, Option, Schedule, Schema } from "effect"
-import { DrizzleJobStore, mqJobAttempts, mqJobs, mqQueueControl, mqSchedules } from "../../src/drizzle/index.ts"
+import { DrizzleJobStore, mqJobAttempts, mqJobs, mqQueueControl, mqSchedules } from "../../src/drizzle-postgres/index.ts"
 import { createTablesSql, freshStoreEffect, freshStoreLayer, freshTableNames, pgAvailable, pgClientLive, pgUrl } from "./support.ts"
 
 const available = await pgAvailable()
@@ -460,13 +460,13 @@ if (!available) {
       }).pipe(Effect.scoped, Effect.provide(pgClientLive())))
 
     it("the jobs table `name` column is typed to the job-tag union", () => {
-      const table = mqJobs<"sync-benefits" | "send-email">("typed_jobs")
+      const table = mqJobs<"generate-invoice" | "send-email">("typed_jobs")
       type NameType = typeof table.name._.data
-      const accepts: NameType = "sync-benefits"
+      const accepts: NameType = "generate-invoice"
       // @ts-expect-error - not part of the union
       const rejects: NameType = "typo-job"
       void rejects
-      expect(accepts).toBe("sync-benefits")
+      expect(accepts).toBe("generate-invoice")
       expect(getTableConfig(table).name).toBe("typed_jobs")
     })
   })

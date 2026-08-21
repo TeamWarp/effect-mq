@@ -24,7 +24,8 @@ const pkg = JSON.parse(readFileSync(path, "utf8"))
 pkg.exports = {
   "./package.json": "./package.json",
   ".": { types: "./dist/index.d.ts", default: "./dist/index.js" },
-  "./drizzle": { types: "./dist/drizzle/index.d.ts", default: "./dist/drizzle/index.js" },
+  "./drizzle-postgres": { types: "./dist/drizzle-postgres/index.d.ts", default: "./dist/drizzle-postgres/index.js" },
+  "./redis": { types: "./dist/redis/index.d.ts", default: "./dist/redis/index.js" },
   "./testing": { types: "./dist/testing/index.d.ts", default: "./dist/testing/index.js" }
 }
 // devDependencies use bun's `catalog:` protocol, which npm cannot parse —

@@ -985,6 +985,75 @@ export const jobStoreConformance = (
         })
       ))
 
+    it.effect("counts stay consistent across cancel, retry, keep pruning, and remove", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          // Three completions with keep {count: 1}: two get pruned.
+          for (let i = 0; i < 3; i++) {
+            const { id } = yield* store.enqueue(baseRequest({ payload: { n: i }, keep: { count: 1 } }))
+            const claim = yield* store.claim(claimOptions({ token: `t-${i}` }))
+            assert(claim._tag === "Claimed")
+            yield* store.ack(id, `t-${i}`, { _tag: "Complete", exit: undefined })
+            yield* TestClock.adjust(10)
+          }
+          expect((yield* store.counts()).completed).toBe(1)
+
+          // Cancel a waiting job.
+          const doomed = yield* store.enqueue(baseRequest({ name: "Doomed" }))
+          yield* store.cancel(doomed.id)
+          expect((yield* store.counts()).cancelled).toBe(1)
+
+          // Fail a job, then admin-retry it: failed -> waiting.
+          const flaky = yield* store.enqueue(baseRequest())
+          const claim = yield* store.claim(claimOptions({ token: "t-f" }))
+          assert(claim._tag === "Claimed")
+          yield* store.ack(flaky.id, "t-f", { _tag: "Fail", exit: undefined })
+          expect((yield* store.counts()).failed).toBe(1)
+          yield* store.retry(flaky.id)
+
+          // Remove the surviving completed record.
+          const completed = yield* store.list({ states: ["completed"] })
+          const survivor = completed.items[0]
+          assert(survivor !== undefined)
+          expect(yield* store.remove(survivor.id)).toBe(true)
+
+          expect(yield* store.counts()).toEqual({
+            waiting: 1,
+            delayed: 0,
+            active: 0,
+            completed: 0,
+            failed: 0,
+            cancelled: 1
+          })
+        })
+      ))
+
+    it.effect("schedule payloads round-trip high-precision numbers and empty arrays exactly", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const payload = { big: 1234567890123456, third: 1 / 3, empty: [] }
+          const schedule: JobStore.ScheduleRecord = {
+            key: JobStore.ScheduleKey("TestJob/precise"),
+            jobName: "TestJob",
+            queue: QueueName("default"),
+            cron: undefined,
+            tz: undefined,
+            everyMs: 60_000,
+            payload,
+            metadata: {},
+            priority: 0,
+            attemptsMax: 1,
+            backoff: undefined,
+            keep: undefined,
+            timeoutMs: undefined,
+            nextRunAt: 60_000
+          }
+          yield* store.upsertSchedule(schedule)
+          const stored = (yield* store.listSchedules())[0]
+          expect(stored?.payload).toEqual(payload)
+        })
+      ))
+
     it.effect("delayed jobs still promote to waiting while their queue is paused", () =>
       withStore((store) =>
         Effect.gen(function*() {

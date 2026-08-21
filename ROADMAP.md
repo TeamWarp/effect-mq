@@ -81,10 +81,14 @@ Redis/Postgres backends, `effect/unstable/workflow`, `DurableQueue`).
   active per queue" checked in `claim` (today concurrency is per-worker), and
   a `{ max, duration }` limiter with `claim` returning the retry-after so
   idle workers sleep precisely.
-- [ ] **Redis store** (L) — the conformance suite is ready; the time-as-
-  client-param discipline carries over (Lua receives `now` via ARGV, as
-  BullMQ does). Main work: one atomic Lua script per `JobStore` op. Verify
-  `Bun.redis` supports EVAL and blocking ops before choosing it.
+- [x] **Redis store** (L) — *shipped in 0.2.0 as `effect-mq/redis`*: one
+  atomic Lua script per `JobStore` op over `effect/unstable/persistence`'s
+  client-agnostic `Redis` service (users provide `NodeRedis`/`BunRedis`
+  layers), pub/sub wake channel, full conformance under TestClock against a
+  real server. Follow-ups live in P1/P2 (indexed `list`, cluster support).
+- [ ] **Redis store hardening** (M) — indexed `list` filters (secondary
+  index sets instead of the Lua scan), Redis Cluster support (hash-tagged
+  keys so scripts stay single-slot), and a `waiting`-set benchmark.
 - [ ] **Archive-table split** (M) — move terminal rows to an append-only
   archive so the hot claim index stays small with indefinite history; the
   drizzle factories grow an archive table and `list` reads the union.

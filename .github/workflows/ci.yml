@@ -22,6 +22,15 @@ jobs:
           --health-interval 2s
           --health-timeout 2s
           --health-retries 30
+      redis:
+        image: redis:8-alpine
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -30,7 +39,7 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run check
       - run: bun run lint
-      # The Postgres suite runs against the service container above.
+      # The Postgres and Redis suites run against the service containers above.
       - run: bun run test
       - run: bun run --filter 'effect-mq' build
 

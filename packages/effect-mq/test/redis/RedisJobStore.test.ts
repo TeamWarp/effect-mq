@@ -1,0 +1,216 @@
+import { Job, JobStore, Worker } from "../../src/index.ts"
+import { jobStoreConformance } from "../../src/testing/index.ts"
+import { assert, describe, expect, it } from "@effect/vitest"
+import { Effect, Fiber, Layer, Option, Schedule, Schema } from "effect"
+import { RedisJobStore } from "../../src/redis/index.ts"
+import { freshPrefix, redisAvailable, redisLive, redisUrl } from "./support.ts"
+
+const available = await redisAvailable()
+
+if (!available) {
+  describe("RedisJobStore", () => {
+    it.skip(`skipped: no Redis at ${redisUrl} — run \`docker compose up -d --wait\``, () => {})
+  })
+} else {
+  // The shared contract, against a real Redis. Works under TestClock because
+  // every Lua script receives time via ARGV from the Effect Clock.
+  jobStoreConformance("RedisJobStore", () =>
+    RedisJobStore.layer({ prefix: freshPrefix() }).pipe(
+      Layer.provide(redisLive())
+    ))
+
+  describe("RedisJobStore specifics", () => {
+    it.live("a full job lifecycle round-trips through Redis end to end", () =>
+      Effect.gen(function*() {
+        class Report extends Job.make("Report", {
+          payload: { month: Schema.String },
+          success: Schema.String,
+          error: Schema.String,
+          metadata: ({ month }) => ({ month }),
+          defaults: { attempts: 2 }
+        }) {}
+        let attempt = 0
+        const handlers = Report.toLayer((payload, ctx) => {
+          attempt = ctx.attempt
+          return ctx.attempt === 1
+            ? Effect.fail("flaky")
+            : Effect.succeed(`report ${payload.month} sent`)
+        })
+
+        const store = yield* RedisJobStore.make({ prefix: freshPrefix() })
+        const storeLayer = Layer.succeed(JobStore.JobStore, store)
+
+        const result = yield* Report.execute({ month: "2026-08" }).pipe(
+          Effect.provide(
+            handlers.pipe(
+              Layer.provideMerge(Worker.layer({ pollInterval: "100 millis", lockDuration: "5 seconds" })),
+              Layer.provideMerge(storeLayer)
+            )
+          )
+        )
+        expect(result).toBe("report 2026-08 sent")
+        expect(attempt).toBe(2)
+
+        const listed = yield* store.list({ metadata: { month: "2026-08" } })
+        expect(listed.items).toHaveLength(1)
+        const record = listed.items[0]
+        assert(record !== undefined)
+        expect(record.state).toBe("completed")
+        expect(record.attemptsMade).toBe(2)
+
+        const ledger = yield* store.getAttempts(record.id)
+        expect(ledger.map((entry) => entry.outcome)).toEqual(["retried", "completed"])
+      }).pipe(Effect.scoped, Effect.provide(redisLive())))
+
+    it.live("a pub/sub wake reaches a waiter in another store instance", () =>
+      Effect.gen(function*() {
+        // Two make() instances over the SAME prefix simulate two processes:
+        // instance A's local wake version cannot help — only the published
+        // message delivered through SUBSCRIBE can wake it.
+        const prefix = freshPrefix()
+        const a = yield* RedisJobStore.make({ prefix })
+        const b = yield* RedisJobStore.make({ prefix })
+
+        const empty = yield* a.claim({
+          queue: JobStore.QueueName("default"),
+          names: ["Cross"],
+          token: "t-a",
+          lockDurationMs: 5_000
+        })
+        assert(empty._tag === "Empty")
+        const waiter = yield* Effect.forkChild(
+          a.awaitWake([JobStore.QueueName("default")], empty.wakeToken)
+        )
+        yield* Effect.sleep("100 millis")
+
+        yield* b.enqueue({
+          id: undefined,
+          name: "Cross",
+          queue: JobStore.QueueName("default"),
+          payload: {},
+          metadata: {},
+          priority: 0,
+          attemptsMax: 1,
+          backoff: undefined,
+          keep: undefined,
+          timeoutMs: undefined,
+          delayMs: 0
+        })
+        yield* Fiber.join(waiter).pipe(Effect.timeout("5 seconds"))
+      }).pipe(Effect.scoped, Effect.provide(redisLive())))
+
+    it.effect("store-assigned ids come from the configured idGenerator", () =>
+      Effect.gen(function*() {
+        let n = 0
+        const store = yield* RedisJobStore.make({
+          prefix: freshPrefix(),
+          idGenerator: ({ name }) => `job_${name}_${++n}`
+        })
+        const base = {
+          id: undefined,
+          queue: JobStore.QueueName("default"),
+          payload: {},
+          metadata: {},
+          priority: 0,
+          attemptsMax: 1,
+          backoff: undefined,
+          keep: undefined,
+          timeoutMs: undefined,
+          delayMs: 0
+        }
+        const first = yield* store.enqueue({ ...base, name: "Gen" })
+        expect(first.id).toBe("job_Gen_1")
+        const custom = yield* store.enqueue({ ...base, name: "Gen", id: JobStore.JobId("mine") })
+        expect(custom.id).toBe("mine")
+        expect(n).toBe(1)
+
+        // Occupy every id the replayed generator will propose: the bounded
+        // retry loop must exhaust and fail rather than spin.
+        for (let i = 2; i <= 5; i++) {
+          yield* store.enqueue({ ...base, name: "Gen", id: JobStore.JobId(`job_Gen_${i}`) })
+        }
+        n = 0
+        const again = yield* Effect.flip(store.enqueue({ ...base, name: "Gen" }))
+        expect(again._tag).toBe("JobStoreError")
+        expect(n).toBe(5)
+      }).pipe(Effect.scoped, Effect.provide(redisLive())))
+
+    it.effect("two stores on one prefix contend atomically; other prefixes are isolated", () =>
+      Effect.gen(function*() {
+        const prefix = freshPrefix()
+        const a = yield* RedisJobStore.make({ prefix })
+        const b = yield* RedisJobStore.make({ prefix })
+        const other = yield* RedisJobStore.make({ prefix: freshPrefix() })
+
+        const base = {
+          id: undefined,
+          name: "Contended",
+          queue: JobStore.QueueName("default"),
+          payload: {},
+          metadata: {},
+          priority: 0,
+          attemptsMax: 1,
+          backoff: undefined,
+          keep: undefined,
+          timeoutMs: undefined,
+          delayMs: 0
+        }
+        const { id } = yield* a.enqueue(base)
+
+        // The same data is visible through both same-prefix instances...
+        expect(Option.isSome(yield* b.getJob(id))).toBe(true)
+        // ...and invisible through a different prefix.
+        expect(Option.isNone(yield* other.getJob(id))).toBe(true)
+        expect((yield* other.counts()).waiting).toBe(0)
+
+        // Exactly one contender wins the claim; Lua atomicity, not luck.
+        const claims = yield* Effect.all(
+          [
+            a.claim({ queue: base.queue, names: ["Contended"], token: "t-a", lockDurationMs: 5_000 }),
+            b.claim({ queue: base.queue, names: ["Contended"], token: "t-b", lockDurationMs: 5_000 })
+          ],
+          { concurrency: 2 }
+        )
+        expect(claims.filter((claim) => claim._tag === "Claimed")).toHaveLength(1)
+      }).pipe(Effect.scoped, Effect.provide(redisLive())))
+
+    it.live("historyTtl sweeps terminal jobs; live jobs survive", () =>
+      Effect.gen(function*() {
+        const store = yield* RedisJobStore.make({
+          prefix: freshPrefix(),
+          historyTtl: "80 millis",
+          historySweepInterval: "40 millis"
+        })
+        const base = {
+          id: undefined,
+          queue: JobStore.QueueName("default"),
+          payload: {},
+          metadata: {},
+          priority: 0,
+          attemptsMax: 1,
+          backoff: undefined,
+          keep: undefined,
+          timeoutMs: undefined,
+          delayMs: 0
+        }
+        const done = yield* store.enqueue({ ...base, name: "Swept" })
+        const claim = yield* store.claim({
+          queue: JobStore.QueueName("default"),
+          names: ["Swept"],
+          token: "t-ttl",
+          lockDurationMs: 5_000
+        })
+        assert(claim._tag === "Claimed")
+        yield* store.ack(done.id, "t-ttl", { _tag: "Complete", exit: undefined })
+        const waiting = yield* store.enqueue({ ...base, name: "Waits" })
+
+        yield* store.getJob(done.id).pipe(
+          Effect.flatMap((record) =>
+            Option.isNone(record) ? Effect.void : Effect.fail(new Error("not swept yet"))
+          ),
+          Effect.retry({ schedule: Schedule.spaced("40 millis"), times: 50 })
+        )
+        expect(Option.isSome(yield* store.getJob(waiting.id))).toBe(true)
+      }).pipe(Effect.scoped, Effect.provide(redisLive())))
+  })
+}

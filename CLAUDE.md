@@ -112,14 +112,17 @@ Effect-native background job library on **Effect v4** (`effect@4.0.0-rc.x`,
 pinned in the root `catalog`).
 
 - Architecture: ONE published package, `packages/effect-mq`, with subpath
-  modules (`effect-mq`, `effect-mq/drizzle`, `effect-mq/testing`; optional
-  peers for the non-core subpaths). `src/JobStore.ts` is the storage seam
+  modules (`effect-mq`, `effect-mq/drizzle-postgres`, `effect-mq/redis`,
+  `effect-mq/testing`; optional peers for the non-core subpaths). `src/JobStore.ts` is the storage seam
   (atomic driver interface, encoded payloads/exits, named store keys,
   attempts ledger, list/retry/keep); `src/MemoryJobStore.ts` is the reference
   driver; `src/Job.ts` the definition/producer API; `src/Worker.ts` the
-  runner; `src/drizzle/` the Postgres store (drizzle 1.0 effect driver over
+  runner; `src/drizzle-postgres/` the Postgres store (drizzle 1.0 effect driver over
   `@effect/sql-pg`; schema factories owned by the user's drizzle-kit
-  migrations); `src/testing/` the conformance suite every driver must pass.
+  migrations); `src/redis/` the Redis store (atomic Lua scripts over
+  `effect/unstable/persistence`'s `Redis` service; provide it via
+  `@effect/platform-node` `NodeRedis` or `-bun` `BunRedis`); `src/testing/`
+  the conformance suite every driver must pass.
 - Publishing: `npm publish` from `packages/effect-mq` (CI does this on `v*`
   tags with NPM_TOKEN). `prepack` builds dist and swaps the dev TS-source
   exports for dist exports; `postpack` restores. bun does NOT apply
@@ -127,8 +130,9 @@ pinned in the root `catalog`).
 - Lint includes the local anti-slop plugin (`tools/oxlint/anti-slop`):
   type assertions need `SAFETY:` comments, no `as any`, no bare-`unknown`
   params — prefer inference, `satisfies`, and named contracts.
-- Postgres tests: `bun run test:pg` (starts `docker compose` postgres on port
-  5433). The suite self-skips when the database is unreachable. Drivers MUST
+- Storage tests: `bun run test:pg` / `bun run test:redis` (docker compose:
+  postgres on 5433, redis on 6380). Both suites self-skip when the backing
+  service is unreachable. Drivers MUST
   take all time as bind parameters from the Effect Clock (never SQL `now()`)
   so conformance runs under TestClock against real storage.
 - drizzle is pinned to 1.0 rc builds in the root catalog; verify drizzle APIs

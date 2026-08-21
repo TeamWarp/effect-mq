@@ -2,7 +2,7 @@ import * as JobStore from "../../src/JobStore.ts"
 import { PgClient } from "@effect/sql-pg"
 import { Effect, Layer, Redacted } from "effect"
 import * as net from "node:net"
-import { DrizzleJobStore, mqJobAttempts, mqJobs, mqQueueControl, mqSchedules } from "../../src/drizzle/index.ts"
+import { DrizzleJobStore, mqJobAttempts, mqJobs, mqQueueControl, mqSchedules } from "../../src/drizzle-postgres/index.ts"
 
 export const pgUrl = process.env.EFFECT_MQ_PG_URL ??
   "postgres://postgres:postgres@localhost:5433/effect_mq_test"
