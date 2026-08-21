@@ -6,6 +6,26 @@ bumps are additive.
 
 ## 0.3.0 (unreleased)
 
+- **Retention split by terminal state** — both per-job `keep` and the
+  store-level `historyTtl` accept `{ completed?, failed?, cancelled? }`
+  (flat values still apply to all states), so completed noise and failed
+  evidence get independent lifetimes. The background sweep now also honours
+  stricter per-row `keep.age` rules, pruning quiet job names on the timer.
+- **Queue-filtered wake-ups** — the Postgres NOTIFY payload and the Redis
+  pub/sub message now name the queue, and `awaitWake` filters waiters by it:
+  an enqueue wakes only the takers watching its queue instead of every idle
+  taker on the store, removing the claim amplification that made many queues
+  expensive.
+- **Upgrade compatibility with 0.2.x data**: rows persisted with the old flat
+  `keep` shape keep pruning (read-side fallback in every driver), and the
+  Redis driver lazily migrates the old unsplit `finished` zset during sweeps.
+- **Fixed** (pre-release review): a livelock when a wake resumed a taker
+  that immediately re-parked (worker concurrency ≥ 2 could hang the process
+  on live clocks); dedupe replace now wakes the keyed job's actual queue;
+  `historyTtl: {}` (or a DurationObject) now fails loudly instead of
+  normalizing to a 0 ms ceiling and wiping history; the Redis sweep
+  self-heals orphaned finished-zset members instead of looping.
+
 - **Deduplication modes** — `dedupe: { key, ttl?, extend?, replace? }` at the
   definition (`Job.make({ dedupe: (payload) => key })`) or enqueue level:
   pending dedup, throttle, debounce, and replace-while-delayed. The dedup key

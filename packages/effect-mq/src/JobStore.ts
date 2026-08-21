@@ -16,7 +16,7 @@
  *
  * @since 0.1.0
  */
-import { Brand, Context, Cron, Data, type Effect, type Option, Predicate, Result } from "effect"
+import { Brand, Context, Cron, Data, Duration, type Effect, type Option, Predicate, Result } from "effect"
 
 /**
  * The identifier of an enqueued job. Produced by `enqueue` (either
@@ -95,17 +95,99 @@ export interface BackoffPolicy {
 }
 
 /**
- * Retention policy for terminal (completed/failed) jobs, persisted on the
- * record. Applied by the store after terminal acks, scoped to jobs with the
- * same name and state. Default (undefined) keeps records forever.
+ * Retention rule for one terminal state's records (per job name).
  *
- * @since 0.1.0
+ * @since 0.3.0
  */
-export interface KeepPolicy {
+export interface KeepStatePolicy {
   /** Keep at most this many terminal records (per name + state). */
   readonly count?: number | undefined
   /** Remove terminal records older than this many milliseconds. */
   readonly ageMs?: number | undefined
+}
+
+/**
+ * Retention policy persisted on the record, split by terminal state —
+ * completed jobs are usually noise, failed ones evidence. Applied by the
+ * store after terminal acks (scoped to jobs with the same name and state),
+ * and honoured by the store's periodic history sweep when one is configured.
+ * An absent state keeps its records until the store's `historyTtl` ceiling
+ * (forever without one). Producers accept a flat `{ count, age }` shorthand
+ * and normalize it to all three states before it reaches a driver.
+ *
+ * @since 0.1.0
+ */
+export interface KeepPolicy {
+  readonly completed?: KeepStatePolicy | undefined
+  readonly failed?: KeepStatePolicy | undefined
+  readonly cancelled?: KeepStatePolicy | undefined
+}
+
+/**
+ * The terminal states retention applies to.
+ *
+ * @since 0.3.0
+ */
+export type TerminalState = "completed" | "failed" | "cancelled"
+
+/**
+ * Store-level retention ceiling: one duration for all terminal states, or a
+ * per-state split (an absent state is never swept by the timer).
+ *
+ * @since 0.3.0
+ */
+export type HistoryTtlInput =
+  | Duration.Input
+  | {
+    readonly completed?: Duration.Input | undefined
+    readonly failed?: Duration.Input | undefined
+    readonly cancelled?: Duration.Input | undefined
+  }
+
+/**
+ * `HistoryTtlInput` normalized to milliseconds per terminal state.
+ *
+ * @since 0.3.0
+ */
+export interface HistoryTtlByState {
+  readonly completed?: number | undefined
+  readonly failed?: number | undefined
+  readonly cancelled?: number | undefined
+}
+
+/**
+ * Normalize a `HistoryTtlInput` to milliseconds per terminal state.
+ *
+ * @internal
+ */
+export const normalizeHistoryTtl = (
+  input: HistoryTtlInput
+): HistoryTtlByState => {
+  if (Predicate.isObject(input) && !Duration.isDuration(input)) {
+    if (!("completed" in input || "failed" in input || "cancelled" in input)) {
+      // {} or a DurationObject would silently normalize to a 0ms ceiling and
+      // wipe all history — refuse loudly; use "90 days"-style inputs.
+      throw new Error(
+        "effect-mq: historyTtl object must set at least one of completed/failed/cancelled"
+      )
+    }
+    // SAFETY: Duration inputs (numbers, strings, bigints, tuples, Duration
+    // instances, DurationObjects) never carry terminal-state keys, so this
+    // is the per-state split form.
+    const split = input as {
+      readonly completed?: Duration.Input | undefined
+      readonly failed?: Duration.Input | undefined
+      readonly cancelled?: Duration.Input | undefined
+    }
+    return {
+      completed: split.completed !== undefined ? Duration.toMillis(split.completed) : undefined,
+      failed: split.failed !== undefined ? Duration.toMillis(split.failed) : undefined,
+      cancelled: split.cancelled !== undefined ? Duration.toMillis(split.cancelled) : undefined
+    }
+  }
+  // SAFETY: not the split form (checked above), so a plain Duration input.
+  const ms = Duration.toMillis(input as Duration.Input)
+  return { completed: ms, failed: ms, cancelled: ms }
 }
 
 /**

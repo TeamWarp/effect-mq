@@ -21,7 +21,7 @@
  * - `p:delayed:<queue>`         ZSET, score `runAt`
  * - `p:active`                  ZSET, score `lockExpiresAt`
  * - `p:all`                     ZSET, score `enqueuedAt` (list pagination)
- * - `p:finished`                ZSET, score `finishedAt` (history TTL)
+ * - `p:finished:<state>`        ZSET, score `finishedAt` (history TTL)
  * - `p:terminal:<name>:<state>` ZSET, score `finishedAt` (keep pruning)
  * - `p:counts`                  HASH `<queue>|<state>` -> integer
  * - `p:paused`                  SET of paused queues
@@ -80,7 +80,7 @@ local function deleteJob(id)
   local name = redis.call("HGET", jk, "name")
   countsAdd(queue, state, -1)
   redis.call("ZREM", prefix .. ":all", id)
-  redis.call("ZREM", prefix .. ":finished", id)
+  redis.call("ZREM", prefix .. ":finished:" .. state, id)
   redis.call("ZREM", prefix .. ":active", id)
   redis.call("ZREM", terminalKey(name, state), id)
   remWaiting(queue, id)
@@ -92,8 +92,20 @@ end
 -- zset score alone cannot carry the seq tie-break exactly.
 local function applyKeep(name, state, keepJson, now)
   if keepJson == nil or keepJson == "" then return end
-  local ok, keep = pcall(cjson.decode, keepJson)
-  if not ok or type(keep) ~= "table" then return end
+  local ok, decoded = pcall(cjson.decode, keepJson)
+  if not ok or type(decoded) ~= "table" then return end
+  -- Policies are split per terminal state; rows persisted by 0.2.x carry the
+  -- flat {count, ageMs} shape and apply to every state.
+  local keep = decoded[state]
+  if type(keep) ~= "table" then
+    if decoded.completed == nil and decoded.failed == nil and decoded.cancelled == nil
+      and (decoded.count ~= nil or decoded.ageMs ~= nil)
+    then
+      keep = decoded
+    else
+      return
+    end
+  end
   local tkey = terminalKey(name, state)
   if keep.ageMs ~= nil then
     local old = redis.call("ZRANGEBYSCORE", tkey, "-inf", now - keep.ageMs)
@@ -141,7 +153,7 @@ local function finishCancelled(id, queue, name, startedAt, now, nowStr)
     "lockToken", "", "lockExpiresAt", "")
   countsAdd(queue, "active", -1)
   countsAdd(queue, "cancelled", 1)
-  redis.call("ZADD", prefix .. ":finished", now, id)
+  redis.call("ZADD", prefix .. ":finished:cancelled", now, id)
   redis.call("ZADD", terminalKey(name, "cancelled"), now, id)
   appendAttempt(id, "cancelled", startedAt, nowStr, "")
   releaseDedupe(name, redis.call("HGET", jk, "dedupeKey"), id, now)
@@ -233,14 +245,15 @@ if dKey ~= "" then
       redis.call("HSET", kjk, "payload", ARGV[6], "metadata", ARGV[7], "priority", ARGV[8],
         "attemptsMax", ARGV[9], "backoff", ARGV[10], "keep", ARGV[11], "timeoutMs", ARGV[12],
         "runAt", fmt(newRunAt))
-      redis.call("ZADD", delayedKey(redis.call("HGET", kjk, "queue")), newRunAt, entryJob)
+      local keyedQueue = redis.call("HGET", kjk, "queue")
+      redis.call("ZADD", delayedKey(keyedQueue), newRunAt, entryJob)
       -- A landed replace re-arms the ttl window.
       if ARGV[16] ~= "" then
         local windowEnd = now + tonumber(ARGV[16])
         redis.call("HSET", sk, "expiresAt", fmt(windowEnd))
         redis.call("ZADD", prefix .. ":dedupes", windowEnd, name .. "\0" .. dKey)
       end
-      return '{"id":' .. cjson.encode(entryJob) .. ',"duplicate":true,"wake":true}'
+      return '{"id":' .. cjson.encode(entryJob) .. ',"duplicate":true,"wake":true,"queue":' .. cjson.encode(keyedQueue) .. '}'
     end
     if windowLive then
       bumpWindow()
@@ -419,7 +432,7 @@ local function finish(newState, storeExit, outcome, ledgerExit)
   if storeExit ~= nil then redis.call("HSET", jk, "exit", storeExit) end
   countsAdd(queue, "active", -1)
   countsAdd(queue, newState, 1)
-  redis.call("ZADD", prefix .. ":finished", now, id)
+  redis.call("ZADD", prefix .. ":finished:" .. newState, now, id)
   redis.call("ZADD", terminalKey(name, newState), now, id)
   appendAttempt(id, outcome, startedAt, nowStr, ledgerExit)
   releaseDedupe(name, redis.call("HGET", jk, "dedupeKey"), id, now)
@@ -449,7 +462,7 @@ else
   else
     redis.call("ZADD", delayedKey(queue), runAt, id)
   end
-  return '{"ok":true,"wake":true}'
+  return '{"ok":true,"wake":true,"queue":' .. cjson.encode(queue) .. '}'
 end
 return '{"ok":true}'
 `
@@ -485,7 +498,7 @@ redis.call("HSET", jk, "state", "waiting", "lockToken", "", "lockExpiresAt", "")
 addWaiting(queue, priority, seq, id)
 countsAdd(queue, "active", -1)
 countsAdd(queue, "waiting", 1)
-return '{"ok":true,"wake":true}'
+return '{"ok":true,"wake":true,"queue":' .. cjson.encode(queue) .. '}'
 `
   }
 ).withReturnType<string>()
@@ -551,7 +564,7 @@ for _, id in ipairs(expired) do
           "failedReason", "job stalled more than allowable limit")
         countsAdd(queue, "active", -1)
         countsAdd(queue, "failed", 1)
-        redis.call("ZADD", prefix .. ":finished", now, id)
+        redis.call("ZADD", prefix .. ":finished:failed", now, id)
         redis.call("ZADD", terminalKey(name, "failed"), now, id)
         releaseDedupe(name, redis.call("HGET", jk, "dedupeKey"), id, now)
         recovered[#recovered + 1] = { id = id, failed = true }
@@ -711,13 +724,13 @@ local seq = redis.call("INCR", prefix .. ":seq")
 redis.call("HSET", jk, "state", "waiting", "attemptsMade", "0", "stalledCount", "0",
   "cancelRequested", "0", "exit", "", "failedReason", "", "finishedAt", "",
   "processedAt", "", "runAt", nowStr, "seq", fmt(seq))
-redis.call("ZREM", prefix .. ":finished", id)
+redis.call("ZREM", prefix .. ":finished:failed", id)
 redis.call("ZREM", terminalKey(name, "failed"), id)
 local priority = tonumber(redis.call("HGET", jk, "priority")) or 0
 addWaiting(queue, priority, seq, id)
 countsAdd(queue, "failed", -1)
 countsAdd(queue, "waiting", 1)
-return '{"ok":true}'
+return '{"ok":true,"queue":' .. cjson.encode(queue) .. '}'
 `
   }
 ).withReturnType<string>()
@@ -751,7 +764,7 @@ redis.call("ZREM", delayedKey(queue), id)
 redis.call("HSET", jk, "state", "cancelled", "finishedAt", nowStr, "cancelRequested", "0")
 countsAdd(queue, state, -1)
 countsAdd(queue, "cancelled", 1)
-redis.call("ZADD", prefix .. ":finished", now, id)
+redis.call("ZADD", prefix .. ":finished:cancelled", now, id)
 redis.call("ZADD", terminalKey(name, "cancelled"), now, id)
 appendAttempt(id, "cancelled", redis.call("HGET", jk, "processedAt"), nowStr, "")
 releaseDedupe(name, redis.call("HGET", jk, "dedupeKey"), id, now)
@@ -780,7 +793,7 @@ redis.call("HSET", jk, "state", "waiting", "runAt", ARGV[3])
 addWaiting(queue, priority, seq, id)
 countsAdd(queue, "delayed", -1)
 countsAdd(queue, "waiting", 1)
-return '{"ok":true}'
+return '{"ok":true,"queue":' .. cjson.encode(queue) .. '}'
 `
   }
 ).withReturnType<string>()
@@ -928,27 +941,104 @@ return "1"
 ).withReturnType<string>()
 
 /**
- * sweepHistory(prefix, cutoff, limit) -> number swept (bounded batch; the
- * caller loops until 0).
+ * sweepState(prefix, state, ttlMs, limit, offset, now) -> {scanned, deleted}
+ * One bounded page over a terminal state's finished zset, deleting rows past
+ * min(store ceiling, per-row keep.age). The caller advances the offset by
+ * (scanned - deleted) and stops when a page comes back short.
  */
-export const sweepHistory = Redis.script(
-  (prefix: string, cutoff: number, limit: number, now: number) => [prefix, cutoff, limit, now],
+export const sweepState = Redis.script(
+  (prefix: string, state: string, ttlMs: string, limit: number, offset: number, now: number) => [
+    prefix,
+    state,
+    ttlMs,
+    limit,
+    offset,
+    now
+  ],
   {
     numberOfKeys: 0,
     lua: `${HELPERS}
-local old = redis.call("ZRANGEBYSCORE", prefix .. ":finished", "-inf", tonumber(ARGV[2]), "LIMIT", 0, tonumber(ARGV[3]))
-for _, id in ipairs(old) do deleteJob(id) end
--- Dead dedup entries: expired windows first, then pending pointers (+inf)
--- whose job is gone or terminal.
-local now = tonumber(ARGV[4])
+local state = ARGV[2]
+local ttl = ARGV[3] ~= "" and tonumber(ARGV[3]) or nil
+local limit = tonumber(ARGV[4])
+local offset = tonumber(ARGV[5])
+local now = tonumber(ARGV[6])
+local batch = redis.call("ZRANGEBYSCORE", prefix .. ":finished:" .. state, "-inf", now,
+  "WITHSCORES", "LIMIT", offset, limit)
+local scanned = 0
+local deleted = 0
+for i = 1, #batch, 2 do
+  scanned = scanned + 1
+  local id = batch[i]
+  local finishedAt = tonumber(batch[i + 1])
+  if redis.call("EXISTS", jobKey(id)) == 0 then
+    -- Orphaned member (hash evicted/removed out of band): self-heal so the
+    -- cursor math stays honest and the member never loops the sweep.
+    redis.call("ZREM", prefix .. ":finished:" .. state, id)
+    deleted = deleted + 1
+  else
+    local cutoffAge = ttl
+    local keepJson = redis.call("HGET", jobKey(id), "keep")
+    if keepJson and keepJson ~= "" then
+      local ok, keep = pcall(cjson.decode, keepJson)
+      if ok and type(keep) == "table" then
+        local policy = keep[state]
+        if type(policy) ~= "table"
+          and keep.completed == nil and keep.failed == nil and keep.cancelled == nil
+          and (keep.count ~= nil or keep.ageMs ~= nil)
+        then
+          policy = keep
+        end
+        if type(policy) == "table" and policy.ageMs ~= nil then
+          local age = tonumber(policy.ageMs)
+          if age ~= nil and (cutoffAge == nil or age < cutoffAge) then cutoffAge = age end
+        end
+      end
+    end
+    if cutoffAge ~= nil and finishedAt <= now - cutoffAge then
+      deleteJob(id)
+      deleted = deleted + 1
+    end
+  end
+end
+return cjson.encode({ scanned = scanned, deleted = deleted })
+`
+  }
+).withReturnType<string>()
+
+/**
+ * sweepDedupes(prefix, limit, now) -> number pruned (bounded batch; the
+ * caller loops until 0): expired windows, then pending pointers (+inf)
+ * whose job is gone or terminal.
+ */
+export const sweepDedupes = Redis.script(
+  (prefix: string, limit: number, now: number) => [prefix, limit, now],
+  {
+    numberOfKeys: 0,
+    lua: `${HELPERS}
+local limit = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+-- Lazy migration: drain the pre-0.3 unsplit finished zset into the per-state
+-- keys (or drop orphans) so old history keeps getting swept.
+local migrated = 0
+local legacy = redis.call("ZRANGE", prefix .. ":finished", 0, limit - 1, "WITHSCORES")
+for i = 1, #legacy, 2 do
+  local id = legacy[i]
+  local state = redis.call("HGET", jobKey(id), "state")
+  if state == "completed" or state == "failed" or state == "cancelled" then
+    redis.call("ZADD", prefix .. ":finished:" .. state, tonumber(legacy[i + 1]), id)
+  end
+  redis.call("ZREM", prefix .. ":finished", id)
+  migrated = migrated + 1
+end
 local index = prefix .. ":dedupes"
-local expired = redis.call("ZRANGEBYSCORE", index, "-inf", now, "LIMIT", 0, tonumber(ARGV[3]))
+local expired = redis.call("ZRANGEBYSCORE", index, "-inf", now, "LIMIT", 0, limit)
 for _, member in ipairs(expired) do
   redis.call("DEL", prefix .. ":dedupe:" .. member)
   redis.call("ZREM", index, member)
 end
 local removedPending = 0
-local pendings = redis.call("ZRANGEBYSCORE", index, "inf", "inf", "LIMIT", 0, tonumber(ARGV[3]))
+local pendings = redis.call("ZRANGEBYSCORE", index, "inf", "inf", "LIMIT", 0, limit)
 for _, member in ipairs(pendings) do
   local sk = prefix .. ":dedupe:" .. member
   local jobId = redis.call("HGET", sk, "jobId")
@@ -959,9 +1049,7 @@ for _, member in ipairs(pendings) do
     removedPending = removedPending + 1
   end
 end
--- Report ALL work done so the caller keeps sweeping until the whole backlog
--- (jobs AND dedup entries) is clean, not just until jobs run dry.
-return tostring(#old + #expired + removedPending)
+return tostring(migrated + #expired + removedPending)
 `
   }
 ).withReturnType<string>()

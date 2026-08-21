@@ -148,17 +148,28 @@ treats it as a defect (`JobCancelledError`), not a typed failure.
 
 ## History retention
 
-Two layers of control:
+Two layers of control, both splittable by terminal state (completed jobs are
+usually noise, failed ones evidence):
 
-- **Per job**: `keep: { count, age }` prunes terminal records per name+state
-  at ack time.
-- **Per store**: a retention ceiling applied to *all* terminal records,
-  swept periodically in the background:
+- **Per job**: `keep` prunes terminal records per name+state — flat
+  `{ count, age }` applies to all states, or split per state:
+
+```ts
+keep: { count: 100 }                                              // all states
+keep: { completed: { age: "1 day" }, failed: { age: "30 days" } } // split
+```
+
+- **Per store**: a retention ceiling swept periodically in the background —
+  one duration or a per-state split (an absent state has no ceiling; the
+  timer touches its rows only when they carry their own `keep.age`):
 
 ```ts
 MemoryJobStore.layerWith({ historyTtl: "7 days" })
-DrizzleJobStore.layer({ jobs, attempts, schedules, queues, historyTtl: "90 days" })
+DrizzleJobStore.layer({ ...tables, historyTtl: { completed: "1 day", failed: "90 days" } })
 ```
+
+The sweep honours `min(per-row keep.age, ceiling)`, so a job name that goes
+quiet is still pruned on the timer, not only when its group is next acked.
 
 ## Custom job ids
 
@@ -338,9 +349,10 @@ db.select().from(jobAttempts)
 `MyJob.retry(id)`, `store.remove(id)` — so lock tokens, attempt accounting,
 and wake-up notifications stay coherent.
 
-Worker tip: `awaitWake` is LISTEN/NOTIFY-driven, and the worker's
-`pollInterval` is the fallback — `Worker.layer({ pollInterval: "500 millis" })`
-is a good Postgres setting.
+Worker tip: `awaitWake` is LISTEN/NOTIFY-driven and **queue-filtered** (the
+NOTIFY payload names the queue, so an enqueue wakes only the takers watching
+that queue — many queues don't amplify into many claims). The worker's
+`pollInterval` is just the fallback; the 5s default is fine.
 
 ## Redis store
 
@@ -363,8 +375,10 @@ const JobStoreLive = RedisJobStore.layer({
 )
 ```
 
-Wake-ups ride pub/sub (`<prefix>:wake`), so idle workers in other processes
-pick new jobs up promptly; the worker's `pollInterval` is the fallback. Notes:
+Wake-ups ride pub/sub (`<prefix>:wake`) with queue-filtered messages, so
+idle workers in other processes pick new jobs up promptly and an enqueue
+wakes only the takers watching its queue; the worker's `pollInterval` is the
+fallback. Notes:
 
 - Keys are plain-prefixed (no hash tags) — point it at a single Redis /
   Valkey node or a cluster-unaware proxy, not Redis Cluster.
@@ -459,7 +473,7 @@ handler).
 | `lockRenewInterval` | half of `lockDuration` | heartbeat cadence (also delivers cross-process cancels) |
 | `stalledInterval` | 30s | how often to sweep for stalled jobs |
 | `maxStalledCount` | 1 | stalls tolerated before a job is failed outright |
-| `pollInterval` | 5s | idle fallback when no wake-up arrives (~500ms is a good Postgres setting) |
+| `pollInterval` | 5s | idle fallback when no wake-up arrives (wake-ups are queue-filtered and push-based, so the default is fine even on Postgres) |
 | `scheduleSweepInterval` | 15s | how often to tick due repeatable-job schedules |
 | `id` | random | identifier used in lock tokens |
 

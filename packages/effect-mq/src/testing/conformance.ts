@@ -473,7 +473,7 @@ export const jobStoreConformance = (
         Effect.gen(function*() {
           for (let i = 0; i < 4; i++) {
             const { id } = yield* store.enqueue(
-              baseRequest({ payload: { n: i }, keep: { count: 2, ageMs: undefined } })
+              baseRequest({ payload: { n: i }, keep: { completed: { count: 2, ageMs: undefined } } })
             )
             const claim = yield* store.claim(claimOptions({ token: `t-${i}` }))
             assert(claim._tag === "Claimed")
@@ -489,7 +489,7 @@ export const jobStoreConformance = (
     it.effect("keep age prunes terminal records older than the window", () =>
       withStore((store) =>
         Effect.gen(function*() {
-          const keep = { count: undefined, ageMs: 10_000 }
+          const keep = { completed: { count: undefined, ageMs: 10_000 } }
           const first = yield* store.enqueue(baseRequest({ payload: { n: 1 }, keep }))
           const claim1 = yield* store.claim(claimOptions())
           assert(claim1._tag === "Claimed")
@@ -544,10 +544,10 @@ export const jobStoreConformance = (
           // Two jobs acked at the SAME TestClock instant: the tie must break
           // on enqueue/seq order identically in every driver.
           const first = yield* store.enqueue(
-            baseRequest({ payload: { n: 1 }, keep: { count: 1, ageMs: undefined } })
+            baseRequest({ payload: { n: 1 }, keep: { completed: { count: 1, ageMs: undefined } } })
           )
           const second = yield* store.enqueue(
-            baseRequest({ payload: { n: 2 }, keep: { count: 1, ageMs: undefined } })
+            baseRequest({ payload: { n: 2 }, keep: { completed: { count: 1, ageMs: undefined } } })
           )
           const claimA = yield* store.claim(claimOptions({ token: "t-a" }))
           const claimB = yield* store.claim(claimOptions({ token: "t-b" }))
@@ -563,7 +563,7 @@ export const jobStoreConformance = (
     it.effect("keep applies count and age together", () =>
       withStore((store) =>
         Effect.gen(function*() {
-          const keep = { count: 2, ageMs: 10_000 }
+          const keep = { completed: { count: 2, ageMs: 10_000 } }
           const ids: Array<JobStore.JobId> = []
           for (let i = 0; i < 3; i++) {
             const { id } = yield* store.enqueue(baseRequest({ payload: { n: i }, keep }))
@@ -890,7 +890,7 @@ export const jobStoreConformance = (
     it.effect("cancel applies the keep retention policy", () =>
       withStore((store) =>
         Effect.gen(function*() {
-          const keep = { count: 1 }
+          const keep = { cancelled: { count: 1 } }
           const ids: Array<JobStore.JobId> = []
           for (let i = 0; i < 3; i++) {
             const { id } = yield* store.enqueue(baseRequest({ payload: { n: i }, keep }))
@@ -991,7 +991,7 @@ export const jobStoreConformance = (
         Effect.gen(function*() {
           // Three completions with keep {count: 1}: two get pruned.
           for (let i = 0; i < 3; i++) {
-            const { id } = yield* store.enqueue(baseRequest({ payload: { n: i }, keep: { count: 1 } }))
+            const { id } = yield* store.enqueue(baseRequest({ payload: { n: i }, keep: { completed: { count: 1 } } }))
             const claim = yield* store.claim(claimOptions({ token: `t-${i}` }))
             assert(claim._tag === "Claimed")
             yield* store.ack(id, `t-${i}`, { _tag: "Complete", exit: undefined })
@@ -1233,6 +1233,63 @@ export const jobStoreConformance = (
             baseRequest({ dedupe, payload: { n: 3 }, delayMs: 300_000 })
           )
           expect(again).toEqual({ id: first.id, duplicate: true })
+        })
+      ))
+
+    it.effect("keep policies are independent per terminal state", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          // Completed records keep only the newest 1; failed keep everything.
+          const keep = { completed: { count: 1 } }
+          const completed: Array<JobStore.JobId> = []
+          const failed: Array<JobStore.JobId> = []
+          for (let i = 0; i < 2; i++) {
+            const done = yield* store.enqueue(baseRequest({ payload: { n: i }, keep }))
+            const claimA = yield* store.claim(claimOptions({ token: `tc-${i}` }))
+            assert(claimA._tag === "Claimed")
+            yield* store.ack(done.id, `tc-${i}`, { _tag: "Complete", exit: undefined })
+            completed.push(done.id)
+
+            const bad = yield* store.enqueue(baseRequest({ payload: { n: 10 + i }, keep }))
+            const claimB = yield* store.claim(claimOptions({ token: `tf-${i}` }))
+            assert(claimB._tag === "Claimed")
+            yield* store.ack(bad.id, `tf-${i}`, { _tag: "Fail", exit: undefined })
+            failed.push(bad.id)
+            yield* TestClock.adjust(10)
+          }
+          const counts = yield* store.counts()
+          expect(counts.completed).toBe(1)
+          expect(counts.failed).toBe(2)
+          expect(Option.isNone(yield* store.getJob(completed[0] ?? JobId("?")))).toBe(true)
+          expect(Option.isSome(yield* store.getJob(failed[0] ?? JobId("?")))).toBe(true)
+        })
+      ))
+
+    it.effect("an enqueue wakes only waiters watching its queue", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const empty = yield* store.claim(claimOptions())
+          assert(empty._tag === "Empty")
+
+          let woke = false
+          const waiter = yield* Effect.forkChild(
+            store.awaitWake([QueueName("default")], empty.wakeToken).pipe(
+              Effect.tap(() => Effect.sync(() => void (woke = true)))
+            )
+          )
+          yield* Effect.yieldNow
+
+          // Work on ANOTHER queue must not wake the default-queue waiter.
+          yield* store.enqueue(baseRequest({ queue: QueueName("other") }))
+          for (let i = 0; i < 10; i++) {
+            yield* Effect.yieldNow
+          }
+          expect(woke).toBe(false)
+
+          // Matching-queue work does.
+          yield* store.enqueue(baseRequest())
+          yield* Fiber.join(waiter)
+          expect(woke).toBe(true)
         })
       ))
 

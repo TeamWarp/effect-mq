@@ -53,9 +53,11 @@ export interface DrizzleJobStoreOptions<StoreId = JobStore.JobStore> {
   readonly store?: Context.Key<StoreId, JobStore.Service> | undefined
   /**
    * Store-level retention ceiling: terminal records older than this are
-   * removed by a periodic sweep. Per-job `keep` may only be stricter.
+   * removed by a periodic sweep — one duration for all terminal states or a
+   * per-state split (`{ completed: "1 day", failed: "30 days" }`). The sweep
+   * also honours stricter per-job `keep.age` rules.
    */
-  readonly historyTtl?: Duration.Input | undefined
+  readonly historyTtl?: JobStore.HistoryTtlInput | undefined
   /** History sweep cadence (default 1 minute). */
   readonly historySweepInterval?: Duration.Input | undefined
   /**
@@ -265,21 +267,48 @@ export const make = (
       )
     }
 
-    // Wake plumbing: a local version + deferred chain (same protocol as the
+    // Wake plumbing: a queue-filtered waiter registry (same protocol as the
     // memory driver), fed by (a) local store operations and (b) cross-process
-    // LISTEN notifications.
+    // LISTEN notifications whose payload names the queue ("*" broadcasts).
+    // Filtering matters at scale: without it every enqueue wakes every idle
+    // taker of every queue on the store.
     let wakeVersion = 0
-    let wake = Deferred.makeUnsafe<void>()
-    const signalWake = () => {
+    let lastBroadcast = 0
+    const lastWake = new Map<JobStore.QueueName, number>()
+    interface Waiter {
+      readonly queues: ReadonlySet<JobStore.QueueName>
+      readonly deferred: Deferred.Deferred<void>
+    }
+    const waiters = new Set<Waiter>()
+    const lastWakeFor = (queue: JobStore.QueueName) => Math.max(lastWake.get(queue) ?? 0, lastBroadcast)
+    const signalWake = (queue?: JobStore.QueueName) => {
       wakeVersion += 1
-      const current = wake
-      wake = Deferred.makeUnsafe<void>()
-      Deferred.doneUnsafe(current, Effect.void)
+      if (queue === undefined) {
+        lastBroadcast = wakeVersion
+      } else {
+        lastWake.set(queue, wakeVersion)
+      }
+      // Snapshot-and-clear BEFORE resolving: doneUnsafe resumes waiting
+      // fibers synchronously, and a woken taker that re-parks registers a
+      // NEW waiter — resolving inside the live Set iteration would visit it
+      // and livelock.
+      const toWake: Array<Waiter> = []
+      for (const waiter of waiters) {
+        if (queue === undefined || waiter.queues.has(queue)) {
+          waiters.delete(waiter)
+          toWake.push(waiter)
+        }
+      }
+      for (const waiter of toWake) {
+        Deferred.doneUnsafe(waiter.deferred, Effect.void)
+      }
     }
     // Resubscribe forever: if the LISTEN stream ends or fails, wake-ups
     // degrade to the worker's pollInterval until the next attempt succeeds.
     yield* client.listen(wakeChannel).pipe(
-      Stream.runForEach(() => Effect.sync(signalWake)),
+      Stream.runForEach((payload) =>
+        Effect.sync(() => signalWake(payload === "*" ? undefined : JobStore.QueueName(payload)))
+      ),
       Effect.catchCause((cause) =>
         Effect.logWarning(
           "effect-mq: LISTEN subscription failed; wake-ups degraded to polling until resubscribe",
@@ -291,16 +320,34 @@ export const make = (
       Effect.forkScoped
     )
     if (options.historyTtl !== undefined) {
-      const ttlMs = Duration.toMillis(options.historyTtl)
+      const ttlByState = JobStore.normalizeHistoryTtl(options.historyTtl)
       const sweepMs = Duration.toMillis(options.historySweepInterval ?? "1 minute")
       yield* Effect.gen(function*() {
         yield* Effect.sleep(sweepMs)
         const now = yield* nowDate
-        yield* db.execute(sql`
-          DELETE FROM ${jobs}
-          WHERE ${jobs.state} IN ('completed', 'failed', 'cancelled')
-            AND ${jobs.finishedAt} <= ${new Date(now.getTime() - ttlMs)}
-        `)
+        // Per-state ceilings, refined by stricter per-row keep ages — a quiet
+        // job name is pruned on the timer, not only when its group is acked.
+        for (const state of ["completed", "failed", "cancelled"] as const) {
+          const ttl = ttlByState[state]
+          yield* db.execute(sql`
+            DELETE FROM ${jobs}
+            WHERE ${jobs.state} = ${state} AND (
+              ${ttl !== undefined ? sql`${jobs.finishedAt} <= ${new Date(now.getTime() - ttl)}` : sql`FALSE`}
+              OR (
+                COALESCE(
+                  ${jobs.keep}->${state}->>'ageMs',
+                  CASE WHEN ${jobs.keep} ?| array['completed', 'failed', 'cancelled'] THEN NULL
+                    ELSE ${jobs.keep}->>'ageMs' END
+                ) IS NOT NULL
+                AND ${jobs.finishedAt} <= ${now}::timestamptz
+                  - make_interval(secs => (COALESCE(
+                      ${jobs.keep}->${state}->>'ageMs',
+                      CASE WHEN ${jobs.keep} ?| array['completed', 'failed', 'cancelled'] THEN NULL
+                        ELSE ${jobs.keep}->>'ageMs' END
+                    )::double precision) / 1000.0))
+            )
+          `)
+        }
         // Dead dedup rows: expired windows, or pointers at vanished jobs.
         yield* db.execute(sql`
           DELETE FROM ${dedupe}
@@ -318,12 +365,13 @@ export const make = (
     }
 
     // Local mutation wake-up: bump synchronously, then best-effort NOTIFY so
-    // workers in other processes wake promptly too.
-    const wakeUp: Effect.Effect<void> = Effect.suspend(() => {
-      signalWake()
-      // The payload must be non-empty: @effect/sql-pg drops falsy payloads.
-      return client.notify(wakeChannel, "1").pipe(Effect.ignore)
-    })
+    // workers in other processes wake promptly too. The payload names the
+    // queue (and must be non-empty: @effect/sql-pg drops falsy payloads).
+    const wakeUp = (queue?: JobStore.QueueName): Effect.Effect<void> =>
+      Effect.suspend(() => {
+        signalWake(queue)
+        return client.notify(wakeChannel, queue !== undefined && queue.length > 0 ? queue : "*").pipe(Effect.ignore)
+      })
 
     const nowDate = Effect.map(Clock.currentTimeMillis, (ms) => new Date(ms))
 
@@ -346,14 +394,39 @@ export const make = (
       `)
 
     // Retention: drop terminal peers (same name + state) beyond count/age.
+    const keepPolicyFor = (
+      keep: JobStore.KeepPolicy | null | undefined,
+      state: string
+    ): JobStore.KeepStatePolicy | undefined => {
+      if (keep === null || keep === undefined) return undefined
+      const policy = state === "completed"
+        ? keep.completed
+        : state === "failed"
+        ? keep.failed
+        : state === "cancelled"
+        ? keep.cancelled
+        : undefined
+      if (policy !== undefined) return policy
+      // Rows persisted by 0.2.x carry the flat {count, ageMs} shape — honour
+      // it as an all-states policy so upgrades keep pruning.
+      if (
+        keep.completed === undefined && keep.failed === undefined && keep.cancelled === undefined &&
+        ("count" in keep || "ageMs" in keep)
+      ) {
+        // SAFETY: the flat legacy shape carries KeepStatePolicy fields.
+        return keep as JobStore.KeepStatePolicy
+      }
+      return undefined
+    }
+
     const applyKeep = (
       tx: Pick<Db, "execute">,
       row: { name: string; state: string; keep: JobStore.KeepPolicy | null },
       now: Date
     ) =>
       Effect.gen(function*() {
-        const keep = row.keep
-        if (keep === null || keep === undefined) return
+        const keep = keepPolicyFor(row.keep, row.state)
+        if (keep === undefined) return
         if (keep.ageMs !== undefined) {
           yield* tx.execute(sql`
             DELETE FROM ${jobs}
@@ -490,7 +563,7 @@ export const make = (
             // re-checks the state so a concurrent claim degrades this to a
             // plain dedup instead of rewriting an active job.
             if (policy.replace && keyedState === "delayed") {
-              const replaced = rowsOf(yield* tx.execute<{ id: string }>(sql`
+              const replaced = rowsOf(yield* tx.execute<{ id: string; queue: string }>(sql`
                 UPDATE ${jobs} SET
                   payload = ${JSON.stringify(request.payload ?? null)}::jsonb,
                   metadata = ${JSON.stringify(request.metadata)}::jsonb,
@@ -501,7 +574,7 @@ export const make = (
                   timeout_ms = ${request.timeoutMs ?? null},
                   run_at = ${new Date(now.getTime() + Math.max(0, request.delayMs))}${extraColumnAssignments(request)}
                 WHERE ${jobs.id} = ${entry.jobId} AND ${jobs.state} = 'delayed'
-                RETURNING ${jobs.id} AS id
+                RETURNING ${jobs.id} AS id, ${jobs.queue} AS "queue"
               `))
               if (replaced.length > 0) {
                 // A landed replace re-arms the ttl window (the entry must
@@ -512,7 +585,14 @@ export const make = (
                     WHERE ${dedupe.name} = ${request.name} AND ${dedupe.key} = ${policy.key}
                   `)
                 }
-                return { id: JobId(entry.jobId), duplicate: true, wake: true }
+                // The replace does not move the job between queues — wake
+                // the queue that actually holds the now-rescheduled job.
+                return {
+                  id: JobId(entry.jobId),
+                  duplicate: true,
+                  wake: true,
+                  wakeQueue: JobStore.QueueName(replaced[0]?.queue ?? request.queue)
+                }
               }
               return { id: JobId(entry.jobId), duplicate: true, wake: false }
             }
@@ -576,14 +656,14 @@ export const make = (
           if (request.dedupe !== undefined) {
             const result = yield* enqueueDeduped(request, request.dedupe)
             if (result.wake) {
-              yield* wakeUp
+              yield* wakeUp("wakeQueue" in result && result.wakeQueue !== undefined ? result.wakeQueue : request.queue)
             }
             return { id: result.id, duplicate: result.duplicate }
           }
           const now = yield* nowDate
           const result = yield* insertJob(db, request, now)
           if (!result.duplicate) {
-            yield* wakeUp
+            yield* wakeUp(request.queue)
           }
           return result
         }),
@@ -681,13 +761,15 @@ export const make = (
                 state: string
                 keep: JobStore.KeepPolicy | null
                 dedupeKey: string | null
+                queue: string
               }
             >(sql`
               UPDATE ${jobs} SET ${update},
                 attempts_made = ${jobs.attemptsMade} + 1, lock_token = NULL, lock_expires_at = NULL
               WHERE ${jobs.id} = ${id} AND ${jobs.state} = 'active' AND ${jobs.lockToken} = ${token}
               RETURNING ${jobs.processedAt} AS "processedAt", ${jobs.name} AS "name",
-                ${jobs.state} AS "state", ${jobs.keep} AS "keep", ${jobs.dedupeKey} AS "dedupeKey"
+                ${jobs.state} AS "state", ${jobs.keep} AS "keep", ${jobs.dedupeKey} AS "dedupeKey",
+                ${jobs.queue} AS "queue"
             `))
             const row = rows[0]
             if (row === undefined) {
@@ -713,6 +795,9 @@ export const make = (
               yield* releaseDedupe(tx, row.name, row.dedupeKey, id, now)
               yield* applyKeep(tx, row, now)
             }
+            return outcome._tag === "Retry" && !cancelledRetry
+              ? JobStore.QueueName(row.queue)
+              : undefined
           })
         ).pipe(
           Effect.mapError((error) =>
@@ -721,12 +806,13 @@ export const make = (
               ? error
               : storeError("ack failed")(error)
           ),
-          Effect.tap(() => outcome._tag === "Retry" ? wakeUp : Effect.void)
+          Effect.tap((queue) => queue !== undefined ? wakeUp(queue) : Effect.void),
+          Effect.asVoid
         ),
 
       release: (id, token) =>
         Effect.gen(function*() {
-          const cancelled = yield* db.transaction((tx) =>
+          const released = yield* db.transaction((tx) =>
             Effect.gen(function*() {
               const now = yield* nowDate
               // A cancel that arrived while the worker was shutting down is
@@ -739,6 +825,7 @@ export const make = (
                   name: string
                   keep: JobStore.KeepPolicy | null
                   dedupeKey: string | null
+                  queue: string
                 }
               >(sql`
                 UPDATE ${jobs} SET
@@ -749,7 +836,7 @@ export const make = (
                 WHERE ${jobs.id} = ${id} AND ${jobs.state} = 'active' AND ${jobs.lockToken} = ${token}
                 RETURNING ${jobs.id} AS id, (${jobs.state} = 'cancelled') AS cancelled,
                   ${jobs.processedAt} AS "processedAt", ${jobs.name} AS "name", ${jobs.keep} AS "keep",
-                  ${jobs.dedupeKey} AS "dedupeKey"
+                  ${jobs.dedupeKey} AS "dedupeKey", ${jobs.queue} AS "queue"
               `))
               const row = rows[0]
               if (row === undefined) return undefined
@@ -758,16 +845,16 @@ export const make = (
                 yield* releaseDedupe(tx, row.name, row.dedupeKey, id, now)
                 yield* applyKeep(tx, { name: row.name, state: "cancelled", keep: row.keep }, now)
               }
-              return row.cancelled
+              return { cancelled: row.cancelled, queue: JobStore.QueueName(row.queue) }
             })
           ).pipe(Effect.mapError((error) =>
             error instanceof JobStore.JobStoreError ? error : storeError("release failed")(error)
           ))
-          if (cancelled === undefined) {
+          if (released === undefined) {
             return yield* explainMiss(id)
           }
-          if (!cancelled) {
-            yield* wakeUp
+          if (!released.cancelled) {
+            yield* wakeUp(released.queue)
           }
         }),
 
@@ -869,14 +956,18 @@ export const make = (
             error instanceof JobStore.JobStoreError ? error : storeError("recoverStalled failed")(error)
           ),
           Effect.tap((recovered) =>
-            recovered.some((entry) => !entry.failed) ? wakeUp : Effect.void
+            recovered.some((entry) => !entry.failed) ? wakeUp() : Effect.void
           )
         ),
 
-      awaitWake: (_queues, wakeToken) =>
+      awaitWake: (queues, wakeToken) =>
         Effect.suspend(() => {
-          if (wakeVersion > wakeToken) return Effect.void
-          return Deferred.await(wake)
+          if (queues.some((queue) => lastWakeFor(queue) > wakeToken)) return Effect.void
+          const waiter: Waiter = { queues: new Set(queues), deferred: Deferred.makeUnsafe<void>() }
+          waiters.add(waiter)
+          return Deferred.await(waiter.deferred).pipe(
+            Effect.ensuring(Effect.sync(() => waiters.delete(waiter)))
+          )
         }),
 
       getJob: (id) =>
@@ -953,13 +1044,13 @@ export const make = (
       retry: (id) =>
         Effect.gen(function*() {
           const now = yield* nowDate
-          const rows = rowsOf(yield* db.execute<{ id: string }>(sql`
+          const rows = rowsOf(yield* db.execute<{ id: string; queue: string }>(sql`
             UPDATE ${jobs} SET state = 'waiting', attempts_made = 0, stalled_count = 0,
               cancel_requested = FALSE,
               exit = NULL, failed_reason = NULL, finished_at = NULL, processed_at = NULL,
               run_at = ${now}, seq = ${seqExpr}
             WHERE ${jobs.id} = ${id} AND ${jobs.state} = 'failed'
-            RETURNING ${jobs.id} AS id
+            RETURNING ${jobs.id} AS id, ${jobs.queue} AS "queue"
           `).pipe(Effect.mapError(storeError("retry failed"))))
           if (rows.length === 0) {
             const existing = yield* db.select({ state: jobs.state }).from(jobs)
@@ -970,7 +1061,7 @@ export const make = (
             }
             return yield* new JobStore.JobNotRetryableError({ jobId: id, state: found.state })
           }
-          yield* wakeUp
+          yield* wakeUp(JobStore.QueueName(rows[0]?.queue ?? ""))
         }),
 
       cancel: (id) =>
@@ -1029,10 +1120,10 @@ export const make = (
       promote: (id) =>
         Effect.gen(function*() {
           const now = yield* nowDate
-          const rows = rowsOf(yield* db.execute<{ id: string }>(sql`
+          const rows = rowsOf(yield* db.execute<{ id: string; queue: string }>(sql`
             UPDATE ${jobs} SET state = 'waiting', run_at = ${now}
             WHERE ${jobs.id} = ${id} AND ${jobs.state} = 'delayed'
-            RETURNING ${jobs.id} AS id
+            RETURNING ${jobs.id} AS id, ${jobs.queue} AS "queue"
           `).pipe(Effect.mapError(storeError("promote failed"))))
           if (rows.length === 0) {
             const existing = rowsOf(yield* db.execute<{ state: JobStore.JobState }>(sql`
@@ -1044,7 +1135,7 @@ export const make = (
             }
             return yield* new JobStore.JobNotPromotableError({ jobId: id, state: found.state })
           }
-          yield* wakeUp
+          yield* wakeUp(JobStore.QueueName(rows[0]?.queue ?? ""))
         }),
 
       pause: (queue) =>
@@ -1061,7 +1152,7 @@ export const make = (
           UPDATE ${queues} SET paused = FALSE WHERE ${queues.queue} = ${queue}
         `).pipe(
           Effect.mapError(storeError("resume failed")),
-          Effect.andThen(wakeUp)
+          Effect.andThen(wakeUp(queue))
         ),
 
       pausedQueues: () =>
@@ -1097,7 +1188,7 @@ export const make = (
               ELSE EXCLUDED.next_run_at END
         `).pipe(
           Effect.mapError(storeError("upsertSchedule failed")),
-          Effect.asVoid
+          Effect.andThen(wakeUp(schedule.queue))
         ),
 
       removeSchedule: (key) =>

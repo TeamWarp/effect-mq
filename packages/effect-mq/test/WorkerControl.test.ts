@@ -1,5 +1,5 @@
 import { assert, describe, expect, it } from "@effect/vitest"
-import { Cause, Deferred, Effect, Exit, Layer, Option, Ref, Result, Schema } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Option, Ref, Result, Schema } from "effect"
 import { TestClock } from "effect/testing"
 import { Job, JobStore, MemoryJobStore, Worker } from "../src/index.ts"
 
@@ -592,7 +592,98 @@ describe("deduplication", () => {
     }).pipe(Effect.provide(MemoryJobStore.layer)))
 })
 
+describe("wake registry", () => {
+  it.live("waking a taker that immediately re-parks does not livelock the store", () =>
+    Effect.gen(function*() {
+      const store = yield* MemoryJobStore.make
+      let tokens = 0
+      // The Worker taker shape: claim; on Empty, park on awaitWake; repeat.
+      // Two takers + one job means the loser re-parks synchronously inside
+      // the winner's wake signal — the regression this test pins hung the
+      // whole event loop here.
+      const taker = Effect.gen(function*() {
+        while (true) {
+          const result = yield* store.claim({
+            queue: QueueName("default"),
+            names: ["Only"],
+            token: `t-${++tokens}`,
+            lockDurationMs: 5_000
+          })
+          if (result._tag === "Claimed") return result.job.id
+          yield* store.awaitWake([QueueName("default")], result.wakeToken)
+        }
+      })
+      const first = yield* Effect.forkChild(taker)
+      const second = yield* Effect.forkChild(taker)
+      yield* Effect.sleep("50 millis")
+
+      yield* store.enqueue(rawRequest("Only", "one")).pipe(Effect.timeout("2 seconds"))
+      yield* store.enqueue(rawRequest("Only", "two")).pipe(Effect.timeout("2 seconds"))
+      const claimed = yield* Fiber.join(first).pipe(
+        Effect.zip(Fiber.join(second)),
+        Effect.timeout("2 seconds")
+      )
+      expect(new Set(claimed)).toEqual(new Set(["one", "two"]))
+    }))
+})
+
 describe("history TTL", () => {
+  it.effect("a per-state historyTtl sweeps only the states it names", () =>
+    Effect.gen(function*() {
+      const store = yield* MemoryJobStore.makeWith({
+        historyTtl: { failed: "1 minute" },
+        historySweepInterval: "10 seconds"
+      })
+      const done = (yield* store.enqueue(rawRequest("Split", "done"))).id
+      const claimA = yield* store.claim({
+        queue: QueueName("default"),
+        names: ["Split"],
+        token: "a",
+        lockDurationMs: 60_000
+      })
+      assert(claimA._tag === "Claimed")
+      yield* store.ack(done, "a", { _tag: "Complete", exit: undefined })
+
+      const bad = (yield* store.enqueue(rawRequest("Split", "bad"))).id
+      const claimB = yield* store.claim({
+        queue: QueueName("default"),
+        names: ["Split"],
+        token: "b",
+        lockDurationMs: 60_000
+      })
+      assert(claimB._tag === "Claimed")
+      yield* store.ack(bad, "b", { _tag: "Fail", exit: undefined })
+
+      yield* TestClock.adjust("2 minutes")
+      expect(Option.isNone(yield* store.getJob(bad))).toBe(true)
+      expect(Option.isSome(yield* store.getJob(done))).toBe(true)
+    }).pipe(Effect.scoped))
+
+  it.effect("the timer sweep honours a stricter per-job keep.age without further acks", () =>
+    Effect.gen(function*() {
+      const store = yield* MemoryJobStore.makeWith({
+        historyTtl: "1 hour",
+        historySweepInterval: "10 seconds"
+      })
+      const id = (yield* store.enqueue({
+        ...rawRequest("Quiet", "quiet-1"),
+        keep: { completed: { ageMs: 60_000 } }
+      })).id
+      const claim = yield* store.claim({
+        queue: QueueName("default"),
+        names: ["Quiet"],
+        token: "t",
+        lockDurationMs: 60_000
+      })
+      assert(claim._tag === "Claimed")
+      yield* store.ack(id, "t", { _tag: "Complete", exit: undefined })
+
+      // No further acks for this name: only the timer can prune it, and it
+      // must use the row's 1-minute keep age, not the 1-hour ceiling.
+      yield* TestClock.adjust("2 minutes")
+      expect(Option.isNone(yield* store.getJob(id))).toBe(true)
+    }).pipe(Effect.scoped))
+
   it.effect("terminal jobs are swept after the retention window; live jobs survive", () =>
     Effect.gen(function*() {
       const store = yield* MemoryJobStore.makeWith({

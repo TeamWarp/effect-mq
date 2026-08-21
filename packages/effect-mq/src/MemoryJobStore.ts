@@ -16,6 +16,8 @@ import {
   type ClaimResult,
   type EnqueueRequest,
   type ExtendLocksResult,
+  type HistoryTtlByState,
+  type HistoryTtlInput,
   type IdGenerator,
   JobId,
   JobNotCancellableError,
@@ -24,10 +26,13 @@ import {
   JobNotRetryableError,
   type JobRecord,
   type JobState,
+  type KeepStatePolicy,
   JobStore,
   type ListResult,
   LockLostError,
   JobStoreError,
+  normalizeHistoryTtl,
+  type TerminalState,
   type QueueName,
   type ScheduleKey,
   type ScheduleRecord,
@@ -100,7 +105,7 @@ const metadataMatches = (
 
 interface MemoryStore {
   readonly service: Service
-  readonly sweepHistory: (now: number, ttlMs: number) => void
+  readonly sweepHistory: (now: number, ttlByState: HistoryTtlByState) => void
 }
 
 const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemoryStore => {
@@ -114,16 +119,39 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
   let seq = 0
   let idCounter = 0
   let wakeVersion = 0
-  let wake = Deferred.makeUnsafe<void>()
+  let lastBroadcast = 0
+  const lastWake = new Map<QueueName, number>()
+  interface Waiter {
+    readonly queues: ReadonlySet<QueueName>
+    readonly deferred: Deferred.Deferred<void>
+  }
+  const waiters = new Set<Waiter>()
+  const lastWakeFor = (queue: QueueName) => Math.max(lastWake.get(queue) ?? 0, lastBroadcast)
 
   // Synchronous on purpose: it is called inside the same synchronous block as
   // the state mutation, so no effect-op boundary (where an interrupt could
-  // land) can separate a mutation from its wake-up signal.
-  const signalWake = () => {
+  // land) can separate a mutation from its wake-up signal. A queue targets
+  // only waiters watching it; no queue broadcasts (rare maintenance verbs).
+  const signalWake = (queue?: QueueName) => {
     wakeVersion += 1
-    const current = wake
-    wake = Deferred.makeUnsafe<void>()
-    Deferred.doneUnsafe(current, Exit.succeed<void>(void 0))
+    if (queue === undefined) {
+      lastBroadcast = wakeVersion
+    } else {
+      lastWake.set(queue, wakeVersion)
+    }
+    // Snapshot-and-clear BEFORE resolving: doneUnsafe resumes waiting fibers
+    // synchronously, and a woken taker that re-parks registers a NEW waiter —
+    // resolving inside the live Set iteration would visit it and livelock.
+    const toWake: Array<Waiter> = []
+    for (const waiter of waiters) {
+      if (queue === undefined || waiter.queues.has(queue)) {
+        waiters.delete(waiter)
+        toWake.push(waiter)
+      }
+    }
+    for (const waiter of toWake) {
+      Deferred.doneUnsafe(waiter.deferred, Exit.succeed<void>(void 0))
+    }
   }
 
   const promoteDue = (now: number) => {
@@ -178,23 +206,47 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
     applyKeep(job, now)
   }
 
+  const keepPolicyFor = (keep: JobRecord["keep"], state: JobState) => {
+    if (keep === undefined) return undefined
+    const policy = state === "completed"
+      ? keep.completed
+      : state === "failed"
+      ? keep.failed
+      : state === "cancelled"
+      ? keep.cancelled
+      : undefined
+    if (policy !== undefined) return policy
+    // Records persisted by 0.2.x carry the flat {count, ageMs} shape — honour
+    // it as an all-states policy so upgrades keep pruning.
+    if (
+      keep.completed === undefined && keep.failed === undefined && keep.cancelled === undefined &&
+      ("count" in keep || "ageMs" in keep)
+    ) {
+      // SAFETY: the flat legacy shape carries KeepStatePolicy fields.
+      return keep as KeepStatePolicy
+    }
+    return undefined
+  }
+
   // Terminal retention: keep at most `count` and drop older than `ageMs`
-  // among terminal jobs sharing this job's name + state.
+  // among terminal jobs sharing this job's name + state (policies are split
+  // per terminal state).
   const applyKeep = (job: MemJob, now: number) => {
-    if (job.keep === undefined) return
+    const policy = keepPolicyFor(job.keep, job.state)
+    if (policy === undefined) return
     const peers = Array.from(jobs.values())
       .filter((peer) => peer.name === job.name && peer.state === job.state)
       .toSorted((a, b) => ((b.finishedAt ?? 0) - (a.finishedAt ?? 0)) || (b.seq - a.seq))
     const remove = new Set<string>()
-    if (job.keep.ageMs !== undefined) {
+    if (policy.ageMs !== undefined) {
       for (const peer of peers) {
-        if (peer.finishedAt !== undefined && peer.finishedAt <= now - job.keep.ageMs) {
+        if (peer.finishedAt !== undefined && peer.finishedAt <= now - policy.ageMs) {
           remove.add(peer.id)
         }
       }
     }
-    if (job.keep.count !== undefined) {
-      for (const peer of peers.slice(Math.max(0, job.keep.count))) {
+    if (policy.count !== undefined) {
+      for (const peer of peers.slice(Math.max(0, policy.count))) {
         remove.add(peer.id)
       }
     }
@@ -203,13 +255,17 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
     }
   }
 
-  const sweepHistory = (now: number, ttlMs: number) => {
+  const sweepHistory = (now: number, ttlByState: HistoryTtlByState) => {
     for (const job of jobs.values()) {
-      if (
-        TERMINAL_STATES.has(job.state) &&
-        job.finishedAt !== undefined &&
-        job.finishedAt <= now - ttlMs
-      ) {
+      if (!TERMINAL_STATES.has(job.state) || job.finishedAt === undefined) continue
+      // SAFETY: TERMINAL_STATES membership was checked above.
+      const state = job.state as TerminalState
+      const ttl = ttlByState[state]
+      const keepAge = keepPolicyFor(job.keep, state)?.ageMs
+      // The sweep honours min(per-row keep age, store ceiling) — a quiet job
+      // name is pruned on the timer, not only when its group is acked.
+      const effective = keepAge !== undefined && (ttl === undefined || keepAge < ttl) ? keepAge : ttl
+      if (effective !== undefined && job.finishedAt <= now - effective) {
         jobs.delete(job.id)
       }
     }
@@ -251,7 +307,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
               if (request.dedupe.ttlMs !== undefined) {
                 entry.expiresAt = now + request.dedupe.ttlMs
               }
-              signalWake()
+              signalWake(keyed.queue)
               return { id: keyed.id, duplicate: true }
             }
             if (windowLive) {
@@ -326,7 +382,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
             expiresAt: request.dedupe.ttlMs !== undefined ? now + request.dedupe.ttlMs : undefined
           })
         }
-        signalWake()
+        signalWake(request.queue)
         return { id, duplicate: false }
       }),
 
@@ -419,7 +475,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
             job.runAt = now + Math.max(0, outcome.delayMs)
             job.state = outcome.delayMs > 0 ? "delayed" : "waiting"
             job.seq = ++seq
-            signalWake()
+            signalWake(job.queue)
             break
           }
         }
@@ -443,7 +499,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
         }
         clearLock(job)
         job.state = "waiting"
-        signalWake()
+        signalWake(job.queue)
       }),
 
     extendLocks: (locks, durationMs) =>
@@ -506,10 +562,14 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
         return recovered
       }),
 
-    awaitWake: (_queues, wakeToken) =>
+    awaitWake: (queues, wakeToken) =>
       Effect.suspend(() => {
-        if (wakeVersion > wakeToken) return Effect.void
-        return Deferred.await(wake)
+        if (queues.some((queue) => lastWakeFor(queue) > wakeToken)) return Effect.void
+        const waiter: Waiter = { queues: new Set(queues), deferred: Deferred.makeUnsafe<void>() }
+        waiters.add(waiter)
+        return Deferred.await(waiter.deferred).pipe(
+          Effect.ensuring(Effect.sync(() => waiters.delete(waiter)))
+        )
       }),
 
     getJob: (id) =>
@@ -589,7 +649,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
         job.processedAt = undefined
         job.runAt = now
         job.seq = ++seq
-        signalWake()
+        signalWake(job.queue)
       }),
 
     cancel: (id) =>
@@ -627,7 +687,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
         }
         job.state = "waiting"
         job.runAt = now
-        signalWake()
+        signalWake(job.queue)
       }),
 
     pause: (queue) =>
@@ -638,7 +698,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
     resume: (queue) =>
       Effect.sync(() => {
         if (paused.delete(queue)) {
-          signalWake()
+          signalWake(queue)
         }
       }),
 
@@ -658,7 +718,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
           schedule.key,
           sameCadence ? { ...schedule, nextRunAt: existing.nextRunAt } : schedule
         )
-        signalWake()
+        signalWake(schedule.queue)
       }),
 
     removeSchedule: (key) => Effect.sync(() => schedules.delete(key)),
@@ -721,11 +781,12 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
  */
 export interface MemoryJobStoreOptions {
   /**
-   * Store-level retention ceiling: terminal records (completed, failed,
-   * cancelled) older than this are removed by a periodic sweep. Per-job
-   * `keep` policies may only be stricter.
+   * Store-level retention ceiling: terminal records older than this are
+   * removed by a periodic sweep — one duration for all terminal states or a
+   * per-state split (`{ completed: "1 day", failed: "30 days" }`). The sweep
+   * also honours stricter per-job `keep.age` rules.
    */
-  readonly historyTtl?: Duration.Input | undefined
+  readonly historyTtl?: HistoryTtlInput | undefined
   /** Sweep cadence (default 1 minute). */
   readonly historySweepInterval?: Duration.Input | undefined
   /**
@@ -755,12 +816,12 @@ export const makeWith = (
   Effect.gen(function*() {
     const { service, sweepHistory } = makeStoreUnsafe(options)
     if (options?.historyTtl !== undefined) {
-      const ttlMs = Duration.toMillis(options.historyTtl)
+      const ttlByState = normalizeHistoryTtl(options.historyTtl)
       const intervalMs = Duration.toMillis(options.historySweepInterval ?? "1 minute")
       yield* Effect.gen(function*() {
         yield* Effect.sleep(intervalMs)
         const now = yield* Clock.currentTimeMillis
-        sweepHistory(now, ttlMs)
+        sweepHistory(now, ttlByState)
       }).pipe(Effect.forever, Effect.forkScoped)
     }
     return service

@@ -34,6 +34,7 @@ import { Clock, type Context, Duration, Effect, type Exit, Layer, Option, Predic
 import {
   type BackoffPolicy,
   type DedupePolicy,
+  type KeepStatePolicy,
   JobCancelledError,
   JobId,
   type JobNotCancellableError,
@@ -90,11 +91,30 @@ export interface BackoffInput {
  *
  * @since 0.1.0
  */
-export interface KeepInput {
+export interface KeepStateInput {
   /** Keep at most this many terminal records (per name + state). */
   readonly count?: number | undefined
   /** Remove terminal records older than this. */
   readonly age?: Duration.Input | undefined
+}
+
+/**
+ * Retention input: a flat `{ count, age }` applies to all terminal states;
+ * the split form sets independent rules per state (completed jobs are
+ * usually noise, failed ones evidence) — an absent state keeps its records
+ * until the store's `historyTtl` ceiling:
+ *
+ * ```ts
+ * keep: { count: 100 }                                        // all states
+ * keep: { completed: { age: "1 day" }, failed: { age: "30 days" } }
+ * ```
+ *
+ * @since 0.1.0
+ */
+export type KeepInput = KeepStateInput | {
+  readonly completed?: KeepStateInput | undefined
+  readonly failed?: KeepStateInput | undefined
+  readonly cancelled?: KeepStateInput | undefined
 }
 
 /**
@@ -419,11 +439,36 @@ const normalizeBackoff = (input: BackoffInput | undefined): BackoffPolicy | unde
     factor: input.factor
   }
 
-const normalizeKeep = (input: KeepInput | undefined): KeepPolicy | undefined =>
-  input === undefined ? undefined : {
-    count: input.count,
-    ageMs: input.age !== undefined ? Duration.toMillis(input.age) : undefined
+const normalizeKeepState = (input: KeepStateInput): KeepStatePolicy => ({
+  count: input.count,
+  ageMs: input.age !== undefined ? Duration.toMillis(input.age) : undefined
+})
+
+const normalizeKeep = (input: KeepInput | undefined): KeepPolicy | undefined => {
+  if (input === undefined) return undefined
+  const split = "completed" in input || "failed" in input || "cancelled" in input
+  const flat = "count" in input || "age" in input
+  if (split && flat) {
+    throw new Error("effect-mq: `keep` must be either flat { count, age } or split per state, not both")
   }
+  if (split) {
+    // SAFETY: the flat branch was excluded above, so the state keys carry
+    // KeepStateInput values.
+    const perState = input as {
+      readonly completed?: KeepStateInput | undefined
+      readonly failed?: KeepStateInput | undefined
+      readonly cancelled?: KeepStateInput | undefined
+    }
+    return {
+      completed: perState.completed !== undefined ? normalizeKeepState(perState.completed) : undefined,
+      failed: perState.failed !== undefined ? normalizeKeepState(perState.failed) : undefined,
+      cancelled: perState.cancelled !== undefined ? normalizeKeepState(perState.cancelled) : undefined
+    }
+  }
+  // SAFETY: the split branch was excluded above, so this is the flat form.
+  const policy = normalizeKeepState(input as KeepStateInput)
+  return { completed: policy, failed: policy, cancelled: policy }
+}
 
 const Proto = {
   [TypeId]: TypeId,

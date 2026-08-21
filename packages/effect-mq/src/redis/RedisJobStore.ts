@@ -25,9 +25,11 @@ export interface RedisJobStoreOptions {
   readonly prefix?: string | undefined
   /**
    * Store-level retention ceiling: terminal records older than this are
-   * removed by a periodic sweep. Per-job `keep` may only be stricter.
+   * removed by a periodic sweep — one duration for all terminal states or a
+   * per-state split (`{ completed: "1 day", failed: "30 days" }`). The sweep
+   * also honours stricter per-job `keep.age` rules.
    */
-  readonly historyTtl?: Duration.Input | undefined
+  readonly historyTtl?: JobStore.HistoryTtlInput | undefined
   /** History sweep cadence (default 1 minute). */
   readonly historySweepInterval?: Duration.Input | undefined
   /**
@@ -152,23 +154,52 @@ export const make = (
     const evalListSchedules = redis.eval(scripts.listSchedules)
     const evalDueSchedules = redis.eval(scripts.dueSchedules)
     const evalAdvanceSchedule = redis.eval(scripts.advanceSchedule)
-    const evalSweepHistory = redis.eval(scripts.sweepHistory)
+    const evalSweepState = redis.eval(scripts.sweepState)
+    const evalSweepDedupes = redis.eval(scripts.sweepDedupes)
 
-    // Wake protocol: a local version + Deferred chain (same-process wake-ups
+    // Wake protocol: a queue-filtered waiter registry (same-process wake-ups
     // never depend on the pub/sub round trip), with the channel carrying
-    // cross-process wake-ups. Same shape as the Postgres driver's NOTIFY.
+    // cross-process wake-ups — the message names the queue ("*" broadcasts).
+    // Filtering matters at scale: without it every enqueue wakes every idle
+    // taker of every queue on the store.
     let wakeVersion = 0
-    let wake = Deferred.makeUnsafe<void>()
-    const signalWakeLocal = () => {
-      wakeVersion += 1
-      const current = wake
-      wake = Deferred.makeUnsafe<void>()
-      Deferred.doneUnsafe(current, Exit.succeed<void>(void 0))
+    let lastBroadcast = 0
+    const lastWake = new Map<JobStore.QueueName, number>()
+    interface Waiter {
+      readonly queues: ReadonlySet<JobStore.QueueName>
+      readonly deferred: Deferred.Deferred<void>
     }
-    const wakeUp = Effect.suspend(() => {
-      signalWakeLocal()
-      return redis.send("PUBLISH", wakeChannel, "1").pipe(Effect.ignore)
-    })
+    const waiters = new Set<Waiter>()
+    const lastWakeFor = (queue: JobStore.QueueName) => Math.max(lastWake.get(queue) ?? 0, lastBroadcast)
+    const signalWakeLocal = (queue?: JobStore.QueueName) => {
+      wakeVersion += 1
+      if (queue === undefined) {
+        lastBroadcast = wakeVersion
+      } else {
+        lastWake.set(queue, wakeVersion)
+      }
+      // Snapshot-and-clear BEFORE resolving: doneUnsafe resumes waiting
+      // fibers synchronously, and a woken taker that re-parks registers a
+      // NEW waiter — resolving inside the live Set iteration would visit it
+      // and livelock.
+      const toWake: Array<Waiter> = []
+      for (const waiter of waiters) {
+        if (queue === undefined || waiter.queues.has(queue)) {
+          waiters.delete(waiter)
+          toWake.push(waiter)
+        }
+      }
+      for (const waiter of toWake) {
+        Deferred.doneUnsafe(waiter.deferred, Exit.succeed<void>(void 0))
+      }
+    }
+    const wakeUp = (queue?: JobStore.QueueName): Effect.Effect<void> =>
+      Effect.suspend(() => {
+        signalWakeLocal(queue)
+        return redis.send("PUBLISH", wakeChannel, queue !== undefined && queue.length > 0 ? queue : "*").pipe(
+          Effect.ignore
+        )
+      })
 
     // Cross-process wake-ups. The pump resubscribes on connection loss (Bun
     // subscribers do not auto-reconnect); the retry delay only ever runs
@@ -177,8 +208,8 @@ export const make = (
       Effect.gen(function*() {
         const messages = yield* redis.subscribe(wakeChannel)
         while (true) {
-          yield* Queue.take(messages)
-          signalWakeLocal()
+          const message = yield* Queue.take(messages)
+          signalWakeLocal(message.message === "*" ? undefined : JobStore.QueueName(message.message))
         }
       })
     ).pipe(
@@ -188,13 +219,26 @@ export const make = (
     )
 
     if (options?.historyTtl !== undefined) {
-      const ttlMs = Duration.toMillis(options.historyTtl)
+      const ttlByState = JobStore.normalizeHistoryTtl(options.historyTtl)
       const intervalMs = Duration.toMillis(options.historySweepInterval ?? "1 minute")
       yield* Effect.gen(function*() {
         yield* Effect.sleep(intervalMs)
         const now = yield* Clock.currentTimeMillis
-        while ((yield* evalSweepHistory(prefix, now - ttlMs, 500, now)) !== "0") {
-          // bounded batches until the window is clean
+        // Per-state ceilings refined by stricter per-row keep ages, paged by
+        // an offset cursor so young rows are visited once per sweep.
+        for (const state of ["completed", "failed", "cancelled"] as const) {
+          const ttl = ttlByState[state]
+          let offset = 0
+          while (true) {
+            const page: { scanned: number; deleted: number } = JSON.parse(
+              yield* evalSweepState(prefix, state, ttl === undefined ? "" : String(ttl), 200, offset, now)
+            )
+            if (page.scanned < 200) break
+            offset += page.scanned - page.deleted
+          }
+        }
+        while ((yield* evalSweepDedupes(prefix, 200, now)) !== "0") {
+          // bounded batches until the dedup backlog is clean
         }
       }).pipe(
         Effect.catchCause((cause) => Effect.logError("effect-mq: redis history sweep failed", cause)),
@@ -258,6 +302,7 @@ export const make = (
               wake?: boolean
               collision?: boolean
               error?: string
+              queue?: string
             } = JSON.parse(yield* enqueueOnce(request, mode, candidate, now))
             if (reply.collision === true) continue
             if (reply.error !== undefined || reply.id === undefined) {
@@ -266,7 +311,8 @@ export const make = (
               })
             }
             if (reply.wake === true) {
-              yield* wakeUp
+              // A replace-while-delayed reply names the keyed job's queue.
+              yield* wakeUp(reply.queue !== undefined ? JobStore.QueueName(reply.queue) : request.queue)
             }
             return { id: JobStore.JobId(reply.id), duplicate: reply.duplicate === true }
           }
@@ -316,7 +362,7 @@ export const make = (
             ? ""
             : JSON.stringify(outcome.exit)
           const delayMs = outcome._tag === "Retry" ? Math.max(0, outcome.delayMs) : 0
-          const reply: { error?: string; wake?: boolean } = JSON.parse(
+          const reply: { error?: string; wake?: boolean; queue?: string } = JSON.parse(
             yield* evalAck(prefix, id, token, outcome._tag, exitJson, delayMs, now).pipe(
               Effect.mapError(storeError("ack failed"))
             )
@@ -324,20 +370,20 @@ export const make = (
           if (reply.error === "notfound") return yield* new JobStore.JobNotFoundError({ jobId: id })
           if (reply.error === "locklost") return yield* new JobStore.LockLostError({ jobId: id })
           if (reply.wake === true) {
-            yield* wakeUp
+            yield* wakeUp(reply.queue !== undefined ? JobStore.QueueName(reply.queue) : undefined)
           }
         }),
 
       release: (id, token) =>
         Effect.gen(function*() {
           const now = yield* Clock.currentTimeMillis
-          const reply: { error?: string; wake?: boolean } = JSON.parse(
+          const reply: { error?: string; wake?: boolean; queue?: string } = JSON.parse(
             yield* evalRelease(prefix, id, token, now).pipe(Effect.mapError(storeError("release failed")))
           )
           if (reply.error === "notfound") return yield* new JobStore.JobNotFoundError({ jobId: id })
           if (reply.error === "locklost") return yield* new JobStore.LockLostError({ jobId: id })
           if (reply.wake === true) {
-            yield* wakeUp
+            yield* wakeUp(reply.queue !== undefined ? JobStore.QueueName(reply.queue) : undefined)
           }
         }),
 
@@ -367,15 +413,19 @@ export const make = (
           )
           const result = recovered.map((entry) => ({ id: JobStore.JobId(entry.id), failed: entry.failed }))
           if (result.some((entry) => !entry.failed)) {
-            yield* wakeUp
+            yield* wakeUp()
           }
           return result
         }).pipe(Effect.mapError(storeError("recoverStalled failed"))),
 
-      awaitWake: (_queues, wakeToken) =>
+      awaitWake: (queues, wakeToken) =>
         Effect.suspend(() => {
-          if (wakeVersion > wakeToken) return Effect.void
-          return Deferred.await(wake)
+          if (queues.some((queue) => lastWakeFor(queue) > wakeToken)) return Effect.void
+          const waiter: Waiter = { queues: new Set(queues), deferred: Deferred.makeUnsafe<void>() }
+          waiters.add(waiter)
+          return Deferred.await(waiter.deferred).pipe(
+            Effect.ensuring(Effect.sync(() => waiters.delete(waiter)))
+          )
         }),
 
       getJob: (id) =>
@@ -440,14 +490,14 @@ export const make = (
       retry: (id) =>
         Effect.gen(function*() {
           const now = yield* Clock.currentTimeMillis
-          const reply: { error?: string; state?: JobStore.JobState } = JSON.parse(
+          const reply: { error?: string; state?: JobStore.JobState; queue?: string } = JSON.parse(
             yield* evalRetry(prefix, id, now).pipe(Effect.mapError(storeError("retry failed")))
           )
           if (reply.error === "notfound") return yield* new JobStore.JobNotFoundError({ jobId: id })
           if (reply.error === "state") {
             return yield* new JobStore.JobNotRetryableError({ jobId: id, state: reply.state ?? "failed" })
           }
-          yield* wakeUp
+          yield* wakeUp(reply.queue !== undefined ? JobStore.QueueName(reply.queue) : undefined)
         }),
 
       counts: (queue) =>
@@ -496,14 +546,14 @@ export const make = (
       promote: (id) =>
         Effect.gen(function*() {
           const now = yield* Clock.currentTimeMillis
-          const reply: { error?: string; state?: JobStore.JobState } = JSON.parse(
+          const reply: { error?: string; state?: JobStore.JobState; queue?: string } = JSON.parse(
             yield* evalPromote(prefix, id, now).pipe(Effect.mapError(storeError("promote failed")))
           )
           if (reply.error === "notfound") return yield* new JobStore.JobNotFoundError({ jobId: id })
           if (reply.error === "state") {
             return yield* new JobStore.JobNotPromotableError({ jobId: id, state: reply.state ?? "completed" })
           }
-          yield* wakeUp
+          yield* wakeUp(reply.queue !== undefined ? JobStore.QueueName(reply.queue) : undefined)
         }),
 
       pause: (queue) =>
@@ -515,7 +565,7 @@ export const make = (
       resume: (queue) =>
         redis.send("SREM", `${prefix}:paused`, queue).pipe(
           Effect.mapError(storeError("resume failed")),
-          Effect.flatMap((removed) => Number(removed) > 0 ? wakeUp : Effect.void)
+          Effect.flatMap((removed) => Number(removed) > 0 ? wakeUp(queue) : Effect.void)
         ),
 
       pausedQueues: () =>
@@ -547,7 +597,7 @@ export const make = (
           schedule.nextRunAt
         ).pipe(
           Effect.mapError(storeError("upsertSchedule failed")),
-          Effect.andThen(wakeUp)
+          Effect.andThen(wakeUp(schedule.queue))
         ),
 
       removeSchedule: (key) =>

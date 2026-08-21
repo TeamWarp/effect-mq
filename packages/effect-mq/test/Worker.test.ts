@@ -1091,7 +1091,12 @@ describe("review gap coverage", () => {
         const first = yield* Pruned.enqueue({ n: 1 })
         const record = yield* store.getJob(first)
         assert(Option.isSome(record))
-        expect(record.value.keep).toEqual({ count: 1, ageMs: 60_000 })
+        // The flat shorthand normalizes to every terminal state.
+        expect(record.value.keep).toEqual({
+          completed: { count: 1, ageMs: 60_000 },
+          failed: { count: 1, ageMs: 60_000 },
+          cancelled: { count: 1, ageMs: 60_000 }
+        })
 
         yield* settle
         yield* TestClock.adjust("1 second")
