@@ -18,10 +18,6 @@ during the initial build (BullMQ v6's Redis/Postgres backends,
   enqueue and restore the handler's span parent from it
   (`Tracer.externalSpan`, exactly as `DurableQueue` does), so producer →
   handler traces connect across processes.
-- [ ] **Cross-process event stream** — append-only events table with
-  cursor replay (the `QueueEvents` analogue): powers live dashboard updates,
-  `waitUntilFinished`-style APIs without polling, and audit trails. NOTIFY
-  coalescing caveats already solved for the wake channel apply here.
 - [ ] **Batch enqueue** — `enqueueMany` in one round trip (one INSERT with
   multi-row VALUES); flagged as an easy perf win during the storage research.
 - [ ] **Drizzle schema customization + typed queue registry** (pair these) —
@@ -60,6 +56,35 @@ during the initial build (BullMQ v6's Redis/Postgres backends,
   over any `effect/unstable/persistence` `KeyValueStore` (file system, etc.),
   explicitly documented as single-process (plain KV has no cross-process
   atomicity; multi-process stays Postgres/Redis territory).
+
+## Maybe — filed for later
+
+Designed but deliberately not committed; revisit when there's a concrete
+pull.
+
+- [ ] **Job event stream (pub/sub)** — a durable, cursor-ordered event log,
+  NOT ephemeral broadcast: the store appends a slim `JobEvent` (cursor,
+  type, jobId, name, queue, timestamp) *inside the same transaction/Lua
+  script* as each transition; Postgres = append-only table with a bigserial
+  cursor, Redis = `XADD` stream with a `MAXLEN` cap. The log is a capped
+  feed, not the archive (the attempts ledger stays the archive). Consumer
+  architecture: `JobEvents.stream({ names?, queues?, after? })` — an Effect
+  Stream that reads batches after a cursor and parks on the queue-filtered
+  wake channel when caught up (push latency, lossless: a missed notify is
+  found by the next read). At-least-once from the caller's cursor; global
+  cursor order per store. Ships together with event-driven `awaitResult`
+  (replacing its poll loop) and `retryAll({ name?, queue?, before? })` bulk
+  redrive. Explicitly out of scope: general application messaging (this is
+  a job-event feed, not a message bus).
+  - *v2, on top*: durable named subscribers
+    (`JobEvents.durable("alerts", handler)`) — store-persisted cursors plus
+    a lease so exactly one instance is active; this is the general "dead
+    letter hook" mechanism.
+  - *Dead-letter sugar* (`deadLetter: { job, map }` on `Job.make`): enqueue
+    a compensation job on terminal failure. Note there is no DLQ *queue* to
+    build — the terminal `failed` state with the ledger, `list`, `retry`,
+    and per-state retention already is the dead-letter store (same
+    conclusion BullMQ reached with its failed set).
 
 ## P3 — later
 
