@@ -15,6 +15,12 @@ bumps are additive.
 - **Custom indexes on the drizzle factories** — every factory takes
   `extraConfig: (table) => [index(...).on(...)]` (the same shape as drizzle's
   third `pgTable` argument), appended after the built-in indexes.
+- **Custom columns on the jobs table** — `mqJobs({ extend: { companyId:
+  text("company_id").notNull(), ... } })`: extended columns are filled at
+  enqueue from the job's `metadata` entry with the same TS key (override or
+  coerce with the store's `extraValues` option), rewritten by dedupe
+  `replace`, visible to `extraConfig` indexes, and fully typed in your own
+  drizzle queries.
 - Store contract (breaking for driver authors): `EnqueueRequest.dedupe`,
   `JobRecord.dedupeKey`; Postgres adds the `effect_mq_dedupe` table and a
   `dedupe_key` jobs column (one drizzle-kit migration).

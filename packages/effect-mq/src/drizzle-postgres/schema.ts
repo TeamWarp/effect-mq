@@ -101,13 +101,41 @@ const jobsColumns = <JobName extends string>() => ({
  * The jobs table factory. `JobName` types the `name` column — derive it from
  * your job definitions: `mqJobs<typeof GenerateInvoice._tag | typeof Report._tag>()`.
  *
+ * `extend` adds your own columns (tenant ids, object ids, ...) to the table.
+ * At enqueue the Postgres store fills each extended column from the job's
+ * `metadata` entry with the same TS key (NULL when absent); override the
+ * mapping with the store's `extraValues` option. Extended columns are yours
+ * to read with plain drizzle queries — FKs, RLS policies, and `extraConfig`
+ * indexes all work:
+ *
+ * ```ts
+ * export const jobs = mqJobs<JobNames>("effect_mq_jobs", {
+ *   extend: {
+ *     companyId: text("company_id").notNull(),
+ *     objectId: text("object_id")
+ *   },
+ *   extraConfig: (t) => [index("jobs_company_idx").on(t.companyId, t.state)]
+ * })
+ * ```
+ *
  * @since 0.1.0
  */
-export const mqJobs = <JobName extends string = string>(
+export const mqJobs = <
+  JobName extends string = string,
+  Extend extends Record<string, AnyPgColumnBuilder> = Record<never, never>
+>(
   tableName = "effect_mq_jobs",
-  options?: MqTableOptions<ReturnType<typeof jobsColumns<JobName>>>
+  options?: MqTableOptions<ReturnType<typeof jobsColumns<JobName>> & Extend> & {
+    /** Extra columns appended to the factory's own (see the JSDoc example). */
+    readonly extend?: Extend | undefined
+  }
 ) =>
-  pgTable(tableName, jobsColumns<JobName>(), (table) => [
+  pgTable(tableName, {
+    ...jobsColumns<JobName>(),
+    // SAFETY: when `extend` is absent, `Extend` was never inferred from a
+    // value and stays at its empty-record default, which {} satisfies.
+    ...options?.extend ?? ({} as Extend)
+  }, (table) => [
     // Claim path: pop highest priority, FIFO within it.
     index(`${tableName}_ready_idx`)
       .on(table.queue, table.priority.desc(), table.seq.asc())

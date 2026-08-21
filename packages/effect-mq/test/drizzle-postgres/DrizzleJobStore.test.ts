@@ -2,7 +2,7 @@ import { Job, JobStore, Worker } from "../../src/index.ts"
 import { PgClient } from "@effect/sql-pg"
 import { jobStoreConformance } from "../../src/testing/index.ts"
 import { assert, describe, expect, it } from "@effect/vitest"
-import { getTableConfig, index } from "drizzle-orm/pg-core"
+import { getTableConfig, index, text } from "drizzle-orm/pg-core"
 import { Effect, Exit, Fiber, Layer, Option, Schedule, Schema } from "effect"
 import { DrizzleJobStore, mqDedupe, mqJobAttempts, mqJobs, mqQueueControl, mqSchedules } from "../../src/drizzle-postgres/index.ts"
 import { createTablesSql, freshStoreEffect, freshStoreLayer, freshTableNames, pgAvailable, pgClientLive, pgUrl } from "./support.ts"
@@ -243,6 +243,99 @@ if (!available) {
         expect(results.filter((r) => !r.duplicate)).toHaveLength(1)
         expect(new Set(results.map((r) => r.id)).size).toBe(1)
         expect((yield* store.counts()).waiting).toBe(1)
+      }).pipe(Effect.scoped, Effect.provide(pgClientLive())))
+
+    it.effect("extended columns fill from metadata at enqueue; extraValues and replace override", () =>
+      Effect.gen(function*() {
+        const client = yield* PgClient.PgClient
+        const names = freshTableNames()
+        const jobs = mqJobs(names.jobs, {
+          extend: {
+            companyId: text("company_id").notNull(),
+            objectId: text("object_id")
+          },
+          // Extended columns are visible to extraConfig, fully typed.
+          extraConfig: (t) => [index(`${names.jobs}_company_idx`).on(t.companyId, t.state)]
+        })
+        const attempts = mqJobAttempts(jobs, names.attempts)
+        const schedules = mqSchedules(names.schedules)
+        const queues = mqQueueControl(names.queues)
+        const dedupe = mqDedupe(names.dedupe)
+        for (
+          const statement of createTablesSql(names.jobs, names.attempts, names.schedules, names.queues, names.dedupe)
+        ) {
+          yield* client.unsafe(statement).pipe(Effect.orDie)
+        }
+        yield* client.unsafe(
+          `ALTER TABLE "${names.jobs}" ADD COLUMN company_id text NOT NULL, ADD COLUMN object_id text`
+        ).pipe(Effect.orDie)
+        yield* Effect.addFinalizer(() =>
+          client.unsafe(
+            `DROP TABLE IF EXISTS "${names.attempts}", "${names.jobs}", "${names.schedules}", "${names.queues}", "${names.dedupe}" CASCADE`
+          ).pipe(Effect.ignore)
+        )
+        const store = yield* DrizzleJobStore.make({ jobs, attempts, schedules, queues, dedupe }).pipe(Effect.orDie)
+
+        const base = {
+          id: undefined,
+          name: "Tenant",
+          queue: JobStore.QueueName("default"),
+          payload: {},
+          metadata: { companyId: "acme", objectId: "obj-1" },
+          priority: 0,
+          attemptsMax: 1,
+          backoff: undefined,
+          keep: undefined,
+          timeoutMs: undefined,
+          dedupe: undefined,
+          delayMs: 0
+        }
+        // Default mapping: metadata[<TS key>] lands in the column at INSERT.
+        const first = yield* store.enqueue(base)
+        const row = yield* client.unsafe(
+          `SELECT company_id, object_id FROM "${names.jobs}" WHERE id = '${first.id}'`
+        ).pipe(Effect.orDie)
+        expect(row[0]).toEqual({ company_id: "acme", object_id: "obj-1" })
+
+        // Absent metadata key -> NULL for nullable columns...
+        const partial = yield* store.enqueue({ ...base, metadata: { companyId: "acme" } })
+        const partialRow = yield* client.unsafe(
+          `SELECT object_id FROM "${names.jobs}" WHERE id = '${partial.id}'`
+        ).pipe(Effect.orDie)
+        expect(partialRow[0]).toEqual({ object_id: null })
+
+        // ...and a loud JobStoreError for NOT NULL ones.
+        const violated = yield* Effect.flip(store.enqueue({ ...base, metadata: {} }))
+        expect(violated._tag).toBe("JobStoreError")
+
+        // extraValues overrides the metadata convention.
+        const mapped = yield* DrizzleJobStore.make({
+          jobs,
+          attempts,
+          schedules,
+          queues,
+          dedupe,
+          extraValues: ({ metadata }) => ({ companyId: `tenant-${metadata.companyId}` })
+        }).pipe(Effect.orDie)
+        const overridden = yield* mapped.enqueue(base)
+        const overriddenRow = yield* client.unsafe(
+          `SELECT company_id, object_id FROM "${names.jobs}" WHERE id = '${overridden.id}'`
+        ).pipe(Effect.orDie)
+        expect(overriddenRow[0]).toEqual({ company_id: "tenant-acme", object_id: "obj-1" })
+
+        // A dedupe replace rewrites the extended columns with the latest values.
+        const keyed = {
+          ...base,
+          metadata: { companyId: "acme", objectId: "v1" },
+          dedupe: { key: "obj", ttlMs: undefined, extend: false, replace: true },
+          delayMs: 60_000
+        }
+        const job = yield* store.enqueue(keyed)
+        yield* store.enqueue({ ...keyed, metadata: { companyId: "acme", objectId: "v2" } })
+        const replacedRow = yield* client.unsafe(
+          `SELECT object_id FROM "${names.jobs}" WHERE id = '${job.id}'`
+        ).pipe(Effect.orDie)
+        expect(replacedRow[0]).toEqual({ object_id: "v2" })
       }).pipe(Effect.scoped, Effect.provide(pgClientLive())))
 
     it.live("historyTtl sweeps terminal rows; live rows survive", () =>

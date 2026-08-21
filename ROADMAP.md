@@ -27,12 +27,8 @@ during the initial build (BullMQ v6's Redis/Postgres backends,
 - [ ] **Batch enqueue** — `enqueueMany` in one round trip (one INSERT with
   multi-row VALUES); flagged as an easy perf win during the storage research.
 - [ ] **Drizzle schema customization + typed queue registry** (pair these) —
-  the remaining factory features (custom *indexes* shipped as `extraConfig`
-  in 0.3.0):
-  - *Custom columns*: `mqJobs<Names>(name, { extend: {...} })` with extras
-    flowing through the generics (the driver already INSERTs an explicit
-    column list, so extras need only be nullable/defaulted; the drift guard
-    gains a superset mode).
+  the remaining factory features (custom *indexes* via `extraConfig` and
+  custom *columns* via `extend`/`extraValues` shipped in 0.3.0):
   - *Configurable column names*: `mqJobs(name, { columns: { runAt:
     "scheduled_at", ... } })` for shops with naming conventions. Prerequisite:
     the store's raw SQL must derive every column identifier from the table

@@ -18,7 +18,7 @@
  */
 import * as JobStore from "../JobStore.ts"
 import type { PgClient } from "@effect/sql-pg"
-import { asc, eq, sql } from "drizzle-orm"
+import { asc, eq, getTableColumns, sql } from "drizzle-orm"
 import * as PgDrizzle from "drizzle-orm/effect-postgres"
 import { getTableConfig } from "drizzle-orm/pg-core"
 import { Clock, type Context, Deferred, Duration, Effect, Layer, Option, type Scope, Stream } from "effect"
@@ -40,6 +40,15 @@ export interface DrizzleJobStoreOptions<StoreId = JobStore.JobStore> {
   readonly queues: MqQueueControlTable
   /** The dedup-key registry table (from `mqDedupe`). */
   readonly dedupe: MqDedupeTable
+  /**
+   * Values for columns added via `mqJobs({ extend })`, evaluated at enqueue
+   * (and on dedupe `replace`). Keys are the extended columns' TS names.
+   * Default: each extended column fills from `request.metadata[<TS name>]`,
+   * NULL when absent.
+   */
+  readonly extraValues?:
+    | ((request: JobStore.EnqueueRequest) => Readonly<Record<string, ExtraColumnValue>>)
+    | undefined
   /** Bind to a `JobStore.named(...)` key; default: the default `JobStore`. */
   readonly store?: Context.Key<StoreId, JobStore.Service> | undefined
   /**
@@ -62,6 +71,13 @@ export interface DrizzleJobStoreOptions<StoreId = JobStore.JobStore> {
 }
 
 type Db = PgDrizzle.EffectPgDatabase & { readonly $client: PgClient.PgClient }
+
+/**
+ * A value the driver can bind directly into an extended column.
+ *
+ * @since 0.3.0
+ */
+export type ExtraColumnValue = string | number | boolean | Date | null
 
 const storeError = (message: string) => (cause: unknown) =>
   new JobStore.JobStoreError({ message, cause })
@@ -181,6 +197,58 @@ export const make = (
     const jobsName = getTableConfig(jobs).name
     const attemptsName = getTableConfig(attempts).name
     const wakeChannel = `effect_mq_wake_${jobsName}`
+
+    // Columns the user added via `mqJobs({ extend })`: everything beyond the
+    // factory's own set. They are written at enqueue (and on dedupe replace)
+    // from `extraValues` or the metadata entry with the same TS key.
+    const BASE_JOB_COLUMNS = new Set([
+      "id",
+      "name",
+      "queue",
+      "state",
+      "priority",
+      "seq",
+      "payload",
+      "metadata",
+      "attemptsMax",
+      "attemptsMade",
+      "stalledCount",
+      "backoff",
+      "keep",
+      "timeoutMs",
+      "cancelRequested",
+      "dedupeKey",
+      "runAt",
+      "enqueuedAt",
+      "processedAt",
+      "finishedAt",
+      "exit",
+      "failedReason",
+      "lockToken",
+      "lockExpiresAt"
+    ])
+    const extendedColumns = Object.entries(getTableColumns(jobs))
+      .filter(([key]) => !BASE_JOB_COLUMNS.has(key))
+      .map(([key, column]) => ({ key, name: column.name }))
+    const extraColumnNames = extendedColumns.length === 0
+      ? sql``
+      : sql.join(extendedColumns.map((column) => sql`, ${sql.identifier(column.name)}`))
+    const extraColumnValues = (request: JobStore.EnqueueRequest) => {
+      if (extendedColumns.length === 0) return sql``
+      const mapped = options.extraValues?.(request) ?? {}
+      return sql.join(extendedColumns.map((column) =>
+        sql`, ${Object.hasOwn(mapped, column.key) ? mapped[column.key] : request.metadata[column.key] ?? null}`
+      ))
+    }
+    const extraColumnAssignments = (request: JobStore.EnqueueRequest) => {
+      if (extendedColumns.length === 0) return sql``
+      const mapped = options.extraValues?.(request) ?? {}
+      return sql.join(extendedColumns.map((column) =>
+        sql`, ${sql.identifier(column.name)} = ${
+          Object.hasOwn(mapped, column.key) ? mapped[column.key] : request.metadata[column.key] ?? null
+        }`
+      ))
+    }
 
     if (options.validate ?? true) {
       yield* Effect.all([
@@ -349,13 +417,13 @@ export const make = (
             : sql`'j-' || ${seqExpr}::text`
           const rows = rowsOf(yield* exec.execute<{ id: string }>(sql`
             INSERT INTO ${jobs} (id, name, queue, state, priority, payload, metadata,
-              attempts_max, backoff, keep, timeout_ms, dedupe_key, run_at, enqueued_at)
+              attempts_max, backoff, keep, timeout_ms, dedupe_key, run_at, enqueued_at${extraColumnNames})
             VALUES (${idExpr}, ${request.name}, ${request.queue}, ${state}, ${request.priority},
               ${JSON.stringify(request.payload ?? null)}::jsonb, ${JSON.stringify(request.metadata)}::jsonb,
               ${request.attemptsMax},
               ${request.backoff === undefined ? null : JSON.stringify(request.backoff)}::jsonb,
               ${request.keep === undefined ? null : JSON.stringify(request.keep)}::jsonb,
-              ${request.timeoutMs ?? null}, ${request.dedupe?.key ?? null}, ${runAt}, ${now})
+              ${request.timeoutMs ?? null}, ${request.dedupe?.key ?? null}, ${runAt}, ${now}${extraColumnValues(request)})
             ON CONFLICT (id) DO NOTHING
             RETURNING ${jobs.id} AS id
           `).pipe(Effect.mapError(storeError("enqueue failed"))))
@@ -431,7 +499,7 @@ export const make = (
                   backoff = ${request.backoff === undefined ? null : JSON.stringify(request.backoff)}::jsonb,
                   keep = ${request.keep === undefined ? null : JSON.stringify(request.keep)}::jsonb,
                   timeout_ms = ${request.timeoutMs ?? null},
-                  run_at = ${new Date(now.getTime() + Math.max(0, request.delayMs))}
+                  run_at = ${new Date(now.getTime() + Math.max(0, request.delayMs))}${extraColumnAssignments(request)}
                 WHERE ${jobs.id} = ${entry.jobId} AND ${jobs.state} = 'delayed'
                 RETURNING ${jobs.id} AS id
               `))

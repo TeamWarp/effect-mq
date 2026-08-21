@@ -257,6 +257,38 @@ export const jobs = mqJobs<JobNames>("effect_mq_jobs", {
 })
 ```
 
+### Custom columns
+
+Need real columns — a tenant id you can FK, RLS-scope, and join — populated
+at job creation instead of patched in from job logic? `extend` the jobs
+table; at enqueue the store fills each extended column from the job's
+`metadata` entry with the same TS key (the definition's
+`metadata: (payload) => ...` is your creation-time hook), NULL when absent:
+
+```ts
+class SyncBenefits extends Job.make("sync-benefits", {
+  payload: { companyId: Schema.String, objectId: Schema.String },
+  metadata: ({ companyId, objectId }) => ({ companyId, objectId })
+}) {}
+
+export const jobs = mqJobs<JobNames>("effect_mq_jobs", {
+  extend: {
+    companyId: text("company_id").notNull(),
+    objectId: text("object_id")
+  },
+  extraConfig: (t) => [index("jobs_company_idx").on(t.companyId, t.state)]
+})
+
+// Coercion/renames when the metadata convention isn't enough:
+DrizzleJobStore.layer({ ...tables, extraValues: ({ metadata }) => ({ companyId: metadata.companyId }) })
+```
+
+`db.select().from(jobs).where(eq(jobs.companyId, tenant))` is fully typed; a
+dedupe `replace` rewrites the extended columns with the latest values; a
+missing metadata key on a `NOT NULL` column fails the enqueue loudly. Memory
+and Redis need nothing — there the metadata projection is already the
+queryable surface (`store.list({ metadata: { companyId } })`).
+
 ```
 drizzle-kit generate   # emits the CREATE TABLE migration next to your others
 drizzle-kit migrate
