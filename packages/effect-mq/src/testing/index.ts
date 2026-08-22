@@ -5,3 +5,10 @@
  * @since 0.1.0
  */
 export * from "./conformance.ts"
+
+/**
+ * Assert what services enqueue in unit tests, with typed payloads.
+ *
+ * @since 0.3.2
+ */
+export * as TestJobStore from "./TestJobStore.ts"

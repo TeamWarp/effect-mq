@@ -16,7 +16,7 @@ One package, tree-shakeable modules:
 | `effect-mq` | `Job`, `JobStore`, `MemoryJobStore`, `Worker` | — |
 | `effect-mq/drizzle-postgres` | drizzle-postgres schema factories + the Postgres `JobStore` | `drizzle-orm` (v1), `@effect/sql-pg` |
 | `effect-mq/redis` | the Redis `JobStore` (Lua-script atomicity) | a `Redis` service (`@effect/platform-node`/`-bun`) |
-| `effect-mq/testing` | the `JobStore` conformance suite for driver authors | `@effect/vitest` |
+| `effect-mq/testing` | `TestJobStore` (assert enqueues in unit tests) + the driver conformance suite | `@effect/vitest` (conformance only) |
 
 ## Five-minute tour
 
@@ -509,6 +509,34 @@ handler).
 **Store construction** — every driver accepts `idGenerator`, `historyTtl`,
 and `historySweepInterval`; drizzle-postgres additionally takes the table
 instances (+ `validate`), Redis a key `prefix`.
+
+## Testing your app
+
+Unit-test that services enqueue correctly — no worker, no boilerplate, and
+payloads come back **decoded through the job's schema** (so `Redacted`,
+`DateTime`, and branded values are real instances, not stored JSON):
+
+```ts
+import { TestJobStore } from "effect-mq/testing"
+
+it.effect("signup enqueues a welcome email", () =>
+  Effect.gen(function*() {
+    yield* SignupService.register({ email: "ada@example.com" })
+
+    const emails = yield* TestJobStore.enqueuedOf(SendEmail)
+    expect(emails).toHaveLength(1)
+    expect(emails[0]?.payload.to).toBe("ada@example.com")
+    expect(emails[0]?.state).toBe("waiting")
+  }).pipe(Effect.provide(TestJobStore.layer)))
+```
+
+`TestJobStore.layer` provides a fresh in-memory store as both the default
+`JobStore` (for the code under test) and the inspection service; jobs just
+accumulate in `waiting`/`delayed` since nothing claims them. Named stores
+use `TestJobStore.layerFor(Durable)`. Records surface scheduling detail
+(`state`, `priority`, `runAt`, `metadata`, `dedupeKey`), and the raw store
+is exposed for simulating claims/acks. No `@effect/vitest` required — it is
+plain Effect, so it works with any test runner.
 
 ## Writing a storage driver
 

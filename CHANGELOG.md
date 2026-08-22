@@ -4,7 +4,17 @@ All notable changes to `effect-mq`. Versions follow 0.x semver: **minor
 bumps may break** (the `JobStore` driver contract in particular); patch
 bumps are additive.
 
-## 0.3.1 (unreleased)
+## 0.3.2 (unreleased)
+
+- **`TestJobStore` test harness** (`effect-mq/testing`) — assert what your
+  services enqueue in unit tests: `TestJobStore.layer` provides an in-memory
+  store to the code under test, and `enqueuedOf(JobClass)` returns the
+  accumulated jobs with payloads decoded through the job's schema (typed
+  `Redacted`/`DateTime`/branded values, not stored JSON), oldest-first,
+  drained past pagination. `layerFor` covers named stores; the raw store is
+  exposed for claim/ack simulation.
+
+## 0.3.1 — 2026-08-22
 
 - **Effect `Metric` integration** — the new `Metrics` module exposes the
   instruments workers and producers emit: enqueues, runs + durations by
