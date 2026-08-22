@@ -278,6 +278,29 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
     }
   }
 
+  const cancelJob = (id: JobId) =>
+    Effect.gen(function*() {
+      const now = yield* Clock.currentTimeMillis
+      const job = jobs.get(id)
+      if (job === undefined) {
+        return yield* new JobNotFoundError({ jobId: id })
+      }
+      switch (job.state) {
+        case "waiting":
+        case "delayed": {
+          markCancelled(job, now)
+          return
+        }
+        case "active": {
+          job.cancelRequested = true
+          return
+        }
+        default: {
+          return yield* new JobNotCancellableError({ jobId: id, state: job.state })
+        }
+      }
+    })
+
   const service: Service = JobStore.of({
     enqueue: (request: EnqueueRequest) =>
       Effect.gen(function*() {
@@ -652,27 +675,18 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
         signalWake(job.queue)
       }),
 
-    cancel: (id) =>
-      Effect.gen(function*() {
-        const now = yield* Clock.currentTimeMillis
-        const job = jobs.get(id)
-        if (job === undefined) {
-          return yield* new JobNotFoundError({ jobId: id })
-        }
-        switch (job.state) {
-          case "waiting":
-          case "delayed": {
-            markCancelled(job, now)
-            return
-          }
-          case "active": {
-            job.cancelRequested = true
-            return
-          }
-          default: {
-            return yield* new JobNotCancellableError({ jobId: id, state: job.state })
-          }
-        }
+    cancel: cancelJob,
+
+    cancelByDedupe: (name, key) =>
+      Effect.suspend(() => {
+        const entry = dedupes.get(dedupeMapKey(name, key))
+        if (entry === undefined) return Effect.succeed(false)
+        return cancelJob(entry.jobId).pipe(
+          Effect.as(true),
+          // Idempotent: a vanished or already-terminal keyed job is "nothing
+          // pending", not an error.
+          Effect.catchTag(["JobNotFoundError", "JobNotCancellableError"], () => Effect.succeed(false))
+        )
       }),
 
     promote: (id) =>

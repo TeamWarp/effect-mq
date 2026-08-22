@@ -4,7 +4,23 @@ All notable changes to `effect-mq`. Versions follow 0.x semver: **minor
 bumps may break** (the `JobStore` driver contract in particular); patch
 bumps are additive.
 
-## 0.3.2 (unreleased)
+## 0.4.0 (unreleased)
+
+- **Absolute-time scheduling** — `enqueue(payload, { at })` accepts any
+  `DateTime.Input` (a zone-aware `DateTime`, `Date`, ISO string, epoch
+  millis, or date parts), so "9am Monday in New York" needs no duration
+  math. `delay` and `at` are mutually exclusive at the type level; a past
+  `at` runs immediately. No store-contract change — the delay is resolved
+  against the Effect Clock at enqueue.
+- **Cancel by dedup key** — `MyJob.cancelByKey(key)` (store contract:
+  `cancelByDedupe(name, key)`, breaking for driver authors) cancels
+  whatever pending job holds the key: delayed/waiting terminally, active
+  via the heartbeat flag. Idempotent — returns false when nothing is
+  pending. Together with dedupe `replace` + `at`, this completes the
+  schedule/reschedule/cancel lifecycle for one-shot future work keyed by
+  business ids.
+
+## 0.3.2 — 2026-08-22
 
 - **`TestJobStore` test harness** (`effect-mq/testing`) — assert what your
   services enqueue in unit tests: `TestJobStore.layer` provides an in-memory

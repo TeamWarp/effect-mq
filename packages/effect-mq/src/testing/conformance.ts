@@ -1293,6 +1293,35 @@ export const jobStoreConformance = (
         })
       ))
 
+    it.effect("cancelByDedupe cancels pending keyed jobs and is idempotent", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const dedupe = { key: "emp-1", ttlMs: undefined, extend: false, replace: false }
+          // Unknown key: nothing pending, no error.
+          expect(yield* store.cancelByDedupe("TestJob", "emp-1")).toBe(false)
+
+          // Delayed keyed job: cancelled terminally.
+          const delayed = yield* store.enqueue(baseRequest({ dedupe, delayMs: 60_000 }))
+          expect(yield* store.cancelByDedupe("TestJob", "emp-1")).toBe(true)
+          const job = yield* store.getJob(delayed.id)
+          assert(Option.isSome(job))
+          expect(job.value.state).toBe("cancelled")
+          expect(yield* store.cancelByDedupe("TestJob", "emp-1")).toBe(false)
+
+          // Active keyed job: flagged for the heartbeat.
+          const active = yield* store.enqueue(baseRequest({ dedupe, payload: { n: 2 } }))
+          const claim = yield* store.claim(claimOptions())
+          assert(claim._tag === "Claimed")
+          expect(yield* store.cancelByDedupe("TestJob", "emp-1")).toBe(true)
+          const flagged = yield* store.getJob(active.id)
+          assert(Option.isSome(flagged))
+          expect(flagged.value.cancelRequested).toBe(true)
+
+          // Name scoping: same key under another name is untouched.
+          expect(yield* store.cancelByDedupe("OtherJob", "emp-1")).toBe(false)
+        })
+      ))
+
     it.effect("delayed jobs still promote to waiting while their queue is paused", () =>
       withStore((store) =>
         Effect.gen(function*() {

@@ -433,6 +433,73 @@ describe("pause and resume", () => {
     }))
 })
 
+describe("absolute-time scheduling", () => {
+  it.effect("`at` runs the job at the wall-clock instant without duration math", () =>
+    Effect.gen(function*() {
+      const store = yield* MemoryJobStore.make
+      const storeLayer = Layer.succeed(JobStore.JobStore, store)
+      class Invite extends Job.make("Invite", { payload: { employeeId: Schema.String } }) {}
+      const ran: Array<string> = []
+      const handlers = Invite.toLayer(({ employeeId }) => Effect.sync(() => void ran.push(employeeId)))
+
+      yield* Effect.gen(function*() {
+        // TestClock starts at the epoch; schedule for one hour in.
+        const id = yield* Invite.enqueue({ employeeId: "e1" }, { at: 3_600_000 })
+        yield* settle
+        expect(ran).toEqual([])
+        const status = yield* store.getJob(id)
+        assert(Option.isSome(status))
+        expect(status.value.state).toBe("delayed")
+        expect(status.value.runAt).toBe(3_600_000)
+
+        yield* TestClock.adjust("1 hour")
+        yield* settle
+        expect(ran).toEqual(["e1"])
+
+        // An `at` in the past runs immediately.
+        yield* Invite.enqueue({ employeeId: "e2" }, { at: 0 })
+        yield* settle
+        expect(ran).toEqual(["e1", "e2"])
+      }).pipe(
+        Effect.provide(
+          handlers.pipe(
+            Layer.provideMerge(Worker.layer()),
+            Layer.provideMerge(storeLayer)
+          )
+        )
+      )
+    }))
+
+  it.effect("schedule, reschedule by key, cancel by key — the invite lifecycle", () =>
+    Effect.gen(function*() {
+      const store = yield* MemoryJobStore.make
+      const storeLayer = Layer.succeed(JobStore.JobStore, store)
+      class SendInvite extends Job.make("SendInvite", {
+        payload: { employeeId: Schema.String },
+        dedupe: ({ employeeId }) => ({ key: employeeId, replace: true })
+      }) {}
+
+      yield* Effect.gen(function*() {
+        const first = yield* SendInvite.enqueue({ employeeId: "e1" }, { at: 3_600_000 })
+
+        // Reschedule = same idempotent call with a new time: same job moves.
+        const second = yield* SendInvite.enqueue({ employeeId: "e1" }, { at: 7_200_000 })
+        expect(second).toBe(first)
+        const moved = yield* store.getJob(first)
+        assert(Option.isSome(moved))
+        expect(moved.value.runAt).toBe(7_200_000)
+        expect(moved.value.state).toBe("delayed")
+
+        // They are not onboarding after all.
+        expect(yield* SendInvite.cancelByKey("e1")).toBe(true)
+        const gone = yield* store.getJob(first)
+        assert(Option.isSome(gone))
+        expect(gone.value.state).toBe("cancelled")
+        expect(yield* SendInvite.cancelByKey("e1")).toBe(false)
+      }).pipe(Effect.provide(storeLayer))
+    }))
+})
+
 describe("repeatable schedules", () => {
   it.effect("a cron schedule enqueues one slot-deterministic job per occurrence", () =>
     Effect.gen(function*() {

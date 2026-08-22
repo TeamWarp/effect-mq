@@ -248,6 +248,33 @@ store level). `idempotencyKey` still exists and is different on purpose: it
 makes the job id *itself* deterministic (permanent identity, joinable from
 your domain tables), while `dedupe` is temporal policy with its own lifecycle.
 
+Keys also power the schedule/reschedule/cancel lifecycle for one-shot future
+work — no job-id bookkeeping in your business logic:
+
+```ts
+class SendInvite extends Job.make("send-invite", {
+  payload: { employeeId: Schema.String },
+  dedupe: ({ employeeId }) => ({ key: employeeId, replace: true })
+}) {}
+
+// Schedule for a wall-clock instant (any DateTime.Input — zero duration math):
+yield* SendInvite.enqueue({ employeeId }, {
+  at: DateTime.makeZonedUnsafe(
+    { year: 2026, month: 8, day: 24, hours: 9 },
+    { timeZone: "America/New_York", adjustForTimeZone: true }
+  )
+})
+
+// Reschedule: the same idempotent call with a new time (replace moves it).
+yield* SendInvite.enqueue({ employeeId }, { at: nextDay })
+
+// They are not onboarding after all — cancel whatever is pending, if anything:
+const wasPending = yield* SendInvite.cancelByKey(employeeId)
+```
+
+`delay` and `at` are mutually exclusive (a compile error via the option
+union); an `at` in the past runs immediately.
+
 Postgres users: dedup adds one table and one jobs column — add
 `export const jobDedupe = mqDedupe()` to your schema and `drizzle-kit
 generate` diffs both (the table and the new `dedupe_key` column) into one
@@ -482,13 +509,14 @@ Everything a job definition, an enqueue, and a worker can be tuned with:
 (any per-enqueue option below).
 
 **Per enqueue** (`enqueue`/`execute` options) — `jobId`, `queue`,
-`metadata`, `dedupe`, `delay`, `priority` (higher first), `attempts`,
-`backoff` (`fixed`/`exponential`), `keep` (`count`/`age`), `timeout`.
+`metadata`, `dedupe`, `delay` OR `at` (absolute `DateTime.Input`; exclusive
+by type), `priority` (higher first), `attempts`, `backoff`
+(`fixed`/`exponential`), `keep` (`count`/`age`), `timeout`.
 
 **Job verbs** — `enqueue`, `execute` (enqueue + await the typed result),
 `poll`, `awaitResult`, `attempts` (the decoded run ledger), `retry`,
-`cancel`, `promote`, `schedule`/`unschedule`, `toLayer` (register the
-handler).
+`cancel`, `cancelByKey` (by dedup key, idempotent), `promote`,
+`schedule`/`unschedule`, `toLayer` (register the handler).
 
 **`Worker.layer(options)`** — all durations take `Duration.Input`:
 
@@ -543,7 +571,7 @@ plain Effect, so it works with any test runner.
 Implement the `JobStore` service (one atomic seam: `enqueue`, `claim`, `ack`,
 `release`, `extendLocks`, `recoverStalled`, `awaitWake`, `getJob`,
 `getAttempts`, `list`, `retry`, `counts`, `remove`, `cancel`, `promote`,
-`pause`/`resume`/`pausedQueues`, and the schedule ops
+`pause`/`resume`/`pausedQueues`, `cancelByDedupe`, and the schedule ops
 `upsertSchedule`/`removeSchedule`/`listSchedules`/`dueSchedules`/`advanceSchedule`)
 and run the conformance suite against it:
 

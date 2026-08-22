@@ -701,6 +701,20 @@ export interface Service {
     JobStoreError | JobNotFoundError | JobNotCancellableError
   >
 
+  /**
+   * Cancel whatever pending job is registered under a dedup key
+   * (name-scoped): pending states are cancelled exactly like `cancel`
+   * (waiting/delayed become terminal, active gets the heartbeat flag).
+   * Returns false when no pending job holds the key — idempotent by design,
+   * so "cancel it if anything is scheduled" needs no existence check.
+   *
+   * @since 0.4.0
+   */
+  readonly cancelByDedupe: (
+    name: string,
+    key: string
+  ) => Effect.Effect<boolean, JobStoreError>
+
   /** Move a delayed job to `waiting` now. */
   readonly promote: (
     id: JobId

@@ -650,6 +650,60 @@ export const make = (
             AND (${dedupe.windowExpiresAt} IS NULL OR ${dedupe.windowExpiresAt} <= ${now})
         `).pipe(Effect.asVoid)
 
+    // Shared by cancel and cancelByDedupe.
+    const cancelJob = (id: JobStore.JobId) =>
+      db.transaction((tx) =>
+          Effect.gen(function*() {
+            const now = yield* nowDate
+            // One guarded statement: waiting/delayed become terminal, active
+            // gets the cancel-request flag; anything else is reported by state.
+            const rows = rowsOf(yield* tx.execute<
+              {
+                id: string
+                state: string
+                processedAt: Date | null
+                name: string
+                keep: JobStore.KeepPolicy | null
+                dedupeKey: string | null
+              }
+            >(sql`
+              UPDATE ${jobs} SET
+                state = CASE WHEN ${jobs.state} IN ('waiting', 'delayed') THEN 'cancelled' ELSE ${jobs.state} END,
+                finished_at = CASE WHEN ${jobs.state} IN ('waiting', 'delayed') THEN ${now}::timestamptz ELSE ${jobs.finishedAt} END,
+                cancel_requested = CASE WHEN ${jobs.state} = 'active' THEN TRUE ELSE ${jobs.cancelRequested} END
+              WHERE ${jobs.id} = ${id} AND ${jobs.state} IN ('waiting', 'delayed', 'active')
+              RETURNING ${jobs.id} AS id, ${jobs.state} AS state,
+                ${jobs.processedAt} AS "processedAt", ${jobs.name} AS "name", ${jobs.keep} AS "keep",
+                ${jobs.dedupeKey} AS "dedupeKey"
+            `))
+            const row = rows[0]
+            if (row === undefined) {
+              const existing = rowsOf(yield* tx.execute<{ state: JobStore.JobState }>(sql`
+                SELECT ${jobs.state} AS state FROM ${jobs} WHERE ${jobs.id} = ${id}
+              `))
+              const found = existing[0]
+              if (found === undefined) {
+                return yield* new JobStore.JobNotFoundError({ jobId: id })
+              }
+              return yield* new JobStore.JobNotCancellableError({ jobId: id, state: found.state })
+            }
+            if (row.state === "cancelled") {
+              yield* insertAttempt(tx, id, "cancelled", row.processedAt, now, undefined)
+              yield* releaseDedupe(tx, row.name, row.dedupeKey, id, now)
+              yield* applyKeep(tx, { name: row.name, state: "cancelled", keep: row.keep }, now)
+            }
+          })
+        ).pipe(
+          Effect.mapError((error) =>
+            error instanceof JobStore.JobNotFoundError ||
+              error instanceof JobStore.JobNotCancellableError ||
+              error instanceof JobStore.JobStoreError
+              ? error
+              : storeError("cancel failed")(error)
+          ),
+          Effect.asVoid
+        )
+
     const store: JobStore.Service = {
       enqueue: (request) =>
         Effect.gen(function*() {
@@ -1064,59 +1118,24 @@ export const make = (
           yield* wakeUp(JobStore.QueueName(rows[0]?.queue ?? ""))
         }),
 
-      cancel: (id) =>
-        db.transaction((tx) =>
-          Effect.gen(function*() {
-            const now = yield* nowDate
-            // One guarded statement: waiting/delayed become terminal, active
-            // gets the cancel-request flag; anything else is reported by state.
-            const rows = rowsOf(yield* tx.execute<
-              {
-                id: string
-                state: string
-                processedAt: Date | null
-                name: string
-                keep: JobStore.KeepPolicy | null
-                dedupeKey: string | null
-              }
-            >(sql`
-              UPDATE ${jobs} SET
-                state = CASE WHEN ${jobs.state} IN ('waiting', 'delayed') THEN 'cancelled' ELSE ${jobs.state} END,
-                finished_at = CASE WHEN ${jobs.state} IN ('waiting', 'delayed') THEN ${now}::timestamptz ELSE ${jobs.finishedAt} END,
-                cancel_requested = CASE WHEN ${jobs.state} = 'active' THEN TRUE ELSE ${jobs.cancelRequested} END
-              WHERE ${jobs.id} = ${id} AND ${jobs.state} IN ('waiting', 'delayed', 'active')
-              RETURNING ${jobs.id} AS id, ${jobs.state} AS state,
-                ${jobs.processedAt} AS "processedAt", ${jobs.name} AS "name", ${jobs.keep} AS "keep",
-                ${jobs.dedupeKey} AS "dedupeKey"
-            `))
-            const row = rows[0]
-            if (row === undefined) {
-              const existing = rowsOf(yield* tx.execute<{ state: JobStore.JobState }>(sql`
-                SELECT ${jobs.state} AS state FROM ${jobs} WHERE ${jobs.id} = ${id}
-              `))
-              const found = existing[0]
-              if (found === undefined) {
-                return yield* new JobStore.JobNotFoundError({ jobId: id })
-              }
-              return yield* new JobStore.JobNotCancellableError({ jobId: id, state: found.state })
-            }
-            if (row.state === "cancelled") {
-              yield* insertAttempt(tx, id, "cancelled", row.processedAt, now, undefined)
-              yield* releaseDedupe(tx, row.name, row.dedupeKey, id, now)
-              yield* applyKeep(tx, { name: row.name, state: "cancelled", keep: row.keep }, now)
-            }
-          })
-        ).pipe(
-          Effect.mapError((error) =>
-            error instanceof JobStore.JobNotFoundError ||
-              error instanceof JobStore.JobNotCancellableError ||
-              error instanceof JobStore.JobStoreError
-              ? error
-              : storeError("cancel failed")(error)
-          ),
-          Effect.asVoid
-        ),
+      cancel: (id) => cancelJob(id),
 
+      cancelByDedupe: (name, key) =>
+        Effect.gen(function*() {
+          const rows = rowsOf(yield* db.execute<{ jobId: string }>(sql`
+            SELECT ${dedupe.jobId} AS "jobId" FROM ${dedupe}
+            WHERE ${dedupe.name} = ${name} AND ${dedupe.key} = ${key}
+          `).pipe(Effect.mapError(storeError("cancelByDedupe failed"))))
+          const jobId = rows[0]?.jobId
+          // "" is the in-transaction placeholder; treat like no entry.
+          if (jobId === undefined || jobId === "") return false
+          return yield* cancelJob(JobId(jobId)).pipe(
+            Effect.as(true),
+            // Idempotent: a vanished or already-terminal keyed job is
+            // "nothing pending", not an error.
+            Effect.catchTag(["JobNotFoundError", "JobNotCancellableError"], () => Effect.succeed(false))
+          )
+        }),
       promote: (id) =>
         Effect.gen(function*() {
           const now = yield* nowDate

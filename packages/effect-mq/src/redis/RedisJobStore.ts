@@ -280,6 +280,19 @@ export const make = (
         request.dedupe?.replace === true ? "1" : "0"
       )
 
+    // Shared by cancel and cancelByDedupe.
+    const cancelJob = (id: JobStore.JobId) =>
+      Effect.gen(function*() {
+        const now = yield* Clock.currentTimeMillis
+        const reply: { error?: string; state?: JobStore.JobState } = JSON.parse(
+          yield* evalCancel(prefix, id, now).pipe(Effect.mapError(storeError("cancel failed")))
+        )
+        if (reply.error === "notfound") return yield* new JobStore.JobNotFoundError({ jobId: id })
+        if (reply.error === "state") {
+          return yield* new JobStore.JobNotCancellableError({ jobId: id, state: reply.state ?? "completed" })
+        }
+      })
+
     const store: JobStore.Service = {
       enqueue: (request) =>
         Effect.gen(function*() {
@@ -531,16 +544,20 @@ export const make = (
           Effect.map((raw) => raw !== "0")
         ),
 
-      cancel: (id) =>
+      cancel: (id) => cancelJob(id),
+
+      cancelByDedupe: (name, key) =>
         Effect.gen(function*() {
-          const now = yield* Clock.currentTimeMillis
-          const reply: { error?: string; state?: JobStore.JobState } = JSON.parse(
-            yield* evalCancel(prefix, id, now).pipe(Effect.mapError(storeError("cancel failed")))
+          const jobId = yield* redis.send("HGET", `${prefix}:dedupe:${name}\u0000${key}`, "jobId").pipe(
+            Effect.mapError(storeError("cancelByDedupe failed"))
           )
-          if (reply.error === "notfound") return yield* new JobStore.JobNotFoundError({ jobId: id })
-          if (reply.error === "state") {
-            return yield* new JobStore.JobNotCancellableError({ jobId: id, state: reply.state ?? "completed" })
-          }
+          if (jobId === null || jobId === undefined || jobId === "") return false
+          return yield* cancelJob(JobStore.JobId(String(jobId))).pipe(
+            Effect.as(true),
+            // Idempotent: a vanished or already-terminal keyed job is
+            // "nothing pending", not an error.
+            Effect.catchTag(["JobNotFoundError", "JobNotCancellableError"], () => Effect.succeed(false))
+          )
         }),
 
       promote: (id) =>

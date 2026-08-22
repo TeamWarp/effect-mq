@@ -30,7 +30,7 @@
  *
  * @since 0.1.0
  */
-import { Clock, type Context, Duration, Effect, type Exit, Layer, Metric, Option, Predicate, Schedule, Schema } from "effect"
+import { Clock, type Context, DateTime, Duration, Effect, type Exit, Layer, Metric, Option, Predicate, Schedule, Schema } from "effect"
 import {
   type BackoffPolicy,
   type DedupePolicy,
@@ -182,9 +182,22 @@ const normalizeDedupe = (input: DedupeInput | undefined): DedupePolicy | undefin
 }
 
 /**
+ * When the job becomes runnable: a relative `delay` OR an absolute `at`
+ * (any `DateTime.Input` — a `DateTime` from `DateTime.makeZonedUnsafe` for
+ * wall-clock-in-timezone instants, a `Date`, ISO string, epoch millis, or
+ * date parts). Setting both is a compile error; an `at` in the past runs
+ * immediately.
+ *
+ * @since 0.4.0
+ */
+export type RunTimeInput =
+  | { readonly delay?: Duration.Input | undefined; readonly at?: undefined }
+  | { readonly at?: DateTime.DateTime.Input | undefined; readonly delay?: undefined }
+
+/**
  * @since 0.1.0
  */
-export interface EnqueueOptions extends JobOptions {
+export type EnqueueOptions = Omit<JobOptions, "delay"> & RunTimeInput & {
   /**
    * Explicit job id. Enqueueing an id that already exists is a no-op that
    * returns the existing id (idempotency). Overrides the definition's
@@ -368,6 +381,12 @@ export interface Job<
     jobId: JobId
   ) => Effect.Effect<void, JobNotFoundError | JobNotCancellableError, StoreId>
 
+  /**
+   * Cancel whatever pending job holds this dedup key (see `DedupeInput`).
+   * Idempotent: returns false when nothing pending holds the key.
+   */
+  readonly cancelByKey: (key: string) => Effect.Effect<boolean, never, StoreId>
+
   /** Run a delayed job now. */
   readonly promote: (
     jobId: JobId
@@ -490,9 +509,23 @@ const Proto = {
         options?.dedupe ?? this.dedupe?.(payload)
       )
       const queue = options?.queue !== undefined ? QueueName(options.queue) : this.queue
-      return Schema.encodeEffect(this.payloadJsonSchema)(payload).pipe(
+      if (options?.at !== undefined && options.delay !== undefined) {
+        // Unrepresentable in TypeScript; guard untyped callers anyway.
+        throw new Error("effect-mq: set either `delay` or `at`, not both")
+      }
+      const delayMs = options?.at !== undefined
+        ? Effect.map(
+          Clock.currentTimeMillis,
+          (now) => Math.max(0, DateTime.toEpochMillis(DateTime.makeUnsafe(options.at ?? now)) - now)
+        )
+        : Effect.succeed(
+          options?.delay !== undefined
+            ? Duration.toMillis(options.delay)
+            : this.defaults.delayMs
+        )
+      return Effect.zip(Schema.encodeEffect(this.payloadJsonSchema)(payload), delayMs).pipe(
         Effect.orDie,
-        Effect.flatMap((encoded) =>
+        Effect.flatMap(([encoded, resolvedDelayMs]) =>
           Effect.flatMap(this.store, (store) =>
             store.enqueue({
               id,
@@ -512,9 +545,7 @@ const Proto = {
                 ? Duration.toMillis(options.timeout)
                 : this.defaults.timeoutMs,
               dedupe,
-              delayMs: options?.delay !== undefined
-                ? Duration.toMillis(options.delay)
-                : this.defaults.delayMs
+              delayMs: resolvedDelayMs
             }))
         ),
         Effect.orDie,
@@ -661,6 +692,15 @@ const Proto = {
       )
   },
 
+  cancelByKey(this: AnyWithProps, key: string) {
+    return Effect.flatMap(this.store, (store) =>
+      store.cancelByDedupe(this._tag, key).pipe(
+        Effect.catchTag("JobStoreError", (error) => Effect.die(error))
+      )).pipe(
+        Effect.withSpan(`${this._tag}.cancelByKey`, { attributes: { key } }, { captureStackTrace: false })
+      )
+  },
+
   promote(this: AnyWithProps, jobId: JobId) {
     return Effect.flatMap(this.store, (store) =>
       store.promote(jobId).pipe(
@@ -749,6 +789,7 @@ const boundMethods = [
   "execute",
   "retry",
   "cancel",
+  "cancelByKey",
   "promote",
   "schedule",
   "unschedule",
