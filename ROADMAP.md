@@ -30,6 +30,18 @@ during the initial build (BullMQ v6's Redis/Postgres backends,
     column lists and SET fragments hardcode the snake_case names.
   - *Typed queue registry*: queue names as a user-declared union checked at
     `Job.make` and `Worker.layer` — the same generics machinery.
+  - *Configurable primary id columns*: native Postgres id generation on the
+    drizzle layer — `mqJobs(name, { id: "uuidv7" | "bigserial" | <column> })`
+    with the INSERT omitting the id so the database default (`uuidv7()`,
+    identity) generates it, returned via RETURNING. Known constraints to
+    design around: the attempts-table FK type must follow; `JobId` stays a
+    string brand (uuid text is fine, bigint stringifies); deterministic text
+    ids clash with non-text columns — `idempotencyKey` and the schedule slot
+    ids (`sched/<key>/<slot>`) both mint text ids, so either restrict native
+    id types to definitions that use neither, or split identity like
+    graphile-worker (native PK + a separate unique text `key` column that
+    carries idempotency/slot identity — pairs naturally with the atomic
+    `tickSchedule` item above, which removes the slot-id dependence).
 
 ## P2 — scale & topology
 
