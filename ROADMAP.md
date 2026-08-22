@@ -42,6 +42,14 @@ during the initial build (BullMQ v6's Redis/Postgres backends,
     graphile-worker (native PK + a separate unique text `key` column that
     carries idempotency/slot identity — pairs naturally with the atomic
     `tickSchedule` item above, which removes the slot-id dependence).
+  - *Configurable timestamp column types*: let users swap the `timestamptz`
+    columns for their conventions — plain `timestamp`, epoch-millis
+    `bigint`, different precision. Constraint: the driver's raw SQL binds
+    `Date` params and compares/derives on these columns everywhere
+    (`run_at <= $now`, retention `GREATEST`/`make_interval` math, RETURNING
+    mappers), so the column config must also swap the bind encoding and the
+    read mapping — same table-config-derived mechanism as column renames,
+    which is why these ship together.
 
 ## P2 — scale & topology
 
