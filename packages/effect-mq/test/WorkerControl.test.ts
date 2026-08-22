@@ -470,6 +470,18 @@ describe("absolute-time scheduling", () => {
       )
     }))
 
+  it("setting both `delay` and `at` is a compile error", () => {
+    class Both extends Job.make("Both", { payload: {} }) {}
+    // @ts-expect-error - the RunTimeInput union makes delay/at exclusive
+    const invalid = () => Both.enqueue({}, { delay: "5 seconds", at: 123 })
+    const delayOnly = () => Both.enqueue({}, { delay: "5 seconds" })
+    const atOnly = () => Both.enqueue({}, { at: 123 })
+    void invalid
+    void delayOnly
+    void atOnly
+    expect(true).toBe(true)
+  })
+
   it.effect("schedule, reschedule by key, cancel by key — the invite lifecycle", () =>
     Effect.gen(function*() {
       const store = yield* MemoryJobStore.make
