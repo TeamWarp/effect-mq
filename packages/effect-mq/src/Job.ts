@@ -131,6 +131,11 @@ export interface JobOptions {
   readonly priority?: number | undefined
   /** Total attempts including the first run. Default 1 (no retries). */
   readonly attempts?: number | undefined
+  /**
+   * Delay between retry attempts:
+   * `{ type: "fixed" | "exponential", delay, factor? }`. Default: retries
+   * are immediate.
+   */
   readonly backoff?: BackoffInput | undefined
   /** Retention for terminal records. Default: keep forever. */
   readonly keep?: KeepInput | undefined
@@ -159,9 +164,28 @@ export interface JobOptions {
  * @since 0.3.0
  */
 export type DedupeInput = string | {
+  /**
+   * The dedup key, scoped to this job's name (e.g. an employee id). Never
+   * changes the job id. Must be non-empty.
+   */
   readonly key: string
+  /**
+   * Throttle window: at most one job per key per window, even after the
+   * keyed job completes. Without `ttl`, dedup lasts while the keyed job is
+   * pending (waiting/delayed/active).
+   */
   readonly ttl?: Duration.Input | undefined
+  /**
+   * Debounce (requires `ttl`): every deduplicated enqueue pushes the window
+   * out again.
+   */
   readonly extend?: boolean | undefined
+  /**
+   * Latest-wins while the keyed job is still delayed: the new enqueue's
+   * payload/metadata/priority/attempts/backoff/keep/timeout/delay replace
+   * the existing job's (same id, ledger preserved). A landed replace
+   * re-arms the `ttl` window. In any other state, normal dedup applies.
+   */
   readonly replace?: boolean | undefined
 }
 
@@ -192,8 +216,36 @@ const normalizeDedupe = (input: DedupeInput | undefined): DedupePolicy | undefin
  * @since 0.4.0
  */
 export type RunTimeInput =
-  | { readonly delay?: Duration.Input | undefined; readonly at?: undefined }
-  | { readonly at?: DateTime.DateTime.Input | undefined; readonly delay?: undefined }
+  | {
+    /**
+     * Run this long after enqueue (relative). Any `Duration.Input`:
+     * `"5 seconds"`, `Duration.minutes(10)`, millis, ...
+     *
+     * Mutually exclusive with `at` (setting both is a compile error).
+     */
+    readonly delay?: Duration.Input | undefined
+    /** Set `delay` for relative times, or `at` (alone) for absolute ones. */
+    readonly at?: undefined
+  }
+  | {
+    /**
+     * Run at an absolute instant (any `DateTime.Input`) — no duration math:
+     *
+     * ```ts
+     * at: DateTime.makeZonedUnsafe(
+     *   { year: 2026, month: 8, day: 24, hours: 9 },
+     *   { timeZone: "America/New_York", adjustForTimeZone: true }
+     * )
+     * // also: a Date, ISO string, epoch millis, or { year, month, ... } parts
+     * ```
+     *
+     * An `at` in the past runs immediately. Mutually exclusive with `delay`
+     * (setting both is a compile error).
+     */
+    readonly at?: DateTime.DateTime.Input | undefined
+    /** Set `at` for absolute times, or `delay` (alone) for relative ones. */
+    readonly delay?: undefined
+  }
 
 /**
  * @since 0.1.0
@@ -230,16 +282,32 @@ interface ResolvedDefaults {
  * @since 0.2.0
  */
 export interface ScheduleOptions<PayloadInput> {
+  /**
+   * Cron expression (5-field, e.g. `"0 9 * * 1"` = 9:00 every Monday).
+   * First fires at the next matching occurrence. Exactly one of `cron` or
+   * `every` must be set.
+   */
   readonly cron?: string | undefined
+  /** IANA time zone for `cron` (e.g. `"America/New_York"`). Default UTC. */
   readonly tz?: string | undefined
+  /**
+   * Fixed interval; first fires one interval from now and stays on that
+   * grid. Exactly one of `cron` or `every` must be set.
+   */
   readonly every?: Duration.Input | undefined
+  /** The payload every occurrence is enqueued with. */
   readonly payload: PayloadInput
   /** Queryable business context, merged over the definition's `metadata`. */
   readonly metadata?: Readonly<Record<string, string>> | undefined
+  /** Priority for each occurrence. Higher runs first; default 0. */
   readonly priority?: number | undefined
+  /** Attempt budget for each occurrence. Default 1. */
   readonly attempts?: number | undefined
+  /** Retry backoff for each occurrence. */
   readonly backoff?: BackoffInput | undefined
+  /** Retention for each occurrence's terminal record. */
   readonly keep?: KeepInput | undefined
+  /** Per-run execution time limit for each occurrence. */
   readonly timeout?: Duration.Input | undefined
 }
 
@@ -862,8 +930,11 @@ export const make = <
 >(
   name: Name,
   options: {
+    /** The payload schema: a `Schema.Struct` or its bare fields object. */
     readonly payload: Payload
+    /** Schema for the handler's success value (decodable via `awaitResult`/`attempts`). Default `Schema.Void`. */
     readonly success?: Success | undefined
+    /** Schema for the handler's typed failure (round-trips through storage). Default `Schema.Never`. */
     readonly error?: Error | undefined
     /**
      * Derive a stable job id from the payload. Enqueueing the same key twice
@@ -912,6 +983,7 @@ export const make = <
      * Default: the default `JobStore`.
      */
     readonly store?: Context.Key<StoreId, StoreService> | undefined
+    /** Default enqueue options (`delay`, `priority`, `attempts`, `backoff`, `keep`, `timeout`); per-enqueue options override. */
     readonly defaults?: JobOptions | undefined
   }
 ): Job<
