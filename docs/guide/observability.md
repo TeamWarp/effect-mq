@@ -24,7 +24,7 @@ const WorkerLive = Worker.layer({
 })
 ```
 
-Producer verbs (`enqueue`, `cancel`, `schedule`, ...) already run in their own spans. Poll-loop iterations are deliberately unspanned — the handler run is the meaningful trace unit, and per-claim spans would flood your backend.
+Producer verbs (`enqueue`, `poll`, `cancel`, `schedule`, ...) already run in their own spans. The worker's claim-loop iterations are deliberately unspanned — the handler run is the meaningful trace unit, and per-claim spans would flood your backend.
 
 ## How the handler span attaches
 

@@ -6,8 +6,6 @@ export default defineConfig({
   description: "Effect-native background jobs. Schema-typed payloads, swappable storage, at-least-once execution.",
   cleanUrls: true,
   lastUpdated: true,
-  // "/" locally and on a custom domain; CI sets "/effect-mq/" for project pages.
-  base: process.env.DOCS_BASE ?? "/",
   head: [
     ["meta", { name: "theme-color", content: "#111111" }],
     ["meta", { property: "og:type", content: "website" }],

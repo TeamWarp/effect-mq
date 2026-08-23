@@ -99,6 +99,7 @@ Workers bind to exactly one store. To run several against different infrastructu
 
 ```ts
 import { JobStore, Worker } from "effect-mq"
+import { Layer } from "effect"
 
 const Durable = JobStore.named("durable")
 

@@ -56,7 +56,7 @@ class WarmCache extends Job.make("warm-cache", {
 }) {}
 ```
 
-`JobStore.named("durable")` creates a distinct `Context.Key` — keys are identified by their name string, so two `named("durable")` calls in different files are interchangeable. Binding a job with `Job.make({ store: Durable })` changes its requirements: `GenerateInvoice.enqueue(...)` now requires the *Durable* store in context, not the default `JobStore`. Forgetting to provide the Postgres layer for it is a compile error at every enqueue site, not a runtime surprise.
+`JobStore.named("durable")` creates a distinct `Context.Key` — keys are identified by their name string, so two `named("durable")` calls in different files are interchangeable. Binding a job with `Job.make(name, { store: Durable })` changes its requirements: `GenerateInvoice.enqueue(...)` now requires the *Durable* store in context, not the default `JobStore`. Forgetting to provide the Postgres layer for it is a compile error at every enqueue site, not a runtime surprise.
 
 A **queue** and a **store** are different axes: a queue is an ordering/concurrency domain *within* a store (`Job.make({ queue })`); a store is an infrastructure/durability domain hosting many queues.
 

@@ -5,7 +5,7 @@ The Postgres store (`effect-mq/drizzle-postgres`) runs on drizzle v1's Effect dr
 Install the optional peers:
 
 ```sh
-bun add drizzle-orm@rc @effect/sql-pg
+bun add drizzle-orm@rc @effect/sql-pg@rc
 ```
 
 | Peer | Range |

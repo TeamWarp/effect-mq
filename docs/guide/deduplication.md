@@ -59,7 +59,7 @@ yield* RefreshCache.enqueue({ employerId }, {
 
 ### Debounce
 
-`extend: true` (requires `ttl` — validated at enqueue) makes every deduplicated enqueue push the window out again. A burst of edits produces one job, `ttl` after the *last* edit landed a job or extended the window.
+`extend: true` (requires `ttl` — validated at enqueue) makes every deduplicated enqueue push the window out again. The first edit in a burst creates the job; every later one is dropped and re-arms the window, so the key only frees — and the next edit can only create a new job — `ttl` after the burst ends.
 
 ### Replace while delayed
 
