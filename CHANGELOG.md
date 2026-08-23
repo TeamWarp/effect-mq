@@ -4,7 +4,7 @@ All notable changes to `effect-mq`. Versions follow 0.x semver: **minor
 bumps may break** (the `JobStore` driver contract in particular); patch
 bumps are additive.
 
-## 0.4.0 (unreleased)
+## 0.4.0 — 2026-08-23
 
 - **Atomic schedule ticks** — repeatable-job occurrences are now claimed
   and enqueued in a single atomic store op (`tickSchedule(key,
