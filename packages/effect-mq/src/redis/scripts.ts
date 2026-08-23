@@ -159,6 +159,30 @@ local function finishCancelled(id, queue, name, startedAt, now, nowStr)
   releaseDedupe(name, redis.call("HGET", jk, "dedupeKey"), id, now)
   applyKeep(name, "cancelled", redis.call("HGET", jk, "keep"), now)
 end
+-- Insert one fresh job row plus every index entry. String params are stored
+-- verbatim (payload/metadata/backoff/keep/trace are pre-encoded JSON, "" =
+-- absent); priority/delayMs/now numeric-coercible.
+local function insertJobRow(id, name, queue, payloadJson, metadataJson, priority,
+    attemptsMax, backoffJson, keepJson, timeoutMs, dedupeKey, traceJson, delayMs, now, nowStr)
+  local seq = redis.call("INCR", prefix .. ":seq")
+  local state = delayMs > 0 and "delayed" or "waiting"
+  local runAt = now + delayMs
+  redis.call("HSET", jobKey(id),
+    "id", id, "name", name, "queue", queue,
+    "payload", payloadJson, "metadata", metadataJson, "state", state,
+    "priority", priority, "attemptsMax", attemptsMax, "attemptsMade", "0", "stalledCount", "0",
+    "backoff", backoffJson, "keep", keepJson, "timeoutMs", timeoutMs,
+    "cancelRequested", "0", "dedupeKey", dedupeKey, "trace", traceJson, "runAt", fmt(runAt), "enqueuedAt", nowStr,
+    "processedAt", "", "finishedAt", "", "exit", "", "failedReason", "",
+    "lockToken", "", "lockExpiresAt", "", "seq", fmt(seq))
+  redis.call("ZADD", prefix .. ":all", now, id)
+  if state == "waiting" then
+    addWaiting(queue, tonumber(priority), seq, id)
+  else
+    redis.call("ZADD", delayedKey(queue), runAt, id)
+  end
+  countsAdd(queue, state, 1)
+end
 `
 
 /**
@@ -280,24 +304,8 @@ if idMode == "auto" then
   end
   if id == "" then return '{"error":"id"}' end
 end
-local seq = redis.call("INCR", prefix .. ":seq")
-local state = delayMs > 0 and "delayed" or "waiting"
-local runAt = now + delayMs
-redis.call("HSET", jobKey(id),
-  "id", id, "name", ARGV[4], "queue", queue,
-  "payload", ARGV[6], "metadata", ARGV[7], "state", state,
-  "priority", ARGV[8], "attemptsMax", ARGV[9], "attemptsMade", "0", "stalledCount", "0",
-  "backoff", ARGV[10], "keep", ARGV[11], "timeoutMs", ARGV[12],
-  "cancelRequested", "0", "dedupeKey", dKey, "trace", ARGV[19], "runAt", fmt(runAt), "enqueuedAt", nowStr,
-  "processedAt", "", "finishedAt", "", "exit", "", "failedReason", "",
-  "lockToken", "", "lockExpiresAt", "", "seq", fmt(seq))
-redis.call("ZADD", prefix .. ":all", now, id)
-if state == "waiting" then
-  addWaiting(queue, tonumber(ARGV[8]), seq, id)
-else
-  redis.call("ZADD", delayedKey(queue), runAt, id)
-end
-countsAdd(queue, state, 1)
+insertJobRow(id, ARGV[4], queue, ARGV[6], ARGV[7], ARGV[8], ARGV[9], ARGV[10], ARGV[11],
+  ARGV[12], dKey, ARGV[19], delayMs, now, nowStr)
 if dKey ~= "" then
   local sk = dedupeStoreKey(name, dKey)
   redis.call("DEL", sk)
@@ -938,6 +946,128 @@ if current == false or tonumber(current) ~= tonumber(ARGV[3]) then return "0" en
 redis.call("HSET", sk, "nextRunAt", fmt(tonumber(ARGV[4])))
 redis.call("ZADD", prefix .. ":schedules", tonumber(ARGV[4]), key)
 return "1"
+`
+  }
+).withReturnType<string>()
+
+/**
+ * tickSchedule(prefix, key, expectedRunAt, nextRunAt, id, name, queue,
+ *   payloadJson, metadataJson, priority, attemptsMax, backoffJson, keepJson,
+ *   timeoutMs, traceJson, delayMs, now) -> "1" fired | "0"
+ * Atomic occurrence claim: the nextRunAt CAS and the tick job's insert run
+ * in one script, so a stale sweeper can never re-fire a slot — even after
+ * retention pruned the previous slot's job row.
+ */
+export const tickSchedule = Redis.script(
+  (
+    prefix: string,
+    key: string,
+    expectedRunAt: number,
+    nextRunAt: number,
+    id: string,
+    name: string,
+    queue: string,
+    payloadJson: string,
+    metadataJson: string,
+    priority: number,
+    attemptsMax: number,
+    backoffJson: string,
+    keepJson: string,
+    timeoutMs: string,
+    traceJson: string,
+    delayMs: number,
+    now: number
+  ) => [
+    prefix,
+    key,
+    expectedRunAt,
+    nextRunAt,
+    id,
+    name,
+    queue,
+    payloadJson,
+    metadataJson,
+    priority,
+    attemptsMax,
+    backoffJson,
+    keepJson,
+    timeoutMs,
+    traceJson,
+    delayMs,
+    now
+  ],
+  {
+    numberOfKeys: 0,
+    lua: `${HELPERS}
+local key = ARGV[2]
+local sk = prefix .. ":schedule:" .. key
+local current = redis.call("HGET", sk, "nextRunAt")
+if current == false or tonumber(current) ~= tonumber(ARGV[3]) then return "0" end
+redis.call("HSET", sk, "nextRunAt", fmt(tonumber(ARGV[4])))
+redis.call("ZADD", prefix .. ":schedules", tonumber(ARGV[4]), key)
+local id = ARGV[5]
+-- Pre-existing slot row (pre-0.4 crash between enqueue and advance): the
+-- schedule still advances, but nothing new fires.
+if redis.call("EXISTS", jobKey(id)) == 1 then return "0" end
+insertJobRow(id, ARGV[6], ARGV[7], ARGV[8], ARGV[9], ARGV[10], ARGV[11], ARGV[12], ARGV[13],
+  ARGV[14], "", ARGV[15], tonumber(ARGV[16]), tonumber(ARGV[17]), ARGV[17])
+return "1"
+`
+  }
+).withReturnType<string>()
+
+/**
+ * enqueueMany(prefix, now, count, ...items) -> JSON array of per-item results
+ * ({id, duplicate} | {collision} | {error}). Items are 13-ARGV strides:
+ * idMode, id, name, queue, payloadJson, metadataJson, priority, attemptsMax,
+ * backoffJson, keepJson, timeoutMs, traceJson, delayMs. Plain (non-dedup)
+ * items only — the caller routes dedup items through \`enqueue\`.
+ */
+export const enqueueMany = Redis.script(
+  (prefix: string, now: number, count: number, items: ReadonlyArray<string>) => [prefix, now, count, ...items],
+  {
+    numberOfKeys: 0,
+    lua: `${HELPERS}
+local now = tonumber(ARGV[2])
+local nowStr = ARGV[2]
+local count = tonumber(ARGV[3])
+local out = {}
+for i = 0, count - 1 do
+  local base = 3 + i * 13
+  local idMode = ARGV[base + 1]
+  local id = ARGV[base + 2]
+  local result
+  if idMode ~= "auto" and redis.call("EXISTS", jobKey(id)) == 1 then
+    -- Sequential in-script processing makes intra-batch repeats of one user
+    -- id resolve exactly like separate enqueues: first inserts, rest dedup.
+    if idMode == "user" then
+      result = '{"id":' .. cjson.encode(id) .. ',"duplicate":true}'
+    else
+      result = '{"collision":true}'
+    end
+  else
+    if idMode == "auto" then
+      id = ""
+      for a = 1, 5 do
+        local candidate = "j-" .. fmt(redis.call("INCR", prefix .. ":seq"))
+        if redis.call("EXISTS", jobKey(candidate)) == 0 then
+          id = candidate
+          break
+        end
+      end
+    end
+    if id == "" then
+      result = '{"error":"id"}'
+    else
+      insertJobRow(id, ARGV[base + 3], ARGV[base + 4], ARGV[base + 5], ARGV[base + 6],
+        ARGV[base + 7], ARGV[base + 8], ARGV[base + 9], ARGV[base + 10], ARGV[base + 11],
+        "", ARGV[base + 12], tonumber(ARGV[base + 13]), now, nowStr)
+      result = '{"id":' .. cjson.encode(id) .. ',"duplicate":false}'
+    end
+  end
+  out[#out + 1] = result
+end
+return "[" .. table.concat(out, ",") .. "]"
 `
   }
 ).withReturnType<string>()

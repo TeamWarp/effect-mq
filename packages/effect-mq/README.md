@@ -75,8 +75,13 @@ What you get out of the box:
 - **Graceful shutdown** — interrupting a worker releases in-flight jobs back
   to `waiting` without consuming an attempt.
 - **Repeatable jobs** — durable cron/interval schedules
-  (`MyJob.schedule(key, { cron })`) that fire exactly once per occurrence
-  across any number of workers.
+  (`MyJob.schedule(key, { cron })`); each occurrence is claimed and enqueued
+  in one atomic store op, so ticks are exactly-once across any number of
+  workers.
+- **Batch enqueue** — `MyJob.enqueueMany(payloads, options?)` inserts a
+  whole batch of plain items in one store round trip per chunk (multi-row
+  `INSERT` / one Lua script), with per-item idempotency and dedup semantics
+  intact (dedup-keyed items fall back to individual enqueues).
 - **Admin verbs** — `cancel` (including *running* jobs, whose handler fiber is
   interrupted cross-process), `promote` (delayed → now), and queue-level
   `pause`/`resume`.
@@ -88,12 +93,37 @@ What you get out of the box:
 - **Deduplication** — pending-dedup, throttle, debounce, and
   replace-while-delayed via a dedup key that never touches your job ids.
 
+## Batch enqueue
+
+Fan-out inserts a whole batch of plain items in **one store round trip per
+chunk** — a multi-row `INSERT` on Postgres, one Lua script on Redis (drivers
+chunk very large batches):
+
+```ts
+const ids = yield* GenerateInvoice.enqueueMany(
+  companies.map((company) => ({ companyId: company.id })),
+  { queue: "billing", at: nextBillingRun }   // shared options
+)
+```
+
+Ids come back aligned with the payloads. Every item keeps full single-enqueue
+semantics — `idempotencyKey`, `dedupe`, and `metadata` callbacks run per
+payload, and duplicates are silent no-ops returning the existing id (items
+that derive a dedup key run through the single-enqueue path individually, in
+order). Options apply batch-wide; per-job `jobId`/`dedupe` are excluded at
+the type level. The batch is intentionally *not* one transaction: a
+mid-batch store failure can leave a subset applied, which is safe under
+at-least-once — re-running a batch with deterministic ids skips what already
+landed (store-assigned ids may re-insert).
+
 ## Repeatable jobs
 
 Schedules are durable rows in the store — not process-local timers — so they
-survive restarts and coordinate across workers. Ticks enqueue with a
-slot-deterministic job id (`sched/<key>/<slot>`), which makes every occurrence
-exactly-once no matter how many workers sweep:
+survive restarts and coordinate across workers. Each occurrence is claimed
+and its job (id `sched/<key>/<slot>`) enqueued in **one atomic store op** —
+a compare-and-swap on the schedule's next occurrence — so every occurrence
+fires exactly once no matter how many workers sweep, and no matter how
+aggressively history retention prunes old tick jobs:
 
 ```ts
 // Create or replace (same key = replace; upsert is idempotent to deploy).
@@ -539,10 +569,11 @@ Everything a job definition, an enqueue, and a worker can be tuned with:
 by type), `priority` (higher first), `attempts`, `backoff`
 (`fixed`/`exponential`), `keep` (`count`/`age`), `timeout`.
 
-**Job verbs** — `enqueue`, `execute` (enqueue + await the typed result),
-`poll`, `awaitResult`, `attempts` (the decoded run ledger), `retry`,
-`cancel`, `cancelByKey` (by dedup key, idempotent), `promote`,
-`schedule`/`unschedule`, `toLayer` (register the handler).
+**Job verbs** — `enqueue`, `enqueueMany` (a whole batch, one store round
+trip per chunk; same options minus per-job `jobId`/`dedupe`), `execute` (enqueue +
+await the typed result), `poll`, `awaitResult`, `attempts` (the decoded run
+ledger), `retry`, `cancel`, `cancelByKey` (by dedup key, idempotent),
+`promote`, `schedule`/`unschedule`, `toLayer` (register the handler).
 
 **`Worker.layer(options)`** — all durations take `Duration.Input`:
 
@@ -617,8 +648,9 @@ suite in this repo runs the same conformance tests against a real database.
 
 ## Roadmap
 
-Next up: trace propagation, a cross-process event stream, batch enqueue,
-custom drizzle columns, and parent-child fan-out. Full prioritized list:
+Next up: drizzle schema customization (column renames, native id and
+timestamp column types, a typed queue registry), a cross-process event
+stream, and parent-child fan-out. Full prioritized list:
 [ROADMAP.md](https://github.com/TeamWarp/effect-mq/blob/main/ROADMAP.md);
 release history:
 [CHANGELOG.md](https://github.com/TeamWarp/effect-mq/blob/main/CHANGELOG.md).

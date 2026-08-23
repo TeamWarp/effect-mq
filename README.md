@@ -42,8 +42,12 @@ const producer = Effect.gen(function*() {
 - **Dashboard data layer**: `list` with metadata filters and keyset
   pagination, `poll`, `retry`, per-job `keep` retention plus a per-store
   `historyTtl` ceiling.
-- **Repeatable jobs**: durable cron/interval schedules with slot-deterministic
-  ids — exactly one job per occurrence across any number of workers.
+- **Repeatable jobs**: durable cron/interval schedules; each occurrence is
+  claimed and enqueued in one atomic store op — exactly one job per
+  occurrence across any number of workers, regardless of retention.
+- **Batch enqueue**: `enqueueMany` inserts a whole batch of plain items in
+  one store round trip per chunk, with per-item idempotency and dedup
+  semantics intact.
 - **Fiber-native control**: handler `timeout`s, cross-process `cancel` of
   running jobs (the handler fiber is interrupted, finalizers run), `promote`,
   queue `pause`/`resume`, and unrecoverable errors that skip the retry budget.

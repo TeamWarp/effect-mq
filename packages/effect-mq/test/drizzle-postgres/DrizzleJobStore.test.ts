@@ -343,6 +343,114 @@ if (!available) {
         expect(replacedRow[0]).toEqual({ object_id: "v2" })
       }).pipe(Effect.scoped, Effect.provide(pgClientLive())))
 
+    it.effect("extended columns fill through enqueueMany and tickSchedule", () =>
+      Effect.gen(function*() {
+        const client = yield* PgClient.PgClient
+        const names = freshTableNames()
+        const jobs = mqJobs(names.jobs, {
+          extend: {
+            companyId: text("company_id").notNull(),
+            objectId: text("object_id")
+          }
+        })
+        const attempts = mqJobAttempts(jobs, names.attempts)
+        const schedules = mqSchedules(names.schedules)
+        const queues = mqQueueControl(names.queues)
+        const dedupe = mqDedupe(names.dedupe)
+        for (
+          const statement of createTablesSql(names.jobs, names.attempts, names.schedules, names.queues, names.dedupe)
+        ) {
+          yield* client.unsafe(statement).pipe(Effect.orDie)
+        }
+        yield* client.unsafe(
+          `ALTER TABLE "${names.jobs}" ADD COLUMN company_id text NOT NULL, ADD COLUMN object_id text`
+        ).pipe(Effect.orDie)
+        yield* Effect.addFinalizer(() =>
+          client.unsafe(
+            `DROP TABLE IF EXISTS "${names.attempts}", "${names.jobs}", "${names.schedules}", "${names.queues}", "${names.dedupe}" CASCADE`
+          ).pipe(Effect.ignore)
+        )
+        const store = yield* DrizzleJobStore.make({ jobs, attempts, schedules, queues, dedupe }).pipe(Effect.orDie)
+
+        const base = {
+          id: undefined,
+          name: "Tenant",
+          queue: JobStore.QueueName("default"),
+          payload: {},
+          metadata: { companyId: "acme", objectId: "obj-1" },
+          priority: 0,
+          attemptsMax: 1,
+          backoff: undefined,
+          keep: undefined,
+          timeoutMs: undefined,
+          dedupe: undefined,
+          trace: undefined,
+          delayMs: 0
+        }
+        // The batch INSERT is a second hand-rolled VALUES list; it must fill
+        // extras exactly like the single-enqueue path (metadata mapping,
+        // NULL for absent nullable keys).
+        const batch = yield* store.enqueueMany([
+          base,
+          { ...base, metadata: { companyId: "acme" } }
+        ])
+        const rows = yield* client.unsafe(
+          `SELECT company_id, object_id FROM "${names.jobs}" WHERE id IN ('${batch[0]?.id}', '${batch[1]?.id}') ORDER BY seq`
+        ).pipe(Effect.orDie)
+        expect(rows).toEqual([
+          { company_id: "acme", object_id: "obj-1" },
+          { company_id: "acme", object_id: null }
+        ])
+
+        // NOT NULL violations stay loud through the batch path.
+        const violated = yield* Effect.flip(store.enqueueMany([{ ...base, metadata: {} }]))
+        expect(violated._tag).toBe("JobStoreError")
+
+        // extraValues overrides apply per batch row too.
+        const mapped = yield* DrizzleJobStore.make({
+          jobs,
+          attempts,
+          schedules,
+          queues,
+          dedupe,
+          extraValues: ({ metadata }) => ({ companyId: `tenant-${metadata.companyId}` })
+        }).pipe(Effect.orDie)
+        const overridden = yield* mapped.enqueueMany([base])
+        const overriddenRow = yield* client.unsafe(
+          `SELECT company_id FROM "${names.jobs}" WHERE id = '${overridden[0]?.id}'`
+        ).pipe(Effect.orDie)
+        expect(overriddenRow[0]).toEqual({ company_id: "tenant-acme" })
+
+        // tickSchedule's insert fills extras from the tick request metadata.
+        yield* store.upsertSchedule({
+          key: JobStore.ScheduleKey("Tenant/minutely"),
+          jobName: "Tenant",
+          queue: JobStore.QueueName("default"),
+          cron: undefined,
+          tz: undefined,
+          everyMs: 60_000,
+          payload: {},
+          metadata: { companyId: "acme" },
+          priority: 0,
+          attemptsMax: 1,
+          backoff: undefined,
+          keep: undefined,
+          timeoutMs: undefined,
+          nextRunAt: 0
+        })
+        const fired = yield* store.tickSchedule(
+          JobStore.ScheduleKey("Tenant/minutely"),
+          0,
+          60_000,
+          { ...base, id: JobStore.JobId("sched/Tenant/minutely/0"), metadata: { companyId: "sched-acme" } }
+        )
+        expect(fired).toBe(true)
+        const tickRow = yield* client.unsafe(
+          `SELECT company_id, object_id FROM "${names.jobs}" WHERE id = 'sched/Tenant/minutely/0'`
+        ).pipe(Effect.orDie)
+        expect(tickRow[0]).toEqual({ company_id: "sched-acme", object_id: null })
+      }).pipe(Effect.scoped, Effect.provide(pgClientLive())))
+
     it.live("historyTtl sweeps terminal rows; live rows survive", () =>
       Effect.gen(function*() {
         const client = yield* PgClient.PgClient

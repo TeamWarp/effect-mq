@@ -107,6 +107,71 @@ describe("Job", () => {
     }).pipe(Effect.provide(MemoryJobStore.layer)))
 })
 
+describe("enqueueMany", () => {
+  it.effect("batches typed payloads with shared options and positional ids", () =>
+    Effect.gen(function*() {
+      const store = yield* JobStore.JobStore
+      const ids = yield* Resize.enqueueMany(
+        [{ file: "a.png", width: 1 }, { file: "b.png", width: 2 }],
+        { priority: 3, delay: "1 second" }
+      )
+      expect(ids).toHaveLength(2)
+      expect(new Set(ids).size).toBe(2)
+      const first = yield* store.getJob(ids[0] ?? JobStore.JobId(""))
+      assert(Option.isSome(first))
+      expect(first.value.payload).toEqual({ file: "a.png", width: 1 })
+      expect(first.value.priority).toBe(3)
+      expect(first.value.state).toBe("delayed")
+      expect((yield* store.counts()).delayed).toBe(2)
+    }).pipe(Effect.provide(MemoryJobStore.layer)))
+
+  it.effect("derives idempotency keys per item", () =>
+    Effect.gen(function*() {
+      const store = yield* JobStore.JobStore
+      const ids = yield* Notify.enqueueMany([
+        { userId: "u-1" },
+        { userId: "u-1" },
+        { userId: "u-2" }
+      ])
+      expect(ids).toEqual(["NotifyUser/u-1", "NotifyUser/u-1", "NotifyUser/u-2"])
+      // Notify's default 3s delay applies to every item.
+      expect((yield* store.counts()).delayed).toBe(2)
+    }).pipe(Effect.provide(MemoryJobStore.layer)))
+
+  it.effect("runs the definition's dedupe callback per item", () =>
+    Effect.gen(function*() {
+      const Grouped = Job.make("GroupedBatch", {
+        payload: { group: Schema.String, n: Schema.Number },
+        dedupe: ({ group }) => group
+      })
+      const store = yield* JobStore.JobStore
+      const ids = yield* Grouped.enqueueMany([
+        { group: "g1", n: 1 },
+        { group: "g1", n: 2 },
+        { group: "g2", n: 3 }
+      ])
+      expect(ids[1]).toBe(ids[0])
+      expect(ids[2]).not.toBe(ids[0])
+      expect((yield* store.counts()).waiting).toBe(2)
+    }).pipe(Effect.provide(MemoryJobStore.layer)))
+
+  it.effect("empty input is a no-op returning no ids", () =>
+    Effect.gen(function*() {
+      expect(yield* Resize.enqueueMany([])).toEqual([])
+    }).pipe(Effect.provide(MemoryJobStore.layer)))
+
+  it("per-job and conflicting options are type errors", () => {
+    const payloads = [{ file: "a.png", width: 1 }]
+    // @ts-expect-error jobId is per-job, not a batch option
+    void (() => Resize.enqueueMany(payloads, { jobId: "x" }))
+    // @ts-expect-error dedupe is per-job, not a batch option
+    void (() => Resize.enqueueMany(payloads, { dedupe: "k" }))
+    // @ts-expect-error delay and at stay mutually exclusive in batches
+    void (() => Resize.enqueueMany(payloads, { delay: "1 second", at: 0 }))
+    expect(true).toBe(true)
+  })
+})
+
 describe("Job hardening", () => {
   it.effect("class extension persists records under the declared tag, not the class name", () =>
     Effect.gen(function*() {
@@ -119,11 +184,13 @@ describe("Job hardening", () => {
 
   it.effect("methods survive destructuring", () =>
     Effect.gen(function*() {
-      const { enqueue, poll } = Resize
+      const { enqueue, enqueueMany, poll } = Resize
       const id = yield* enqueue({ file: "x.png", width: 2 })
       const status = yield* poll(id)
       assert(Option.isSome(status))
       expect(status.value.state).toBe("waiting")
+      const ids = yield* enqueueMany([{ file: "y.png", width: 3 }])
+      expect(ids).toHaveLength(1)
     }).pipe(Effect.provide(MemoryJobStore.layer)))
 
   it("attempts below 1 are clamped in defaults", () => {

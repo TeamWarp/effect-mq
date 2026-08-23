@@ -265,6 +265,27 @@ export type EnqueueOptions = Omit<JobOptions, "delay"> & RunTimeInput & {
   readonly dedupe?: DedupeInput | undefined
 }
 
+/**
+ * Options for `enqueueMany` — `EnqueueOptions` minus the per-job fields:
+ * `jobId` (a shared id would make every item after the first a duplicate)
+ * and `dedupe` (a shared key would collapse the batch into one job; per-item
+ * dedup still runs via the definition's `dedupe` callback).
+ *
+ * Built from parts rather than `Omit<EnqueueOptions, ...>`: a mapped type
+ * over the `delay`/`at` union would flatten it and lose their exclusivity.
+ *
+ * @since 0.4.0
+ */
+export type EnqueueManyOptions = Omit<JobOptions, "delay"> & RunTimeInput & {
+  /** Send every item to a different queue than the definition's. */
+  readonly queue?: string | undefined
+  /**
+   * Queryable business context, merged over each item's definition-derived
+   * `metadata` (the same overrides apply to every item).
+   */
+  readonly metadata?: Readonly<Record<string, string>> | undefined
+}
+
 interface ResolvedDefaults {
   readonly delayMs: number
   readonly priority: number
@@ -389,6 +410,26 @@ export interface Job<
     options?: EnqueueOptions | undefined
   ) => Effect.Effect<JobId, never, StoreId | Payload["EncodingServices"]>
 
+  /**
+   * Queue many jobs in bulk — one store round trip per chunk of plain
+   * items; items whose definition derives a `dedupe` key fall back to
+   * individual enqueues, in order. Returns ids aligned with the payloads.
+   * Per-item semantics match `enqueue`: `idempotencyKey`, `dedupe`, and
+   * `metadata` callbacks run for each payload, and duplicates are silent
+   * no-ops returning the existing id. Options apply to every item
+   * (`jobId`/`dedupe` are excluded — a shared id or dedup key would
+   * collapse the batch into one job).
+   *
+   * The batch is not transactional: a store failure mid-batch may leave a
+   * subset (not necessarily a prefix) enqueued. Safe under at-least-once —
+   * re-running the batch skips already-inserted items when ids are
+   * deterministic (`idempotencyKey`); store-assigned ids may re-insert.
+   */
+  readonly enqueueMany: (
+    payloads: ReadonlyArray<Payload["~type.make.in"]>,
+    options?: EnqueueManyOptions | undefined
+  ) => Effect.Effect<ReadonlyArray<JobId>, never, StoreId | Payload["EncodingServices"]>
+
   /** Read the current status of a previously enqueued job. */
   readonly poll: (
     jobId: JobId
@@ -462,12 +503,11 @@ export interface Job<
   ) => Effect.Effect<void, JobNotFoundError | JobNotPromotableError, StoreId>
 
   /**
-   * Create or replace a durable repeatable schedule for this job. Ticks
-   * enqueue with a slot-deterministic id, so schedules are exactly-once per
-   * occurrence across all workers (assuming history retention windows
-   * comfortably exceed the sweep interval — a pruned tick job cannot dedup a
-   * pathologically stale sweeper). Missed occurrences (downtime) collapse
-   * into a single catch-up run.
+   * Create or replace a durable repeatable schedule for this job. Each
+   * occurrence is claimed and enqueued in one atomic store op, so ticks are
+   * exactly-once per occurrence across all workers — regardless of history
+   * retention. Missed occurrences (downtime) collapse into a single
+   * catch-up run.
    *
    * Re-registering with an *unchanged* cadence (same `cron`/`tz`/`every`) is
    * a no-op for the next occurrence — deploy-time re-registration neither
@@ -649,6 +689,91 @@ const Proto = {
       )
     }).pipe(
       Effect.withSpan(`${this._tag}.enqueue`, {}, { captureStackTrace: false })
+    )
+  },
+
+  enqueueMany(this: AnyWithProps, payloads: ReadonlyArray<any>, options?: EnqueueManyOptions) {
+    return Effect.suspend(() => {
+      const queue = options?.queue !== undefined ? QueueName(options.queue) : this.queue
+      if (options?.at !== undefined && options.delay !== undefined) {
+        // Unrepresentable in TypeScript; guard untyped callers anyway.
+        throw new Error("effect-mq: set either `delay` or `at`, not both")
+      }
+      const delayMs = options?.at !== undefined
+        ? Effect.map(
+          Clock.currentTimeMillis,
+          (now) => Math.max(0, DateTime.toEpochMillis(DateTime.makeUnsafe(options.at ?? now)) - now)
+        )
+        : Effect.succeed(
+          options?.delay !== undefined
+            ? Duration.toMillis(options.delay)
+            : this.defaults.delayMs
+        )
+      const spanContext = Effect.currentSpan.pipe(
+        Effect.map((span) => ({
+          traceId: span.traceId,
+          spanId: span.spanId,
+          sampled: span.sampled
+        })),
+        Effect.catchTag("NoSuchElementError", () => Effect.succeed(undefined))
+      )
+      const encodedAll = Effect.forEach(payloads, (fields) => {
+        const payload = this.payloadSchema.make(fields)
+        return Effect.map(
+          Schema.encodeEffect(this.payloadJsonSchema)(payload),
+          (encoded) => ({ payload, encoded })
+        )
+      })
+      return Effect.all([encodedAll, delayMs, spanContext]).pipe(
+        Effect.orDie,
+        Effect.flatMap(([items, resolvedDelayMs, capturedSpan]) =>
+          Effect.flatMap(this.store, (store) =>
+            store.enqueueMany(items.map(({ encoded, payload }) => ({
+              id: this.idempotencyKey !== undefined
+                ? JobId(`${this._tag}/${this.idempotencyKey(payload)}`)
+                : undefined,
+              name: this._tag,
+              queue,
+              payload: encoded,
+              metadata: { ...this.metadata?.(payload), ...options?.metadata },
+              priority: options?.priority ?? this.defaults.priority,
+              attemptsMax: Math.max(1, options?.attempts ?? this.defaults.attempts),
+              backoff: options?.backoff !== undefined
+                ? normalizeBackoff(options.backoff)
+                : this.defaults.backoff,
+              keep: options?.keep !== undefined
+                ? normalizeKeep(options.keep)
+                : this.defaults.keep,
+              timeoutMs: options?.timeout !== undefined
+                ? Duration.toMillis(options.timeout)
+                : this.defaults.timeoutMs,
+              dedupe: normalizeDedupe(this.dedupe?.(payload)),
+              trace: capturedSpan === undefined
+                ? undefined
+                : { ...capturedSpan, delayed: resolvedDelayMs > 0 } satisfies TraceContext,
+              delayMs: resolvedDelayMs
+            })))
+          )
+        ),
+        Effect.orDie,
+        Effect.tap((results) => {
+          const duplicates = results.filter((result) => result.duplicate).length
+          const update = (duplicate: "true" | "false", count: number) =>
+            count === 0 ? Effect.void : Metric.update(
+              Metrics.jobsEnqueued.pipe(
+                Metric.withAttributes({ name: this._tag, queue, duplicate })
+              ),
+              count
+            )
+          return Effect.andThen(
+            update("false", results.length - duplicates),
+            update("true", duplicates)
+          )
+        }),
+        Effect.map((results) => results.map((result) => result.id))
+      )
+    }).pipe(
+      Effect.withSpan(`${this._tag}.enqueueMany`, {}, { captureStackTrace: false })
     )
   },
 
@@ -867,6 +992,7 @@ const Proto = {
 
 const boundMethods = [
   "enqueue",
+  "enqueueMany",
   "poll",
   "attempts",
   "awaitResult",

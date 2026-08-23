@@ -633,10 +633,10 @@ export const make = <StoreId = JobStore>(
       Effect.forever
     )
 
-    // Tick one due repeatable-job schedule. The enqueue id is deterministic
-    // per (schedule, slot), so concurrent sweepers across workers dedup
-    // naturally; advanceSchedule is conditional, so double-advances are
-    // no-ops.
+    // Tick one due repeatable-job schedule. tickSchedule is a single atomic
+    // op (CAS on nextRunAt + insert + advance), so concurrent sweepers fire
+    // each slot exactly once — even when the previous slot's job row has
+    // already been pruned by retention.
     const sweepSchedule = (schedule: ScheduleRecord) =>
       Effect.gen(function*() {
         const now = yield* Clock.currentTimeMillis
@@ -647,7 +647,7 @@ export const make = <StoreId = JobStore>(
             `effect-mq: schedule "${schedule.key}" has an invalid cron/every configuration; skipping`
           )
         }
-        const tick = yield* retryStore(store.enqueue({
+        const fired = yield* retryStore(store.tickSchedule(schedule.key, slot, next, {
           id: JobId(`sched/${schedule.key}/${slot}`),
           name: schedule.jobName,
           queue: schedule.queue,
@@ -662,13 +662,12 @@ export const make = <StoreId = JobStore>(
           trace: undefined,
           delayMs: 0
         }))
-        if (!tick.duplicate) {
+        if (fired) {
           yield* Metric.update(
             Metrics.scheduleTicks.pipe(Metric.withAttributes({ name: schedule.jobName })),
             1
           )
         }
-        yield* retryStore(store.advanceSchedule(schedule.key, slot, next))
       })
 
     // Each due schedule is swept in isolation so one poison row (bad cron,

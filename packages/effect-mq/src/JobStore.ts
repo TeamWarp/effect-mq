@@ -430,8 +430,9 @@ export interface ListResult {
  * A repeatable-job schedule as persisted by the store. Exactly one of `cron`
  * (with optional IANA `tz`) or `everyMs` is set. The payload is stored
  * schema-encoded, like job payloads. `nextRunAt` is maintained by the worker
- * sweep via `advanceSchedule`; ticks enqueue with the deterministic id
- * `sched/<key>/<slot>`, so concurrent sweepers dedup naturally.
+ * sweep via the atomic `tickSchedule` (CAS + insert + advance in one op),
+ * with tick jobs using the deterministic id `sched/<key>/<slot>`; concurrent
+ * sweepers lose the CAS, so each occurrence fires exactly once.
  *
  * @since 0.2.0
  */
@@ -623,6 +624,27 @@ export interface Service {
   ) => Effect.Effect<EnqueueResult, JobStoreError>
 
   /**
+   * Insert many jobs in bulk: one store round trip per chunk of plain items
+   * (drivers chunk large batches); items carrying a dedup key run through
+   * the single-enqueue decision tree individually, in order. Results align
+   * positionally with the requests; each item carries full single-enqueue
+   * semantics (id dedup, dedup keys, delayed routing).
+   *
+   * The batch is NOT one transaction — items are independent, and a failure
+   * may leave a *subset* (not necessarily a prefix) applied. Safe under
+   * at-least-once: re-running a batch whose ids are deterministic skips
+   * what already landed, but items with store-assigned ids may re-insert.
+   * FIFO order within a priority holds except for an item whose
+   * auto/generated id collides with an existing row — it re-draws and lands
+   * after its batch-mates.
+   *
+   * @since 0.4.0
+   */
+  readonly enqueueMany: (
+    requests: ReadonlyArray<EnqueueRequest>
+  ) => Effect.Effect<ReadonlyArray<EnqueueResult>, JobStoreError>
+
+  /**
    * Atomically: promote due delayed jobs, then claim the best runnable job
    * matching `queue` + `names` (highest priority first, FIFO within a
    * priority), locking it with `token` for `lockDurationMs`.
@@ -781,6 +803,22 @@ export interface Service {
     ReadonlyArray<ScheduleRecord>,
     JobStoreError
   >
+
+  /**
+   * Atomically claim one schedule occurrence: iff the schedule's `nextRunAt`
+   * still equals `expectedRunAt`, insert the tick job AND advance to
+   * `nextRunAt` in the same transaction, returning true. A stale sweeper's
+   * tick returns false without inserting — exactly-once per occurrence even
+   * when the previous slot's job row has been pruned by retention.
+   *
+   * @since 0.4.0
+   */
+  readonly tickSchedule: (
+    key: ScheduleKey,
+    expectedRunAt: number,
+    nextRunAt: number,
+    request: EnqueueRequest
+  ) => Effect.Effect<boolean, JobStoreError>
 
   /**
    * Advance a schedule's `nextRunAt` from `expectedRunAt` to `nextRunAt`

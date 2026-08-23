@@ -8,14 +8,6 @@ during the initial build (BullMQ v6's Redis/Postgres backends,
 
 ## P1 — product polish
 
-- [ ] **Atomic schedule ticks** — close the last exactly-once gap in
-  repeatable jobs: today a *pathologically* stale sweeper (lagging longer
-  than the history retention window) could re-enqueue a pruned slot, because
-  dedup rests on the slot job's row existing. Add a store op that claims the
-  slot and enqueues in one transaction (`tickSchedule(key, expectedRunAt,
-  next, request) -> fired`), conformance-pinned.
-- [ ] **Batch enqueue** — `enqueueMany` in one round trip (one INSERT with
-  multi-row VALUES); flagged as an easy perf win during the storage research.
 - [ ] **Drizzle schema customization + typed queue registry** (pair these) —
   the remaining factory features (custom *indexes* via `extraConfig` and
   custom *columns* via `extend`/`extraValues` shipped in 0.3.0):

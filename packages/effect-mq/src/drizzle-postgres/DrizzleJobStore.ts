@@ -710,22 +710,170 @@ export const make = (
           Effect.asVoid
         )
 
-    const store: JobStore.Service = {
-      enqueue: (request) =>
-        Effect.gen(function*() {
-          if (request.dedupe !== undefined) {
-            const result = yield* enqueueDeduped(request, request.dedupe)
-            if (result.wake) {
-              yield* wakeUp("wakeQueue" in result && result.wakeQueue !== undefined ? result.wakeQueue : request.queue)
+    const enqueueOne = (request: JobStore.EnqueueRequest) =>
+      Effect.gen(function*() {
+        if (request.dedupe !== undefined) {
+          const result = yield* enqueueDeduped(request, request.dedupe)
+          if (result.wake) {
+            yield* wakeUp("wakeQueue" in result && result.wakeQueue !== undefined ? result.wakeQueue : request.queue)
+          }
+          return { id: result.id, duplicate: result.duplicate }
+        }
+        const now = yield* nowDate
+        const result = yield* insertJob(db, request, now)
+        if (!result.duplicate) {
+          yield* wakeUp(request.queue)
+        }
+        return result
+      })
+
+    // Multi-row insert with every id resolved client-side, so the ON
+    // CONFLICT outcome maps back to items unambiguously (RETURNING only
+    // yields rows that actually inserted, in no guaranteed order). Auto ids
+    // draw from the seq sequence one statement per round; a conflicted auto
+    // id (user squatting on "j-<n>", or a colliding generator) re-draws.
+    const insertBatch = (requests: ReadonlyArray<JobStore.EnqueueRequest>) =>
+      Effect.gen(function*() {
+        const now = yield* nowDate
+        const generate = options.idGenerator
+        const results: Array<JobStore.EnqueueResult | undefined> = requests.map(() => undefined)
+        interface PendingItem {
+          readonly request: JobStore.EnqueueRequest
+          readonly index: number
+          id: JobStore.JobId | undefined
+        }
+        let pending: Array<PendingItem> = requests.map((request, index) => ({ request, index, id: request.id }))
+        for (let round = 0; round < 5 && pending.length > 0; round++) {
+          const needIds = pending.filter((item) => item.id === undefined)
+          if (needIds.length > 0) {
+            if (generate !== undefined) {
+              for (const item of needIds) {
+                const raw = generate(item.request)
+                item.id = JobId(Effect.isEffect(raw) ? yield* raw : raw)
+              }
+            } else {
+              const rows = rowsOf(yield* db.execute<{ id: string }>(sql`
+                SELECT 'j-' || ${seqExpr}::text AS id FROM generate_series(1, ${needIds.length})
+              `).pipe(Effect.mapError(storeError("enqueueMany failed"))))
+              for (let i = 0; i < needIds.length; i++) {
+                const row = rows[i]
+                const item = needIds[i]
+                if (row !== undefined && item !== undefined) {
+                  item.id = JobId(row.id)
+                }
+              }
             }
-            return { id: result.id, duplicate: result.duplicate }
           }
-          const now = yield* nowDate
-          const result = yield* insertJob(db, request, now)
-          if (!result.duplicate) {
-            yield* wakeUp(request.queue)
+          // Intra-batch repeats: only an id's first occurrence inserts. A
+          // later explicit repeat is a duplicate; an auto collision re-draws.
+          const seen = new Set<string>()
+          const toInsert: Array<{ request: JobStore.EnqueueRequest; index: number; id: JobStore.JobId }> = []
+          const stillPending: Array<PendingItem> = []
+          for (const item of pending) {
+            const id = item.id
+            if (id === undefined) continue
+            if (seen.has(id)) {
+              if (item.request.id !== undefined) {
+                results[item.index] = { id, duplicate: true }
+              } else {
+                item.id = undefined
+                stillPending.push(item)
+              }
+              continue
+            }
+            seen.add(id)
+            toInsert.push({ request: item.request, index: item.index, id })
           }
-          return result
+          pending = stillPending
+          // One INSERT per chunk keeps the bind-parameter count bounded.
+          for (let start = 0; start < toInsert.length; start += 500) {
+            const chunk = toInsert.slice(start, start + 500)
+            const values = chunk.map(({ id, request }) =>
+              sql`(${id}, ${request.name}, ${request.queue}, ${
+                request.delayMs > 0 ? "delayed" : "waiting"
+              }, ${request.priority},
+                ${JSON.stringify(request.payload ?? null)}::jsonb, ${JSON.stringify(request.metadata)}::jsonb,
+                ${request.attemptsMax},
+                ${request.backoff === undefined ? null : JSON.stringify(request.backoff)}::jsonb,
+                ${request.keep === undefined ? null : JSON.stringify(request.keep)}::jsonb,
+                ${request.timeoutMs ?? null}, ${request.dedupe?.key ?? null},
+                ${request.trace === undefined ? null : JSON.stringify(request.trace)}::jsonb,
+                ${new Date(now.getTime() + Math.max(0, request.delayMs))}, ${now}${extraColumnValues(request)})`
+            )
+            const rows = rowsOf(yield* db.execute<{ id: string }>(sql`
+              INSERT INTO ${jobs} (id, name, queue, state, priority, payload, metadata,
+                attempts_max, backoff, keep, timeout_ms, dedupe_key, trace, run_at, enqueued_at${extraColumnNames})
+              VALUES ${sql.join(values, sql`, `)}
+              ON CONFLICT (id) DO NOTHING
+              RETURNING ${jobs.id} AS id
+            `).pipe(Effect.mapError(storeError("enqueueMany failed"))))
+            const inserted = new Set(rows.map((row) => row.id))
+            // Wake per committed chunk, immediately: a later chunk's failure
+            // (or id exhaustion below) must not strand these durable rows
+            // unwoken until the poll interval.
+            const freshQueues = new Set<JobStore.QueueName>()
+            for (const item of chunk) {
+              if (inserted.has(item.id)) {
+                results[item.index] = { id: item.id, duplicate: false }
+                freshQueues.add(item.request.queue)
+              } else if (item.request.id !== undefined) {
+                results[item.index] = { id: item.id, duplicate: true }
+              } else {
+                // Auto/generated id squatted by an existing row: re-draw and
+                // re-insert next round. NOTE this lands the item after its
+                // batch-mates in seq (FIFO) order — acceptable for a
+                // pathological collision, and documented on the contract.
+                pending.push({ request: item.request, index: item.index, id: undefined })
+              }
+            }
+            for (const queue of freshQueues) {
+              yield* wakeUp(queue)
+            }
+          }
+        }
+        const resolved: Array<JobStore.EnqueueResult> = []
+        for (const result of results) {
+          if (result === undefined) {
+            return yield* new JobStore.JobStoreError({
+              message: "enqueueMany failed: could not generate unique job ids"
+            })
+          }
+          resolved.push(result)
+        }
+        return resolved
+      })
+
+    const store: JobStore.Service = {
+      enqueue: enqueueOne,
+
+      enqueueMany: (requests) =>
+        Effect.gen(function*() {
+          const results: Array<JobStore.EnqueueResult> = []
+          let batch: Array<JobStore.EnqueueRequest> = []
+          const flush = () =>
+            Effect.gen(function*() {
+              if (batch.length === 0) return
+              const items = batch
+              batch = []
+              // No spread: a six-figure batch would blow the engine's
+              // argument-count limit after the rows already committed.
+              for (const result of yield* insertBatch(items)) {
+                results.push(result)
+              }
+            })
+          for (const request of requests) {
+            // Dedup items run through the transactional single-enqueue path
+            // in order; runs of plain items between them batch into one
+            // INSERT with multi-row VALUES.
+            if (request.dedupe !== undefined) {
+              yield* flush()
+              results.push(yield* enqueueOne(request))
+            } else {
+              batch.push(request)
+            }
+          }
+          yield* flush()
+          return results
         }),
 
       claim: (claimOptions) =>
@@ -1276,6 +1424,39 @@ export const make = (
           Effect.mapError(storeError("advanceSchedule failed")),
           Effect.asVoid
         ),
+
+      tickSchedule: (key, expectedRunAt, nextRunAt, request) =>
+        Effect.gen(function*() {
+          if (request.id === undefined) {
+            return yield* new JobStore.JobStoreError({
+              message: "tickSchedule requires an explicit request.id"
+            })
+          }
+          // One transaction: the nextRunAt CAS claims the slot and the job
+          // INSERT commits with it, so a stale sweeper can never re-fire an
+          // occurrence — even after retention pruned the previous slot's job.
+          const fired = yield* db.transaction((tx) =>
+            Effect.gen(function*() {
+              const claimed = rowsOf(yield* tx.execute<{ key: string }>(sql`
+                UPDATE ${schedules} SET next_run_at = ${new Date(nextRunAt)}
+                WHERE ${schedules.key} = ${key} AND ${schedules.nextRunAt} = ${new Date(expectedRunAt)}
+                RETURNING ${schedules.key} AS key
+              `))
+              if (claimed.length === 0) return false
+              const now = yield* nowDate
+              const result = yield* insertJob(tx, request, now)
+              // A pre-existing slot row (pre-0.4 crash between enqueue and
+              // advance) still advances the schedule but fires nothing new.
+              return !result.duplicate
+            })
+          ).pipe(Effect.mapError((error) =>
+            error instanceof JobStore.JobStoreError ? error : storeError("tickSchedule failed")(error)
+          ))
+          if (fired) {
+            yield* wakeUp(request.queue)
+          }
+          return fired
+        }),
 
       counts: (queue) =>
         db.execute<{ state: JobStore.JobState; count: number }>(sql`

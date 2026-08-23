@@ -155,6 +155,8 @@ export const make = (
     const evalListSchedules = redis.eval(scripts.listSchedules)
     const evalDueSchedules = redis.eval(scripts.dueSchedules)
     const evalAdvanceSchedule = redis.eval(scripts.advanceSchedule)
+    const evalTickSchedule = redis.eval(scripts.tickSchedule)
+    const evalEnqueueMany = redis.eval(scripts.enqueueMany)
     const evalSweepState = redis.eval(scripts.sweepState)
     const evalSweepDedupes = redis.eval(scripts.sweepDedupes)
 
@@ -295,50 +297,181 @@ export const make = (
         }
       })
 
-    const store: JobStore.Service = {
-      enqueue: (request) =>
-        Effect.gen(function*() {
+    const enqueueJob = (request: JobStore.EnqueueRequest) =>
+      Effect.gen(function*() {
+        const now = yield* Clock.currentTimeMillis
+        const generate = options?.idGenerator
+        for (let i = 0; i < 5; i++) {
+          const mode = request.id !== undefined
+            ? "user" as const
+            : generate !== undefined
+            ? "generated" as const
+            : "auto" as const
+          const candidate = mode === "user"
+            ? request.id ?? ""
+            : mode === "generated" && generate !== undefined
+            ? yield* generateCandidate(request, generate)
+            : ""
+          const reply: {
+            id?: string
+            duplicate?: boolean
+            wake?: boolean
+            collision?: boolean
+            error?: string
+            queue?: string
+          } = JSON.parse(yield* enqueueOnce(request, mode, candidate, now))
+          if (reply.collision === true) continue
+          if (reply.error !== undefined || reply.id === undefined) {
+            return yield* new JobStore.JobStoreError({
+              message: "enqueue failed: could not generate a unique job id"
+            })
+          }
+          if (reply.wake === true) {
+            // A replace-while-delayed reply names the keyed job's queue.
+            yield* wakeUp(reply.queue !== undefined ? JobStore.QueueName(reply.queue) : request.queue)
+          }
+          return { id: JobStore.JobId(reply.id), duplicate: reply.duplicate === true }
+        }
+        return yield* new JobStore.JobStoreError({
+          message: "enqueue failed: could not generate a unique job id"
+        })
+      }).pipe(
+        Effect.mapError((error) =>
+          error instanceof JobStore.JobStoreError ? error : storeError("enqueue failed")(error)
+        )
+      )
+
+    // One EVALSHA per chunk of plain (non-dedup) items. Ids resolve in-script
+    // ("auto") or client-side (user/generated); a generated id that collides
+    // re-draws and retries in the next round, like the single-enqueue path.
+    const insertBatch = (requests: ReadonlyArray<JobStore.EnqueueRequest>) =>
+      Effect.gen(function*() {
+        const generate = options?.idGenerator
+        const results: Array<JobStore.EnqueueResult | undefined> = requests.map(() => undefined)
+        let pending = requests.map((request, index) => ({ request, index }))
+        for (let round = 0; round < 5 && pending.length > 0; round++) {
           const now = yield* Clock.currentTimeMillis
-          const generate = options?.idGenerator
-          for (let i = 0; i < 5; i++) {
-            const mode = request.id !== undefined
-              ? "user" as const
-              : generate !== undefined
-              ? "generated" as const
-              : "auto" as const
-            const candidate = mode === "user"
-              ? request.id ?? ""
-              : mode === "generated" && generate !== undefined
-              ? yield* generateCandidate(request, generate)
-              : ""
-            const reply: {
-              id?: string
-              duplicate?: boolean
-              wake?: boolean
-              collision?: boolean
-              error?: string
-              queue?: string
-            } = JSON.parse(yield* enqueueOnce(request, mode, candidate, now))
-            if (reply.collision === true) continue
-            if (reply.error !== undefined || reply.id === undefined) {
+          const stillPending: typeof pending = []
+          for (let start = 0; start < pending.length; start += 500) {
+            const chunk = pending.slice(start, start + 500)
+            const itemArgs: Array<string> = []
+            for (const { request } of chunk) {
+              const mode = request.id !== undefined
+                ? "user"
+                : generate !== undefined
+                ? "generated"
+                : "auto"
+              const candidate = request.id !== undefined
+                ? request.id
+                : generate !== undefined
+                ? yield* generateCandidate(request, generate)
+                : ""
+              itemArgs.push(
+                mode,
+                candidate,
+                request.name,
+                request.queue,
+                JSON.stringify(request.payload ?? null),
+                JSON.stringify(request.metadata),
+                String(request.priority),
+                String(request.attemptsMax),
+                request.backoff === undefined ? "" : JSON.stringify(request.backoff),
+                request.keep === undefined ? "" : JSON.stringify(request.keep),
+                request.timeoutMs === undefined ? "" : String(request.timeoutMs),
+                request.trace === undefined ? "" : JSON.stringify(request.trace),
+                String(Math.max(0, request.delayMs))
+              )
+            }
+            const replies: Array<{ id?: string; duplicate?: boolean; collision?: boolean; error?: string }> = JSON
+              .parse(yield* evalEnqueueMany(prefix, now, chunk.length, itemArgs))
+            const freshQueues = new Set<JobStore.QueueName>()
+            let failed = false
+            for (let i = 0; i < chunk.length; i++) {
+              const reply = replies[i]
+              const item = chunk[i]
+              if (item === undefined) continue
+              if (reply === undefined || reply.error !== undefined) {
+                failed = true
+                continue
+              }
+              if (reply.collision === true) {
+                // Generated-id collision: re-draw and re-insert next round.
+                // NOTE this lands the item after its batch-mates in FIFO
+                // order — acceptable for a pathological collision, and
+                // documented on the contract.
+                stillPending.push(item)
+                continue
+              }
+              if (reply.id === undefined) {
+                failed = true
+                continue
+              }
+              results[item.index] = { id: JobStore.JobId(reply.id), duplicate: reply.duplicate === true }
+              if (reply.duplicate !== true) {
+                freshQueues.add(item.request.queue)
+              }
+            }
+            // The script is not transactional across items: inserts that
+            // landed before a failing item are durable, so wake their queues
+            // BEFORE surfacing the error.
+            for (const queue of freshQueues) {
+              yield* wakeUp(queue)
+            }
+            if (failed) {
               return yield* new JobStore.JobStoreError({
-                message: "enqueue failed: could not generate a unique job id"
+                message: "enqueueMany failed: could not generate a unique job id"
               })
             }
-            if (reply.wake === true) {
-              // A replace-while-delayed reply names the keyed job's queue.
-              yield* wakeUp(reply.queue !== undefined ? JobStore.QueueName(reply.queue) : request.queue)
-            }
-            return { id: JobStore.JobId(reply.id), duplicate: reply.duplicate === true }
           }
-          return yield* new JobStore.JobStoreError({
-            message: "enqueue failed: could not generate a unique job id"
-          })
-        }).pipe(
-          Effect.mapError((error) =>
-            error instanceof JobStore.JobStoreError ? error : storeError("enqueue failed")(error)
-          )
-        ),
+          pending = stillPending
+        }
+        const resolved: Array<JobStore.EnqueueResult> = []
+        for (const result of results) {
+          if (result === undefined) {
+            return yield* new JobStore.JobStoreError({
+              message: "enqueueMany failed: could not generate a unique job id"
+            })
+          }
+          resolved.push(result)
+        }
+        return resolved
+      }).pipe(
+        Effect.mapError((error) =>
+          error instanceof JobStore.JobStoreError ? error : storeError("enqueueMany failed")(error)
+        )
+      )
+
+    const store: JobStore.Service = {
+      enqueue: enqueueJob,
+
+      enqueueMany: (requests) =>
+        Effect.gen(function*() {
+          const results: Array<JobStore.EnqueueResult> = []
+          let batch: Array<JobStore.EnqueueRequest> = []
+          const flush = () =>
+            Effect.gen(function*() {
+              if (batch.length === 0) return
+              const items = batch
+              batch = []
+              // No spread: a six-figure batch would blow the engine's
+              // argument-count limit after the rows already committed.
+              for (const result of yield* insertBatch(items)) {
+                results.push(result)
+              }
+            })
+          for (const request of requests) {
+            // Dedup items run through the single-enqueue decision tree in
+            // order; runs of plain items between them batch into one script.
+            if (request.dedupe !== undefined) {
+              yield* flush()
+              results.push(yield* enqueueJob(request))
+            } else {
+              batch.push(request)
+            }
+          }
+          yield* flush()
+          return results
+        }),
 
       claim: (claimOptions) =>
         // Snapshot BEFORE the script runs: a wake that fires while the claim
@@ -640,6 +773,43 @@ export const make = (
           const flat: ReadonlyArray<ReadonlyArray<string>> = JSON.parse(yield* evalDueSchedules(prefix, now))
           return flat.map((pairs) => toSchedule(foldPairs(pairs)))
         }).pipe(Effect.mapError(storeError("dueSchedules failed"))),
+
+      tickSchedule: (key, expectedRunAt, nextRunAt, request) =>
+        Effect.gen(function*() {
+          if (request.id === undefined) {
+            return yield* new JobStore.JobStoreError({
+              message: "tickSchedule requires an explicit request.id"
+            })
+          }
+          const now = yield* Clock.currentTimeMillis
+          const fired = (yield* evalTickSchedule(
+            prefix,
+            key,
+            expectedRunAt,
+            nextRunAt,
+            request.id,
+            request.name,
+            request.queue,
+            JSON.stringify(request.payload ?? null),
+            JSON.stringify(request.metadata),
+            request.priority,
+            request.attemptsMax,
+            request.backoff === undefined ? "" : JSON.stringify(request.backoff),
+            request.keep === undefined ? "" : JSON.stringify(request.keep),
+            request.timeoutMs === undefined ? "" : String(request.timeoutMs),
+            request.trace === undefined ? "" : JSON.stringify(request.trace),
+            Math.max(0, request.delayMs),
+            now
+          )) === "1"
+          if (fired) {
+            yield* wakeUp(request.queue)
+          }
+          return fired
+        }).pipe(
+          Effect.mapError((error) =>
+            error instanceof JobStore.JobStoreError ? error : storeError("tickSchedule failed")(error)
+          )
+        ),
 
       advanceSchedule: (key, expectedRunAt, nextRunAt) =>
         evalAdvanceSchedule(prefix, key, expectedRunAt, nextRunAt).pipe(

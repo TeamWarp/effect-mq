@@ -833,6 +833,310 @@ export const jobStoreConformance = (
         })
       ))
 
+    const minutelySchedule = (): JobStore.ScheduleRecord => ({
+      key: JobStore.ScheduleKey("TestJob/minutely"),
+      jobName: "TestJob",
+      queue: QueueName("default"),
+      cron: undefined,
+      tz: undefined,
+      everyMs: 60_000,
+      payload: { n: 7 },
+      metadata: {},
+      priority: 0,
+      attemptsMax: 1,
+      backoff: undefined,
+      keep: undefined,
+      timeoutMs: undefined,
+      nextRunAt: 60_000
+    })
+
+    it.effect("tickSchedule fires a slot exactly once and advances atomically", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const schedule = minutelySchedule()
+          yield* store.upsertSchedule(schedule)
+          yield* TestClock.adjust(60_000)
+          const request = baseRequest({
+            id: JobId("sched/TestJob/minutely/60000"),
+            payload: { n: 7 }
+          })
+
+          expect(yield* store.tickSchedule(schedule.key, 60_000, 120_000, request)).toBe(true)
+          expect((yield* store.listSchedules())[0]?.nextRunAt).toBe(120_000)
+          expect((yield* store.counts()).waiting).toBe(1)
+
+          // A concurrent sweeper holding the same stale expectation loses the
+          // CAS: nothing fires, nothing advances further.
+          expect(yield* store.tickSchedule(schedule.key, 60_000, 180_000, request)).toBe(false)
+          expect((yield* store.listSchedules())[0]?.nextRunAt).toBe(120_000)
+          expect((yield* store.counts()).waiting).toBe(1)
+
+          const claim = yield* store.claim(claimOptions())
+          assert(claim._tag === "Claimed")
+          expect(claim.job.id).toBe("sched/TestJob/minutely/60000")
+          expect(claim.job.payload).toEqual({ n: 7 })
+        })
+      ))
+
+    it.effect("a stale tick cannot re-fire a slot whose job was pruned", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const schedule = minutelySchedule()
+          yield* store.upsertSchedule(schedule)
+          yield* TestClock.adjust(60_000)
+          const slotId = JobId("sched/TestJob/minutely/60000")
+          const request = baseRequest({ id: slotId, payload: { n: 7 } })
+          expect(yield* store.tickSchedule(schedule.key, 60_000, 120_000, request)).toBe(true)
+
+          // Retention prunes the slot job — the old non-atomic design would
+          // now let a stale sweeper re-insert it. The CAS must still refuse.
+          expect(yield* store.remove(slotId)).toBe(true)
+          expect(yield* store.tickSchedule(schedule.key, 60_000, 180_000, request)).toBe(false)
+          expect((yield* store.counts()).waiting).toBe(0)
+          expect((yield* store.listSchedules())[0]?.nextRunAt).toBe(120_000)
+        })
+      ))
+
+    it.effect("tickSchedule advances without firing when the slot job already exists", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const schedule = minutelySchedule()
+          yield* store.upsertSchedule(schedule)
+          yield* TestClock.adjust(60_000)
+          const slotId = JobId("sched/TestJob/minutely/60000")
+          // A pre-0.4 worker crashed between its enqueue and advance: the
+          // slot row exists but nextRunAt is stale. The tick must advance the
+          // schedule (or it stays due forever) yet report nothing new fired.
+          yield* store.enqueue(baseRequest({ id: slotId, payload: { n: 7 } }))
+          const request = baseRequest({ id: slotId, payload: { n: 7 } })
+          expect(yield* store.tickSchedule(schedule.key, 60_000, 120_000, request)).toBe(false)
+          expect((yield* store.listSchedules())[0]?.nextRunAt).toBe(120_000)
+          expect((yield* store.counts()).waiting).toBe(1)
+        })
+      ))
+
+    it.effect("tickSchedule rejects requests without an id and unknown keys", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const missing = yield* Effect.flip(
+            store.tickSchedule(JobStore.ScheduleKey("TestJob/minutely"), 60_000, 120_000, baseRequest())
+          )
+          expect(missing._tag).toBe("JobStoreError")
+          expect(
+            yield* store.tickSchedule(
+              JobStore.ScheduleKey("ghost"),
+              0,
+              60_000,
+              baseRequest({ id: JobId("sched/ghost/0") })
+            )
+          ).toBe(false)
+          expect((yield* store.counts()).waiting).toBe(0)
+        })
+      ))
+
+    it.effect("tickSchedule wakes parked takers", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const schedule = minutelySchedule()
+          yield* store.upsertSchedule(schedule)
+          const empty = yield* store.claim(claimOptions())
+          assert(empty._tag === "Empty")
+          const waiter = yield* Effect.forkChild(
+            store.awaitWake([QueueName("default")], empty.wakeToken)
+          )
+          yield* Effect.yieldNow
+          yield* TestClock.adjust(60_000)
+          const request = baseRequest({
+            id: JobId("sched/TestJob/minutely/60000"),
+            payload: { n: 7 }
+          })
+          expect(yield* store.tickSchedule(schedule.key, 60_000, 120_000, request)).toBe(true)
+          yield* Fiber.join(waiter)
+          const claim = yield* store.claim(claimOptions({ token: "t-2" }))
+          assert(claim._tag === "Claimed")
+        })
+      ))
+
+    it.effect("enqueueMany inserts a batch with positional results", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const results = yield* store.enqueueMany([
+            baseRequest({ payload: { n: 1 } }),
+            baseRequest({ payload: { n: 2 }, delayMs: 60_000 }),
+            baseRequest({ id: JobId("batch-3"), payload: { n: 3 }, priority: 5 })
+          ])
+          expect(results).toHaveLength(3)
+          expect(results.map((result) => result.duplicate)).toEqual([false, false, false])
+          expect(new Set(results.map((result) => result.id)).size).toBe(3)
+          expect(results[2]?.id).toBe("batch-3")
+
+          const counts = yield* store.counts()
+          expect(counts.waiting).toBe(2)
+          expect(counts.delayed).toBe(1)
+
+          const explicit = yield* store.getJob(JobId("batch-3"))
+          assert(Option.isSome(explicit))
+          expect(explicit.value.payload).toEqual({ n: 3 })
+          expect(explicit.value.priority).toBe(5)
+
+          const delayedId = results[1]?.id
+          assert(delayedId !== undefined)
+          const delayed = yield* store.getJob(delayedId)
+          assert(Option.isSome(delayed))
+          expect(delayed.value.state).toBe("delayed")
+          expect(delayed.value.runAt).toBe(60_000)
+
+          // Priority order survives the batch path.
+          const claim = yield* store.claim(claimOptions())
+          assert(claim._tag === "Claimed")
+          expect(claim.job.id).toBe("batch-3")
+        })
+      ))
+
+    it.effect("enqueueMany reports duplicates positionally without clobbering", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          yield* store.enqueue(baseRequest({ id: JobId("dup-1"), payload: { n: 0 } }))
+          const results = yield* store.enqueueMany([
+            baseRequest({ payload: { n: 1 } }),
+            baseRequest({ id: JobId("dup-1"), payload: { n: 99 } }),
+            baseRequest({ payload: { n: 2 } })
+          ])
+          expect(results.map((result) => result.duplicate)).toEqual([false, true, false])
+          expect(results[1]?.id).toBe("dup-1")
+          const kept = yield* store.getJob(JobId("dup-1"))
+          assert(Option.isSome(kept))
+          expect(kept.value.payload).toEqual({ n: 0 })
+          expect((yield* store.counts()).waiting).toBe(3)
+        })
+      ))
+
+    it.effect("enqueueMany resolves intra-batch repeats of one id like separate enqueues", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const results = yield* store.enqueueMany([
+            baseRequest({ id: JobId("same"), payload: { n: 1 } }),
+            baseRequest({ id: JobId("same"), payload: { n: 2 } })
+          ])
+          expect(results.map((result) => result.duplicate)).toEqual([false, true])
+          expect(results[1]?.id).toBe("same")
+          expect((yield* store.counts()).waiting).toBe(1)
+          const job = yield* store.getJob(JobId("same"))
+          assert(Option.isSome(job))
+          expect(job.value.payload).toEqual({ n: 1 })
+        })
+      ))
+
+    it.effect("enqueueMany applies per-item dedup policies in order", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const dedupe = { key: "k", ttlMs: undefined, extend: false, replace: false }
+          const results = yield* store.enqueueMany([
+            baseRequest({ payload: { n: 1 }, dedupe }),
+            baseRequest({ payload: { n: 2 } }),
+            baseRequest({ payload: { n: 3 }, dedupe })
+          ])
+          expect(results.map((result) => result.duplicate)).toEqual([false, false, true])
+          expect(results[2]?.id).toBe(results[0]?.id)
+          expect((yield* store.counts()).waiting).toBe(2)
+        })
+      ))
+
+    it.effect("enqueueMany with an empty batch returns an empty array", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          expect(yield* store.enqueueMany([])).toEqual([])
+        })
+      ))
+
+    // Pins the hand-duplicated field plumbing in batch/tick insert paths
+    // (positional Lua ARGV strides, multi-row VALUES lists): every persisted
+    // field must come out identical to the single-enqueue path. A swapped
+    // pair of ARGVs or a dropped column fails this even though the simpler
+    // tests (payload/priority/state only) stay green.
+    it.effect("batch and tick inserts persist every field exactly like enqueue", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const richRequest = (id: string): JobStore.EnqueueRequest =>
+            baseRequest({
+              id: JobId(id),
+              payload: { big: 1234567890123456, nested: { arr: [1, 2, 3] } },
+              metadata: { tenant: "acme", region: "us" },
+              priority: 3,
+              attemptsMax: 4,
+              backoff: { _tag: "fixed", delayMs: 2_000 },
+              keep: { completed: { count: 2, ageMs: undefined } },
+              timeoutMs: 9_000,
+              trace: { traceId: "trace-1", spanId: "span-1", sampled: true, delayed: false }
+            })
+          yield* store.enqueue(richRequest("rich-single"))
+          expect(yield* store.enqueueMany([richRequest("rich-batch")]))
+            .toEqual([{ id: "rich-batch", duplicate: false }])
+          const schedule = {
+            ...minutelySchedule(),
+            key: JobStore.ScheduleKey("TestJob/parity"),
+            nextRunAt: 0
+          }
+          yield* store.upsertSchedule(schedule)
+          expect(yield* store.tickSchedule(schedule.key, 0, 60_000, richRequest("rich-tick")))
+            .toBe(true)
+
+          const project = (job: JobStore.JobRecord) => ({
+            name: job.name,
+            queue: job.queue,
+            state: job.state,
+            payload: job.payload,
+            metadata: job.metadata,
+            priority: job.priority,
+            attemptsMax: job.attemptsMax,
+            attemptsMade: job.attemptsMade,
+            backoff: job.backoff,
+            keep: job.keep,
+            timeoutMs: job.timeoutMs,
+            cancelRequested: job.cancelRequested,
+            trace: job.trace,
+            runAt: job.runAt,
+            enqueuedAt: job.enqueuedAt
+          })
+          const single = yield* store.getJob(JobId("rich-single"))
+          assert(Option.isSome(single))
+          const expected = project(single.value)
+          // The reference row itself must carry the rich fields — otherwise
+          // three empty rows would compare equal and prove nothing.
+          expect(expected.backoff).toEqual({ _tag: "fixed", delayMs: 2_000 })
+          expect(expected.keep).toEqual({ completed: { count: 2 } })
+          expect(expected.timeoutMs).toBe(9_000)
+          expect(expected.trace).toEqual({
+            traceId: "trace-1",
+            spanId: "span-1",
+            sampled: true,
+            delayed: false
+          })
+          expect(expected.payload).toEqual({ big: 1234567890123456, nested: { arr: [1, 2, 3] } })
+          for (const id of [JobId("rich-batch"), JobId("rich-tick")]) {
+            const job = yield* store.getJob(id)
+            assert(Option.isSome(job))
+            expect(project(job.value)).toEqual(expected)
+          }
+        })
+      ))
+
+    it.effect("enqueueMany wakes parked takers", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const empty = yield* store.claim(claimOptions())
+          assert(empty._tag === "Empty")
+          const waiter = yield* Effect.forkChild(
+            store.awaitWake([QueueName("default")], empty.wakeToken)
+          )
+          yield* Effect.yieldNow
+          yield* store.enqueueMany([baseRequest()])
+          yield* Fiber.join(waiter)
+          const claim = yield* store.claim(claimOptions({ token: "t-2" }))
+          assert(claim._tag === "Claimed")
+        })
+      ))
+
     it.effect("completion wins over a pending cancel request", () =>
       withStore((store) =>
         Effect.gen(function*() {

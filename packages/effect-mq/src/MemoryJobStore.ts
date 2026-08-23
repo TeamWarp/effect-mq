@@ -303,9 +303,40 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
       }
     })
 
-  const service: Service = JobStore.of({
-    enqueue: (request: EnqueueRequest) =>
-      Effect.gen(function*() {
+  const insertJobRecord = (id: JobId, request: EnqueueRequest, now: number) => {
+    jobs.set(id, {
+      id,
+      name: request.name,
+      queue: request.queue,
+      payload: request.payload,
+      metadata: request.metadata,
+      state: request.delayMs > 0 ? "delayed" : "waiting",
+      priority: request.priority,
+      attemptsMax: request.attemptsMax,
+      attemptsMade: 0,
+      stalledCount: 0,
+      backoff: request.backoff,
+      keep: request.keep,
+      timeoutMs: request.timeoutMs,
+      cancelRequested: false,
+      dedupeKey: request.dedupe?.key,
+      trace: request.trace,
+      runAt: now + Math.max(0, request.delayMs),
+      enqueuedAt: now,
+      processedAt: undefined,
+      finishedAt: undefined,
+      exit: undefined,
+      failedReason: undefined,
+      attempts: [],
+      seq: ++seq,
+      lockToken: undefined,
+      lockExpiresAt: undefined
+    })
+    signalWake(request.queue)
+  }
+
+  const enqueueOne = (request: EnqueueRequest) =>
+    Effect.gen(function*() {
         const now = yield* Clock.currentTimeMillis
         if (request.id !== undefined && jobs.has(request.id)) {
           return { id: request.id, duplicate: true }
@@ -375,43 +406,20 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
             }
           }
         }
-        jobs.set(id, {
-          id,
-          name: request.name,
-          queue: request.queue,
-          payload: request.payload,
-          metadata: request.metadata,
-          state: request.delayMs > 0 ? "delayed" : "waiting",
-          priority: request.priority,
-          attemptsMax: request.attemptsMax,
-          attemptsMade: 0,
-          stalledCount: 0,
-          backoff: request.backoff,
-          keep: request.keep,
-          timeoutMs: request.timeoutMs,
-          cancelRequested: false,
-          dedupeKey: request.dedupe?.key,
-          trace: request.trace,
-          runAt: now + Math.max(0, request.delayMs),
-          enqueuedAt: now,
-          processedAt: undefined,
-          finishedAt: undefined,
-          exit: undefined,
-          failedReason: undefined,
-          attempts: [],
-          seq: ++seq,
-          lockToken: undefined,
-          lockExpiresAt: undefined
-        })
+        insertJobRecord(id, request, now)
         if (request.dedupe !== undefined) {
           dedupes.set(dedupeMapKey(request.name, request.dedupe.key), {
             jobId: id,
             expiresAt: request.dedupe.ttlMs !== undefined ? now + request.dedupe.ttlMs : undefined
           })
         }
-        signalWake(request.queue)
         return { id, duplicate: false }
-      }),
+      })
+
+  const service: Service = JobStore.of({
+    enqueue: enqueueOne,
+
+    enqueueMany: (requests) => Effect.forEach(requests, enqueueOne),
 
     claim: (options) =>
       Effect.gen(function*() {
@@ -763,6 +771,29 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
         if (schedule !== undefined && schedule.nextRunAt === expectedRunAt) {
           schedules.set(key, { ...schedule, nextRunAt })
         }
+      }),
+
+    tickSchedule: (key, expectedRunAt, nextRunAt, request) =>
+      Effect.gen(function*() {
+        const id = request.id
+        if (id === undefined) {
+          return yield* new JobStoreError({
+            message: "tickSchedule requires an explicit request.id"
+          })
+        }
+        const now = yield* Clock.currentTimeMillis
+        // One synchronous block: CAS, insert, and advance commit together —
+        // no yield point can interleave another sweeper between them.
+        const schedule = schedules.get(key)
+        if (schedule === undefined || schedule.nextRunAt !== expectedRunAt) {
+          return false
+        }
+        schedules.set(key, { ...schedule, nextRunAt })
+        // Slot already materialized (pre-0.4 crash between enqueue and
+        // advance): the schedule still advances, but nothing new fired.
+        if (jobs.has(id)) return false
+        insertJobRecord(id, request, now)
+        return true
       }),
 
     counts: (queue) =>

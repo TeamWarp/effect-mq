@@ -6,6 +6,25 @@ bumps are additive.
 
 ## 0.4.0 (unreleased)
 
+- **Atomic schedule ticks** — repeatable-job occurrences are now claimed
+  and enqueued in a single atomic store op (`tickSchedule(key,
+  expectedRunAt, next, request) -> fired`; breaking for driver authors).
+  Previously exactly-once rested on the slot job's row existing, so a
+  sweeper stale past the history-retention window could re-fire a pruned
+  slot; the compare-and-swap now refuses regardless of retention.
+  Conformance-pinned, including the pruned-slot regression.
+- **Batch enqueue** — `MyJob.enqueueMany(payloads, options?)` inserts a
+  whole batch of plain items in one store round trip per chunk (store
+  contract: `enqueueMany`, breaking for driver authors). Postgres uses
+  multi-row `INSERT ... ON CONFLICT` VALUES, Redis one Lua script per
+  chunk; items that carry a dedup key run through the single-enqueue path
+  individually, in order. Per-item semantics match `enqueue` —
+  `idempotencyKey`/`dedupe`/`metadata` callbacks run per payload,
+  duplicates report positionally — while shared options apply batch-wide
+  (`jobId`/`dedupe` are excluded at the type level). The batch is not one
+  transaction: a mid-batch failure can leave a subset applied, which is
+  safe under at-least-once with deterministic ids.
+
 - **Trace propagation** — the enqueue span's `traceId`/`spanId`/`sampled`
   persist on the job record and become the handler span's parent
   (`Tracer.externalSpan`), so producer → handler traces connect across
