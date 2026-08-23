@@ -70,10 +70,10 @@ export interface MqTableOptions<Columns extends Record<string, AnyPgColumnBuilde
     | undefined
 }
 
-const jobsColumns = <JobName extends string>() => ({
+const jobsColumns = <JobName extends string, Queue extends string>() => ({
   id: text("id").primaryKey().$type<JobId>(),
   name: text("name").notNull().$type<JobName>(),
-  queue: text("queue").notNull().$type<QueueName>(),
+  queue: text("queue").notNull().$type<Queue>(),
   state: text("state").notNull().$type<JobState>(),
   priority: integer("priority").notNull().default(0),
   /** FIFO order within a priority; bumped on retry so retries go to the tail. */
@@ -102,6 +102,8 @@ const jobsColumns = <JobName extends string>() => ({
 /**
  * The jobs table factory. `JobName` types the `name` column — derive it from
  * your job definitions: `mqJobs<typeof GenerateInvoice._tag | typeof Report._tag>()`.
+ * `Queue` types the `queue` column the same way — pass your own branded type
+ * or literal union (defaults to effect-mq's `QueueName` brand).
  *
  * `extend` adds your own columns (tenant ids, object ids, ...) to the table.
  * At enqueue the Postgres store fills each extended column from the job's
@@ -124,16 +126,17 @@ const jobsColumns = <JobName extends string>() => ({
  */
 export const mqJobs = <
   JobName extends string = string,
+  Queue extends string = QueueName,
   Extend extends Record<string, AnyPgColumnBuilder> = Record<never, never>
 >(
   tableName = "effect_mq_jobs",
-  options?: MqTableOptions<ReturnType<typeof jobsColumns<JobName>> & Extend> & {
+  options?: MqTableOptions<ReturnType<typeof jobsColumns<JobName, Queue>> & Extend> & {
     /** Extra columns appended to the factory's own (see the JSDoc example). */
     readonly extend?: Extend | undefined
   }
 ) =>
   pgTable(tableName, {
-    ...jobsColumns<JobName>(),
+    ...jobsColumns<JobName, Queue>(),
     // SAFETY: when `extend` is absent, `Extend` was never inferred from a
     // value and stays at its empty-record default, which {} satisfies.
     ...options?.extend ?? ({} as Extend)
@@ -175,7 +178,7 @@ const attemptsColumns = (jobs: MqJobsTable) => ({
  * @since 0.1.0
  */
 export const mqJobAttempts = (
-  jobs: ReturnType<typeof mqJobs<any>>,
+  jobs: MqJobsTable,
   tableName = "effect_mq_job_attempts",
   options?: MqTableOptions<ReturnType<typeof attemptsColumns>>
 ) =>
@@ -184,10 +187,10 @@ export const mqJobAttempts = (
     ...options?.extraConfig?.(table) ?? []
   ])
 
-const schedulesColumns = () => ({
+const schedulesColumns = <JobName extends string, Queue extends string>() => ({
   key: text("key").primaryKey().$type<ScheduleKey>(),
-  jobName: text("job_name").notNull(),
-  queue: text("queue").notNull().$type<QueueName>(),
+  jobName: text("job_name").notNull().$type<JobName>(),
+  queue: text("queue").notNull().$type<Queue>(),
   cron: text("cron"),
   tz: text("tz"),
   everyMs: bigint("every_ms", { mode: "number" }),
@@ -204,19 +207,22 @@ const schedulesColumns = () => ({
 /**
  * Repeatable-job schedules (one row per `Job.schedule` key).
  *
+ * `JobName` and `Queue` type the `jobName`/`queue` columns, exactly like
+ * `mqJobs` (both default to plain string / effect-mq's `QueueName` brand).
+ *
  * @since 0.2.0
  */
-export const mqSchedules = (
+export const mqSchedules = <JobName extends string = string, Queue extends string = QueueName>(
   tableName = "effect_mq_schedules",
-  options?: MqTableOptions<ReturnType<typeof schedulesColumns>>
+  options?: MqTableOptions<ReturnType<typeof schedulesColumns<JobName, Queue>>>
 ) =>
-  pgTable(tableName, schedulesColumns(), (table) => [
+  pgTable(tableName, schedulesColumns<JobName, Queue>(), (table) => [
     index(`${tableName}_due_idx`).on(table.nextRunAt),
     ...options?.extraConfig?.(table) ?? []
   ])
 
-const dedupeColumns = () => ({
-  name: text("name").notNull(),
+const dedupeColumns = <JobName extends string>() => ({
+  name: text("name").notNull().$type<JobName>(),
   key: text("key").notNull(),
   jobId: text("job_id").notNull().$type<JobId>(),
   /** Set for ttl/throttle windows; NULL rows live as long as their job is pending. */
@@ -228,17 +234,17 @@ const dedupeColumns = () => ({
  *
  * @since 0.3.0
  */
-export const mqDedupe = (
+export const mqDedupe = <JobName extends string = string>(
   tableName = "effect_mq_dedupe",
-  options?: MqTableOptions<ReturnType<typeof dedupeColumns>>
+  options?: MqTableOptions<ReturnType<typeof dedupeColumns<JobName>>>
 ) =>
-  pgTable(tableName, dedupeColumns(), (table) => [
+  pgTable(tableName, dedupeColumns<JobName>(), (table) => [
     primaryKey({ columns: [table.name, table.key] }),
     ...options?.extraConfig?.(table) ?? []
   ])
 
-const queueControlColumns = () => ({
-  queue: text("queue").primaryKey().$type<QueueName>(),
+const queueControlColumns = <Queue extends string>() => ({
+  queue: text("queue").primaryKey().$type<Queue>(),
   paused: boolean("paused").notNull().default(false)
 })
 
@@ -247,18 +253,18 @@ const queueControlColumns = () => ({
  *
  * @since 0.2.0
  */
-export const mqQueueControl = (
+export const mqQueueControl = <Queue extends string = QueueName>(
   tableName = "effect_mq_queue_control",
-  options?: MqTableOptions<ReturnType<typeof queueControlColumns>>
+  options?: MqTableOptions<ReturnType<typeof queueControlColumns<Queue>>>
 ) =>
-  pgTable(tableName, queueControlColumns(), (table) => [
+  pgTable(tableName, queueControlColumns<Queue>(), (table) => [
     ...options?.extraConfig?.(table) ?? []
   ])
 
 /**
  * @since 0.1.0
  */
-export type MqJobsTable = ReturnType<typeof mqJobs<any>>
+export type MqJobsTable = ReturnType<typeof mqJobs<any, any>>
 
 /**
  * @since 0.1.0
@@ -268,14 +274,14 @@ export type MqJobAttemptsTable = ReturnType<typeof mqJobAttempts>
 /**
  * @since 0.2.0
  */
-export type MqSchedulesTable = ReturnType<typeof mqSchedules>
+export type MqSchedulesTable = ReturnType<typeof mqSchedules<any, any>>
 
 /**
  * @since 0.2.0
  */
-export type MqQueueControlTable = ReturnType<typeof mqQueueControl>
+export type MqQueueControlTable = ReturnType<typeof mqQueueControl<any>>
 
 /**
  * @since 0.3.0
  */
-export type MqDedupeTable = ReturnType<typeof mqDedupe>
+export type MqDedupeTable = ReturnType<typeof mqDedupe<any>>

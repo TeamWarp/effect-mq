@@ -4,6 +4,20 @@ All notable changes to `effect-mq`. Versions follow 0.x semver: **minor
 bumps may break** (the `JobStore` driver contract in particular); patch
 bumps are additive.
 
+## 0.4.1 — 2026-08-23
+
+- **Typed queue and job-name columns in the drizzle factories** — the
+  `queue` columns are now generic, mirroring the existing `JobName`
+  parameter on `mqJobs`: `mqJobs<JobName, Queue>` (new second type
+  parameter), `mqSchedules<JobName, Queue>` (also types the previously
+  plain-`string` `jobName` column), `mqDedupe<JobName>` (types `name`),
+  and `mqQueueControl<Queue>`. Pass your own branded type or literal
+  union; everything defaults to the prior types (`QueueName` brand /
+  `string`), and the annotations are compile-time only — the store still
+  brands values at the boundary. Note for explicit-type-argument callers:
+  `mqJobs`'s `Extend` parameter moved from second to third position
+  (inferred usage via the `extend` option is unaffected).
+
 ## 0.4.0 — 2026-08-23
 
 - **Atomic schedule ticks** — repeatable-job occurrences are now claimed

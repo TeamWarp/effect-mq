@@ -718,6 +718,44 @@ if (!available) {
       expect(getTableConfig(table).name).toBe("typed_jobs")
     })
 
+    it("the `queue` and schedule/dedupe name columns accept user-supplied brands", () => {
+      type WarpQueue = "critical" | "default"
+      type JobNames = "generate-invoice" | "send-email"
+
+      const jobs = mqJobs<JobNames, WarpQueue>("typed_queue_jobs")
+      type JobsQueueType = typeof jobs.queue._.data
+      const jobsQueue: JobsQueueType = "critical"
+      // @ts-expect-error - not one of the declared queues
+      const badQueue: JobsQueueType = "typo-queue"
+      void badQueue
+
+      const schedules = mqSchedules<JobNames, WarpQueue>("typed_queue_sched")
+      type SchedJobName = typeof schedules.jobName._.data
+      type SchedQueue = typeof schedules.queue._.data
+      const schedName: SchedJobName = "send-email"
+      const schedQueue: SchedQueue = "default"
+      // @ts-expect-error - not part of the job-tag union
+      const badSchedName: SchedJobName = "typo-job"
+      void badSchedName
+
+      const dedupe = mqDedupe<JobNames>("typed_queue_dedupe")
+      type DedupeName = typeof dedupe.name._.data
+      const dedupeName: DedupeName = "generate-invoice"
+      // @ts-expect-error - not part of the job-tag union
+      const badDedupeName: DedupeName = "typo-job"
+      void badDedupeName
+
+      const queues = mqQueueControl<WarpQueue>("typed_queue_control")
+      type ControlQueue = typeof queues.queue._.data
+      const controlQueue: ControlQueue = "critical"
+      // @ts-expect-error - not one of the declared queues
+      const badControlQueue: ControlQueue = "typo-queue"
+      void badControlQueue
+
+      expect([jobsQueue, schedName, schedQueue, dedupeName, controlQueue])
+        .toEqual(["critical", "send-email", "default", "generate-invoice", "critical"])
+    })
+
     it("extraConfig appends user indexes to the built-in ones on every factory", () => {
       const jobs = mqJobs("extra_idx_jobs", {
         extraConfig: (t) => [
