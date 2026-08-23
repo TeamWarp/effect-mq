@@ -482,6 +482,100 @@ describe("trace propagation", () => {
       expect(seen.parentTraceId).toBe(producerTraceId)
     }))
 
+  it.effect("auto linking: delayed jobs start their own trace with a causal link", () =>
+    Effect.gen(function*() {
+      const store = yield* MemoryJobStore.make
+      const storeLayer = Layer.succeed(JobStore.JobStore, store)
+      class Later extends Job.make("LaterTraced", { payload: {} }) {}
+      let seen: {
+        ownTraceId: string
+        parentTraceId: string | undefined
+        linkTraceIds: Array<string>
+      } | undefined
+      const handlers = Later.toLayer(() =>
+        Effect.gen(function*() {
+          const span = yield* Effect.currentSpan
+          seen = {
+            ownTraceId: span.traceId,
+            parentTraceId: Option.isSome(span.parent) ? span.parent.value.traceId : undefined,
+            linkTraceIds: span.links.map((link) => link.span.traceId)
+          }
+        }).pipe(Effect.orDie)
+      )
+
+      let producerTraceId: string | undefined
+      yield* Effect.gen(function*() {
+        yield* Effect.gen(function*() {
+          producerTraceId = (yield* Effect.currentSpan).traceId
+          yield* Later.enqueue({}, { delay: "5 seconds" })
+        }).pipe(Effect.withSpan("scheduling-op"))
+        yield* settle
+        yield* TestClock.adjust("5 seconds")
+        yield* settle
+      }).pipe(
+        Effect.provide(
+          handlers.pipe(
+            Layer.provideMerge(Worker.layer()),
+            Layer.provideMerge(storeLayer)
+          )
+        )
+      )
+
+      assert(seen !== undefined && producerTraceId !== undefined)
+      // Own trace root (no producer parent), causally linked back.
+      expect(seen.ownTraceId).not.toBe(producerTraceId)
+      expect(seen.parentTraceId).not.toBe(producerTraceId)
+      expect(seen.linkTraceIds).toEqual([producerTraceId])
+    }))
+
+  it.effect("traceLinking overrides: parent forces continuation, none drops the edge", () =>
+    Effect.gen(function*() {
+      const run = (linking: "parent" | "none") =>
+        Effect.gen(function*() {
+          const store = yield* MemoryJobStore.make
+          const storeLayer = Layer.succeed(JobStore.JobStore, store)
+          class Forced extends Job.make(`Forced${linking}`, { payload: {} }) {}
+          let seen: { parentTraceId: string | undefined; links: number } | undefined
+          const handlers = Forced.toLayer(() =>
+            Effect.gen(function*() {
+              const span = yield* Effect.currentSpan
+              seen = {
+                parentTraceId: Option.isSome(span.parent) ? span.parent.value.traceId : undefined,
+                links: span.links.length
+              }
+            }).pipe(Effect.orDie)
+          )
+          let producerTraceId: string | undefined
+          yield* Effect.gen(function*() {
+            yield* Effect.gen(function*() {
+              producerTraceId = (yield* Effect.currentSpan).traceId
+              // Delayed: auto would link, the override must win.
+              yield* Forced.enqueue({}, { delay: "1 second" })
+            }).pipe(Effect.withSpan("op"))
+            yield* settle
+            yield* TestClock.adjust("1 second")
+            yield* settle
+          }).pipe(
+            Effect.provide(
+              handlers.pipe(
+                Layer.provideMerge(Worker.layer({ traceLinking: linking })),
+                Layer.provideMerge(storeLayer)
+              )
+            )
+          )
+          assert(seen !== undefined && producerTraceId !== undefined)
+          return { seen, producerTraceId }
+        })
+
+      const parent = yield* run("parent")
+      expect(parent.seen.parentTraceId).toBe(parent.producerTraceId)
+      expect(parent.seen.links).toBe(0)
+
+      const none = yield* run("none")
+      expect(none.seen.parentTraceId).not.toBe(none.producerTraceId)
+      expect(none.seen.links).toBe(0)
+    }))
+
   it.effect("handlerSpanName customizes the run span's name", () =>
     Effect.gen(function*() {
       const store = yield* MemoryJobStore.make

@@ -132,6 +132,16 @@ export interface WorkerOptions<StoreId = JobStore> {
    * child.
    */
   readonly handlerSpanName?: ((context: JobContext) => string) | undefined
+  /**
+   * How the handler span attaches to the producer's persisted trace:
+   * - `"auto"` (default): immediate enqueues CONTINUE the producer trace
+   *   (parent-child); explicitly delayed/`at`-scheduled ones start their own
+   *   trace with a causal LINK back (long-delayed parent-child traces render
+   *   badly and defeat tail sampling).
+   * - `"parent"` / `"link"`: force one mode for every job.
+   * - `"none"`: spans and attributes only, no cross-trace edge.
+   */
+  readonly traceLinking?: "auto" | "parent" | "link" | "none" | undefined
   /** Identifier used in lock tokens (default: random). */
   readonly id?: string | undefined
 }
@@ -347,6 +357,17 @@ export const make = <StoreId = JobStore>(
           // id, parented on the PRODUCER's persisted span context when
           // present — so producer -> handler traces connect across
           // processes.
+          const linking = options?.traceLinking ?? "auto"
+          const attach = record.trace === undefined
+            ? "none"
+            : linking === "auto"
+            ? (record.trace.delayed ? "link" : "parent")
+            : linking
+          const producerSpan = record.trace === undefined ? undefined : Tracer.externalSpan({
+            traceId: record.trace.traceId,
+            spanId: record.trace.spanId,
+            sampled: record.trace.sampled
+          })
           const withRunSpan = entry.run(record.payload, context).pipe(
             Effect.withSpan(
               options?.handlerSpanName?.(context) ?? `${record.name}.run`,
@@ -355,20 +376,17 @@ export const make = <StoreId = JobStore>(
                   effectMqJobId: record.id,
                   effectMqQueue: record.queue,
                   effectMqAttempt: context.attempt
-                }
+                },
+                links: attach === "link" && producerSpan !== undefined
+                  ? [{ span: producerSpan, attributes: {} }]
+                  : undefined
               },
               { captureStackTrace: false }
             )
           )
-          const spanned = record.trace === undefined
-            ? withRunSpan
-            : withRunSpan.pipe(
-              Effect.withParentSpan(Tracer.externalSpan({
-                traceId: record.trace.traceId,
-                spanId: record.trace.spanId,
-                sampled: record.trace.sampled
-              }))
-            )
+          const spanned = attach === "parent" && producerSpan !== undefined
+            ? withRunSpan.pipe(Effect.withParentSpan(producerSpan))
+            : withRunSpan
           const handlerEffect = record.timeoutMs === undefined
             ? spanned
             : spanned.pipe(

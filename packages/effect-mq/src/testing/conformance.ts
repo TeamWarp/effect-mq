@@ -1326,7 +1326,7 @@ export const jobStoreConformance = (
     it.effect("the producer's trace context round-trips on the record", () =>
       withStore((store) =>
         Effect.gen(function*() {
-          const trace = { traceId: "trace-abc", spanId: "span-def", sampled: true }
+          const trace = { traceId: "trace-abc", spanId: "span-def", sampled: true, delayed: false }
           const { id } = yield* store.enqueue(baseRequest({ trace }))
           const job = yield* store.getJob(id)
           assert(Option.isSome(job))

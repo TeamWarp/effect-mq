@@ -526,17 +526,17 @@ const Proto = {
         )
       // The enqueue span's context rides along on the record, so the
       // handler's span joins the producing trace across processes.
-      const trace = Effect.currentSpan.pipe(
-        Effect.map((span): TraceContext | undefined => ({
+      const spanContext = Effect.currentSpan.pipe(
+        Effect.map((span) => ({
           traceId: span.traceId,
           spanId: span.spanId,
           sampled: span.sampled
         })),
         Effect.catchTag("NoSuchElementError", () => Effect.succeed(undefined))
       )
-      return Effect.all([Schema.encodeEffect(this.payloadJsonSchema)(payload), delayMs, trace]).pipe(
+      return Effect.all([Schema.encodeEffect(this.payloadJsonSchema)(payload), delayMs, spanContext]).pipe(
         Effect.orDie,
-        Effect.flatMap(([encoded, resolvedDelayMs, trace]) =>
+        Effect.flatMap(([encoded, resolvedDelayMs, capturedSpan]) =>
           Effect.flatMap(this.store, (store) =>
             store.enqueue({
               id,
@@ -556,7 +556,11 @@ const Proto = {
                 ? Duration.toMillis(options.timeout)
                 : this.defaults.timeoutMs,
               dedupe,
-              trace,
+              // `delayed` records scheduling INTENT (not queue backlog), so
+              // the worker's auto trace-linking stays deterministic.
+              trace: capturedSpan === undefined
+                ? undefined
+                : { ...capturedSpan, delayed: resolvedDelayMs > 0 } satisfies TraceContext,
               delayMs: resolvedDelayMs
             }))
         ),

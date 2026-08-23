@@ -181,7 +181,17 @@ span appears as a child of the HTTP request that scheduled it, even when
 they ran hours apart on different machines. Run spans are named
 `` `${name}.run` `` by default (configurable via
 `Worker.layer({ handlerSpanName: (ctx) => ... })`) and carry
-`effectMqJobId`, `effectMqQueue`, and `effectMqAttempt` attributes. All
+`effectMqJobId`, `effectMqQueue`, and `effectMqAttempt` attributes.
+
+How the handler span attaches follows the delay: **immediate enqueues
+continue the producer trace** (parent-child — the email handler sits inside
+the signup request's waterfall), while **explicitly delayed/`at`-scheduled
+jobs start their own trace with a causal link** back to the producer (a
+five-day-wide parent-child trace renders badly and defeats tail sampling).
+The policy keys off scheduling *intent* captured at enqueue — queue backlog
+never changes your trace shapes — and every retry attempt of a job keeps
+its mode. Override per worker with
+`Worker.layer({ traceLinking: "auto" | "parent" | "link" | "none" })`. All
 producer verbs (`enqueue`, `cancel`, `schedule`, ...) already run in their
 own spans. Wire up any Effect tracer/exporter; without one, the overhead is
 negligible. Poll-loop iterations are deliberately unspanned — the handler
@@ -549,6 +559,7 @@ by type), `priority` (higher first), `attempts`, `backoff`
 | `scheduleSweepInterval` | 15s | how often to tick due repeatable-job schedules |
 | `queueMetricsInterval` | off | sample `store.counts()` per queue into the depth gauge |
 | `handlerSpanName` | `` `${name}.run` `` | name of the span wrapping each handler run |
+| `traceLinking` | `auto` | parent for immediate jobs, causal link for delayed ones (`parent`/`link`/`none` force a mode) |
 | `id` | random | identifier used in lock tokens |
 
 **Store construction** — every driver accepts `idGenerator`, `historyTtl`,

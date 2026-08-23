@@ -295,6 +295,13 @@ export interface TraceContext {
   readonly traceId: string
   readonly spanId: string
   readonly sampled: boolean
+  /**
+   * Whether the enqueue explicitly scheduled the job for the future
+   * (`delay`/`at`). Drives the worker's `traceLinking: "auto"` policy:
+   * immediate work continues the producer trace, future work starts its own
+   * trace with a causal link.
+   */
+  readonly delayed: boolean
 }
 
 /**

@@ -11,9 +11,14 @@ bumps are additive.
   (`Tracer.externalSpan`), so producer → handler traces connect across
   processes and time. Run spans default to `` `${name}.run` ``
   (configurable via `Worker.layer({ handlerSpanName })`) and carry
-  `effectMqJobId`/`effectMqQueue`/`effectMqAttempt` attributes. Store
-  contract: `EnqueueRequest.trace` + `JobRecord.trace`; Postgres adds a
-  `trace` jsonb column (drizzle-kit diffs it).
+  `effectMqJobId`/`effectMqQueue`/`effectMqAttempt` attributes. Attachment
+  is policy-driven (`Worker.layer({ traceLinking })`, default `"auto"`):
+  immediate enqueues continue the producer trace as parent-child, while
+  explicitly delayed/`at`-scheduled jobs start their own trace with a
+  causal span link back — keyed off scheduling intent captured at enqueue,
+  so queue backlog never changes trace shapes. Store contract:
+  `EnqueueRequest.trace` + `JobRecord.trace`; Postgres adds a `trace` jsonb
+  column (drizzle-kit diffs it).
 
 - **Absolute-time scheduling** — `enqueue(payload, { at })` accepts any
   `DateTime.Input` (a zone-aware `DateTime`, `Date`, ISO string, epoch
