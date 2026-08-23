@@ -55,6 +55,7 @@ export const createTablesSql = (
     timeout_ms bigint,
     cancel_requested boolean NOT NULL DEFAULT false,
     dedupe_key text,
+    trace jsonb,
     run_at timestamptz NOT NULL,
     enqueued_at timestamptz NOT NULL,
     processed_at timestamptz,

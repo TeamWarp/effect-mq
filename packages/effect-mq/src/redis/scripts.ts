@@ -186,7 +186,8 @@ export const enqueue = Redis.script(
     dedupeKey: string,
     dedupeTtlMs: string,
     dedupeExtend: string,
-    dedupeReplace: string
+    dedupeReplace: string,
+    traceJson: string
   ) => [
     prefix,
     idMode,
@@ -205,7 +206,8 @@ export const enqueue = Redis.script(
     dedupeKey,
     dedupeTtlMs,
     dedupeExtend,
-    dedupeReplace
+    dedupeReplace,
+    traceJson
   ],
   {
     numberOfKeys: 0,
@@ -244,7 +246,7 @@ if dKey ~= "" then
       local newRunAt = now + delayMs
       redis.call("HSET", kjk, "payload", ARGV[6], "metadata", ARGV[7], "priority", ARGV[8],
         "attemptsMax", ARGV[9], "backoff", ARGV[10], "keep", ARGV[11], "timeoutMs", ARGV[12],
-        "runAt", fmt(newRunAt))
+        "trace", ARGV[19], "runAt", fmt(newRunAt))
       local keyedQueue = redis.call("HGET", kjk, "queue")
       redis.call("ZADD", delayedKey(keyedQueue), newRunAt, entryJob)
       -- A landed replace re-arms the ttl window.
@@ -286,7 +288,7 @@ redis.call("HSET", jobKey(id),
   "payload", ARGV[6], "metadata", ARGV[7], "state", state,
   "priority", ARGV[8], "attemptsMax", ARGV[9], "attemptsMade", "0", "stalledCount", "0",
   "backoff", ARGV[10], "keep", ARGV[11], "timeoutMs", ARGV[12],
-  "cancelRequested", "0", "dedupeKey", dKey, "runAt", fmt(runAt), "enqueuedAt", nowStr,
+  "cancelRequested", "0", "dedupeKey", dKey, "trace", ARGV[19], "runAt", fmt(runAt), "enqueuedAt", nowStr,
   "processedAt", "", "finishedAt", "", "exit", "", "failedReason", "",
   "lockToken", "", "lockExpiresAt", "", "seq", fmt(seq))
 redis.call("ZADD", prefix .. ":all", now, id)

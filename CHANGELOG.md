@@ -6,6 +6,15 @@ bumps are additive.
 
 ## 0.4.0 (unreleased)
 
+- **Trace propagation** — the enqueue span's `traceId`/`spanId`/`sampled`
+  persist on the job record and become the handler span's parent
+  (`Tracer.externalSpan`), so producer → handler traces connect across
+  processes and time. Run spans default to `` `${name}.run` ``
+  (configurable via `Worker.layer({ handlerSpanName })`) and carry
+  `effectMqJobId`/`effectMqQueue`/`effectMqAttempt` attributes. Store
+  contract: `EnqueueRequest.trace` + `JobRecord.trace`; Postgres adds a
+  `trace` jsonb column (drizzle-kit diffs it).
+
 - **Absolute-time scheduling** — `enqueue(payload, { at })` accepts any
   `DateTime.Input` (a zone-aware `DateTime`, `Date`, ISO string, epoch
   millis, or date parts), so "9am Monday in New York" needs no duration

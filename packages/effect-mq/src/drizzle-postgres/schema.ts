@@ -55,6 +55,7 @@ type JobState = JobStore.JobState
 type BackoffPolicy = JobStore.BackoffPolicy
 type KeepPolicy = JobStore.KeepPolicy
 type AttemptOutcome = JobStore.AttemptRecord["outcome"]
+type TraceContext = JobStore.TraceContext
 
 /**
  * Table-factory options: `extraConfig` receives the table's columns (exactly
@@ -87,6 +88,7 @@ const jobsColumns = <JobName extends string>() => ({
   timeoutMs: bigint("timeout_ms", { mode: "number" }),
   cancelRequested: boolean("cancel_requested").notNull().default(false),
   dedupeKey: text("dedupe_key"),
+  trace: jsonb("trace").$type<TraceContext>(),
   runAt: timestamp("run_at", { withTimezone: true, mode: "date" }).notNull(),
   enqueuedAt: timestamp("enqueued_at", { withTimezone: true, mode: "date" }).notNull(),
   processedAt: timestamp("processed_at", { withTimezone: true, mode: "date" }),

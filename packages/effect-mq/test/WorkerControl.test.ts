@@ -28,6 +28,7 @@ const rawRequest = (name: string, id?: string): JobStore.EnqueueRequest => ({
   keep: undefined,
   timeoutMs: undefined,
   dedupe: undefined,
+  trace: undefined,
   delayMs: 0
 })
 
@@ -433,6 +434,83 @@ describe("pause and resume", () => {
     }))
 })
 
+describe("trace propagation", () => {
+  it.effect("the handler span joins the producer's trace and carries effectMqJobId", () =>
+    Effect.gen(function*() {
+      const store = yield* MemoryJobStore.make
+      const storeLayer = Layer.succeed(JobStore.JobStore, store)
+      class Traced extends Job.make("Traced", { payload: {} }) {}
+      let seen: {
+        name: string
+        jobId: unknown
+        parentTraceId: string | undefined
+      } | undefined
+      const handlers = Traced.toLayer(() =>
+        Effect.gen(function*() {
+          const span = yield* Effect.currentSpan
+          seen = {
+            name: span.name,
+            jobId: span.attributes.get("effectMqJobId"),
+            parentTraceId: Option.isSome(span.parent) ? span.parent.value.traceId : undefined
+          }
+        }).pipe(Effect.orDie)
+      )
+
+      let producerTraceId: string | undefined
+      let jobId: JobStore.JobId | undefined
+      yield* Effect.gen(function*() {
+        yield* Effect.gen(function*() {
+          const span = yield* Effect.currentSpan
+          producerTraceId = span.traceId
+          jobId = yield* Traced.enqueue({})
+        }).pipe(Effect.withSpan("producer-business-op"))
+        yield* settle
+      }).pipe(
+        Effect.provide(
+          handlers.pipe(
+            Layer.provideMerge(Worker.layer()),
+            Layer.provideMerge(storeLayer)
+          )
+        )
+      )
+
+      assert(seen !== undefined)
+      expect(seen.name).toBe("Traced.run")
+      expect(seen.jobId).toBe(jobId)
+      // The handler's span parent chain carries the PRODUCER's trace id —
+      // producer -> handler connect across the storage boundary.
+      expect(seen.parentTraceId).toBe(producerTraceId)
+    }))
+
+  it.effect("handlerSpanName customizes the run span's name", () =>
+    Effect.gen(function*() {
+      const store = yield* MemoryJobStore.make
+      const storeLayer = Layer.succeed(JobStore.JobStore, store)
+      class Named extends Job.make("Named", { payload: {} }) {}
+      let spanName: string | undefined
+      const handlers = Named.toLayer(() =>
+        Effect.gen(function*() {
+          spanName = (yield* Effect.currentSpan).name
+        }).pipe(Effect.orDie)
+      )
+
+      yield* Effect.gen(function*() {
+        yield* Named.enqueue({})
+        yield* settle
+      }).pipe(
+        Effect.provide(
+          handlers.pipe(
+            Layer.provideMerge(Worker.layer({
+              handlerSpanName: (context) => `queue-processor ${context.queue}/${context.name}`
+            })),
+            Layer.provideMerge(storeLayer)
+          )
+        )
+      )
+      expect(spanName).toBe("queue-processor default/Named")
+    }))
+})
+
 describe("absolute-time scheduling", () => {
   it.effect("`at` runs the job at the wall-clock instant without duration math", () =>
     Effect.gen(function*() {
@@ -651,6 +729,7 @@ describe("deduplication", () => {
         keep: undefined,
         timeoutMs: undefined,
         dedupe: { key: "k", ttlMs: undefined, extend: false, replace: false },
+        trace: undefined,
         delayMs: 0
       }
       const first = yield* store.enqueue(request)

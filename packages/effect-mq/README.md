@@ -171,6 +171,22 @@ DrizzleJobStore.layer({ ...tables, historyTtl: { completed: "1 day", failed: "90
 The sweep honours `min(per-row keep.age, ceiling)`, so a job name that goes
 quiet is still pruned on the timer, not only when its group is next acked.
 
+## Tracing
+
+Producer → handler traces connect **across processes and storage**: the
+enqueue span's context (`traceId`/`spanId`/`sampled`) is persisted on the
+job record, and the worker wraps every handler run in a span whose parent
+is that external context (`Tracer.externalSpan`) — your invite handler's
+span appears as a child of the HTTP request that scheduled it, even when
+they ran hours apart on different machines. Run spans are named
+`` `${name}.run` `` by default (configurable via
+`Worker.layer({ handlerSpanName: (ctx) => ... })`) and carry
+`effectMqJobId`, `effectMqQueue`, and `effectMqAttempt` attributes. All
+producer verbs (`enqueue`, `cancel`, `schedule`, ...) already run in their
+own spans. Wire up any Effect tracer/exporter; without one, the overhead is
+negligible. Poll-loop iterations are deliberately unspanned — the handler
+run is the meaningful trace unit; per-claim spans would flood your backend.
+
 ## Metrics
 
 Workers and producers emit Effect `Metric` instruments (exported as the
@@ -532,6 +548,7 @@ by type), `priority` (higher first), `attempts`, `backoff`
 | `pollInterval` | 5s | idle fallback when no wake-up arrives (wake-ups are queue-filtered and push-based, so the default is fine even on Postgres) |
 | `scheduleSweepInterval` | 15s | how often to tick due repeatable-job schedules |
 | `queueMetricsInterval` | off | sample `store.counts()` per queue into the depth gauge |
+| `handlerSpanName` | `` `${name}.run` `` | name of the span wrapping each handler run |
 | `id` | random | identifier used in lock tokens |
 
 **Store construction** — every driver accepts `idGenerator`, `historyTtl`,

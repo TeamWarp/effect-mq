@@ -113,6 +113,7 @@ type JobRow = {
   readonly timeoutMs: number | string | null
   readonly cancelRequested: boolean
   readonly dedupeKey: string | null
+  readonly trace: JobStore.TraceContext | null
   readonly runAt: Date
   readonly enqueuedAt: Date
   readonly processedAt: Date | null
@@ -171,6 +172,7 @@ const toRecord = (row: JobRow): JobStore.JobRecord => ({
   timeoutMs: row.timeoutMs === null || row.timeoutMs === undefined ? undefined : Number(row.timeoutMs),
   cancelRequested: row.cancelRequested,
   dedupeKey: row.dedupeKey ?? undefined,
+  trace: row.trace ?? undefined,
   runAt: row.runAt.getTime(),
   enqueuedAt: row.enqueuedAt.getTime(),
   processedAt: row.processedAt?.getTime(),
@@ -220,6 +222,7 @@ export const make = (
       "timeoutMs",
       "cancelRequested",
       "dedupeKey",
+      "trace",
       "runAt",
       "enqueuedAt",
       "processedAt",
@@ -490,13 +493,15 @@ export const make = (
             : sql`'j-' || ${seqExpr}::text`
           const rows = rowsOf(yield* exec.execute<{ id: string }>(sql`
             INSERT INTO ${jobs} (id, name, queue, state, priority, payload, metadata,
-              attempts_max, backoff, keep, timeout_ms, dedupe_key, run_at, enqueued_at${extraColumnNames})
+              attempts_max, backoff, keep, timeout_ms, dedupe_key, trace, run_at, enqueued_at${extraColumnNames})
             VALUES (${idExpr}, ${request.name}, ${request.queue}, ${state}, ${request.priority},
               ${JSON.stringify(request.payload ?? null)}::jsonb, ${JSON.stringify(request.metadata)}::jsonb,
               ${request.attemptsMax},
               ${request.backoff === undefined ? null : JSON.stringify(request.backoff)}::jsonb,
               ${request.keep === undefined ? null : JSON.stringify(request.keep)}::jsonb,
-              ${request.timeoutMs ?? null}, ${request.dedupe?.key ?? null}, ${runAt}, ${now}${extraColumnValues(request)})
+              ${request.timeoutMs ?? null}, ${request.dedupe?.key ?? null},
+              ${request.trace === undefined ? null : JSON.stringify(request.trace)}::jsonb,
+              ${runAt}, ${now}${extraColumnValues(request)})
             ON CONFLICT (id) DO NOTHING
             RETURNING ${jobs.id} AS id
           `).pipe(Effect.mapError(storeError("enqueue failed"))))
@@ -572,6 +577,7 @@ export const make = (
                   backoff = ${request.backoff === undefined ? null : JSON.stringify(request.backoff)}::jsonb,
                   keep = ${request.keep === undefined ? null : JSON.stringify(request.keep)}::jsonb,
                   timeout_ms = ${request.timeoutMs ?? null},
+                  trace = ${request.trace === undefined ? null : JSON.stringify(request.trace)}::jsonb,
                   run_at = ${new Date(now.getTime() + Math.max(0, request.delayMs))}${extraColumnAssignments(request)}
                 WHERE ${jobs.id} = ${entry.jobId} AND ${jobs.state} = 'delayed'
                 RETURNING ${jobs.id} AS id, ${jobs.queue} AS "queue"
@@ -763,6 +769,7 @@ export const make = (
                 ${jobs.stalledCount} AS "stalledCount", ${jobs.backoff} AS "backoff",
                 ${jobs.keep} AS "keep", ${jobs.timeoutMs} AS "timeoutMs",
                 ${jobs.cancelRequested} AS "cancelRequested", ${jobs.dedupeKey} AS "dedupeKey",
+                ${jobs.trace} AS "trace",
                 ${jobs.runAt} AS "runAt", ${jobs.enqueuedAt} AS "enqueuedAt",
                 ${jobs.processedAt} AS "processedAt", ${jobs.finishedAt} AS "finishedAt",
                 ${jobs.exit} AS "exit", ${jobs.failedReason} AS "failedReason"

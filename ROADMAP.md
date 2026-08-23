@@ -14,10 +14,6 @@ during the initial build (BullMQ v6's Redis/Postgres backends,
   dedup rests on the slot job's row existing. Add a store op that claims the
   slot and enqueues in one transaction (`tickSchedule(key, expectedRunAt,
   next, request) -> fired`), conformance-pinned.
-- [ ] **Trace propagation** — persist `traceId`/`spanId`/`sampled` at
-  enqueue and restore the handler's span parent from it
-  (`Tracer.externalSpan`, exactly as `DurableQueue` does), so producer →
-  handler traces connect across processes.
 - [ ] **Batch enqueue** — `enqueueMany` in one round trip (one INSERT with
   multi-row VALUES); flagged as an easy perf win during the storage research.
 - [ ] **Drizzle schema customization + typed queue registry** (pair these) —

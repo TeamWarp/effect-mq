@@ -95,6 +95,7 @@ if (!available) {
           keep: undefined,
           timeoutMs: undefined,
           dedupe: undefined,
+          trace: undefined,
           delayMs: 0
         })
         yield* Fiber.join(waiter).pipe(Effect.timeout("5 seconds"))
@@ -118,6 +119,7 @@ if (!available) {
           keep: undefined,
           timeoutMs: undefined,
           dedupe: undefined,
+          trace: undefined,
           delayMs: 0
         }
         const first = yield* store.enqueue({ ...base, name: "Gen" })
@@ -156,6 +158,7 @@ if (!available) {
           keep: undefined,
           timeoutMs: undefined,
           dedupe: undefined,
+          trace: undefined,
           delayMs: 0
         }
         const { id } = yield* a.enqueue(base)
@@ -195,6 +198,7 @@ if (!available) {
           keep: undefined,
           timeoutMs: undefined,
           dedupe: undefined,
+          trace: undefined,
           delayMs: 0
         }
         const done = yield* store.enqueue({ ...base, name: "Swept" })

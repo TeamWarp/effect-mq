@@ -84,6 +84,7 @@ const toRecord = (hash: ReadonlyMap<string, string>): JobStore.JobRecord => ({
   timeoutMs: optionalNumber(hash.get("timeoutMs")),
   cancelRequested: hash.get("cancelRequested") === "1",
   dedupeKey: optionalString(hash.get("dedupeKey")),
+  trace: optionalJson<JobStore.TraceContext>(hash.get("trace")),
   runAt: Number(hash.get("runAt") ?? 0),
   enqueuedAt: Number(hash.get("enqueuedAt") ?? 0),
   processedAt: optionalNumber(hash.get("processedAt")),
@@ -277,7 +278,8 @@ export const make = (
         request.dedupe?.key ?? "",
         request.dedupe?.ttlMs === undefined ? "" : String(request.dedupe.ttlMs),
         request.dedupe?.extend === true ? "1" : "0",
-        request.dedupe?.replace === true ? "1" : "0"
+        request.dedupe?.replace === true ? "1" : "0",
+        request.trace === undefined ? "" : JSON.stringify(request.trace)
       )
 
     // Shared by cancel and cancelByDedupe.

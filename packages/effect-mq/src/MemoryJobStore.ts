@@ -55,6 +55,7 @@ interface MemJob {
   timeoutMs: number | undefined
   cancelRequested: boolean
   readonly dedupeKey: string | undefined
+  trace: JobRecord["trace"]
   runAt: number
   readonly enqueuedAt: number
   processedAt: number | undefined
@@ -85,6 +86,7 @@ const snapshot = (job: MemJob): JobRecord => ({
   timeoutMs: job.timeoutMs,
   cancelRequested: job.cancelRequested,
   dedupeKey: job.dedupeKey,
+  trace: job.trace,
   runAt: job.runAt,
   enqueuedAt: job.enqueuedAt,
   processedAt: job.processedAt,
@@ -325,6 +327,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
               keyed.backoff = request.backoff
               keyed.keep = request.keep
               keyed.timeoutMs = request.timeoutMs
+              keyed.trace = request.trace
               keyed.runAt = now + Math.max(0, request.delayMs)
               // A landed replace re-arms the ttl window.
               if (request.dedupe.ttlMs !== undefined) {
@@ -388,6 +391,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
           timeoutMs: request.timeoutMs,
           cancelRequested: false,
           dedupeKey: request.dedupe?.key,
+          trace: request.trace,
           runAt: now + Math.max(0, request.delayMs),
           enqueuedAt: now,
           processedAt: undefined,

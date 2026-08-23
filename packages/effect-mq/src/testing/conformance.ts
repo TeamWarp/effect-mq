@@ -37,6 +37,7 @@ const baseRequest = (
   keep: undefined,
   timeoutMs: undefined,
   dedupe: undefined,
+  trace: undefined,
   delayMs: 0,
   ...overrides
 })
@@ -1319,6 +1320,22 @@ export const jobStoreConformance = (
 
           // Name scoping: same key under another name is untouched.
           expect(yield* store.cancelByDedupe("OtherJob", "emp-1")).toBe(false)
+        })
+      ))
+
+    it.effect("the producer's trace context round-trips on the record", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const trace = { traceId: "trace-abc", spanId: "span-def", sampled: true }
+          const { id } = yield* store.enqueue(baseRequest({ trace }))
+          const job = yield* store.getJob(id)
+          assert(Option.isSome(job))
+          expect(job.value.trace).toEqual(trace)
+
+          const bare = yield* store.enqueue(baseRequest({ payload: { n: 2 } }))
+          const none = yield* store.getJob(bare.id)
+          assert(Option.isSome(none))
+          expect(none.value.trace).toBeUndefined()
         })
       ))
 

@@ -242,6 +242,8 @@ export interface JobRecord {
   readonly cancelRequested: boolean
   /** The dedup key this job was enqueued under, if any (see `DedupePolicy`). */
   readonly dedupeKey: string | undefined
+  /** The producer's span context, restored as the handler span's parent. */
+  readonly trace: TraceContext | undefined
   /** Epoch millis before which the job must not be claimed. */
   readonly runAt: number
   readonly enqueuedAt: number
@@ -284,6 +286,18 @@ export interface DedupePolicy {
 }
 
 /**
+ * The producer's span context, persisted at enqueue so the handler's span
+ * can join the producing trace across processes (via `Tracer.externalSpan`).
+ *
+ * @since 0.4.0
+ */
+export interface TraceContext {
+  readonly traceId: string
+  readonly spanId: string
+  readonly sampled: boolean
+}
+
+/**
  * @since 0.1.0
  */
 export interface EnqueueRequest {
@@ -304,6 +318,8 @@ export interface EnqueueRequest {
   readonly timeoutMs: number | undefined
   /** Deduplicate against other enqueues sharing `dedupe.key` (same name). */
   readonly dedupe: DedupePolicy | undefined
+  /** The producer's span context, for cross-process trace propagation. */
+  readonly trace: TraceContext | undefined
   readonly delayMs: number
 }
 

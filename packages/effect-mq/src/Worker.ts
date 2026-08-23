@@ -124,6 +124,14 @@ export interface WorkerOptions<StoreId = JobStore> {
    * sampling costs one store query per queue per tick).
    */
   readonly queueMetricsInterval?: Duration.Input | undefined
+  /**
+   * Name for the span wrapping each handler run (default
+   * `` `${context.name}.run` ``). The span carries `effectMqJobId`,
+   * `effectMqQueue`, and `effectMqAttempt` attributes and — when the
+   * producer enqueued inside a span — joins the producing trace as its
+   * child.
+   */
+  readonly handlerSpanName?: ((context: JobContext) => string) | undefined
   /** Identifier used in lock tokens (default: random). */
   readonly id?: string | undefined
 }
@@ -335,9 +343,35 @@ export const make = <StoreId = JobStore>(
           // it as a defect so it flows through normal retry accounting.
           // timeoutOrElse (not timeout + a catch on TimeoutError) so a
           // handler's OWN typed TimeoutError failure stays a typed failure.
+          // Each run gets a span (configurable name) tagged with the job
+          // id, parented on the PRODUCER's persisted span context when
+          // present — so producer -> handler traces connect across
+          // processes.
+          const withRunSpan = entry.run(record.payload, context).pipe(
+            Effect.withSpan(
+              options?.handlerSpanName?.(context) ?? `${record.name}.run`,
+              {
+                attributes: {
+                  effectMqJobId: record.id,
+                  effectMqQueue: record.queue,
+                  effectMqAttempt: context.attempt
+                }
+              },
+              { captureStackTrace: false }
+            )
+          )
+          const spanned = record.trace === undefined
+            ? withRunSpan
+            : withRunSpan.pipe(
+              Effect.withParentSpan(Tracer.externalSpan({
+                traceId: record.trace.traceId,
+                spanId: record.trace.spanId,
+                sampled: record.trace.sampled
+              }))
+            )
           const handlerEffect = record.timeoutMs === undefined
-            ? entry.run(record.payload, context)
-            : entry.run(record.payload, context).pipe(
+            ? spanned
+            : spanned.pipe(
               Effect.timeoutOrElse({
                 duration: record.timeoutMs,
                 orElse: () =>
@@ -607,6 +641,7 @@ export const make = <StoreId = JobStore>(
           keep: schedule.keep,
           timeoutMs: schedule.timeoutMs,
           dedupe: undefined,
+          trace: undefined,
           delayMs: 0
         }))
         if (!tick.duplicate) {

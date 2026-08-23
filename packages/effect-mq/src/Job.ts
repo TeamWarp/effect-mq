@@ -35,6 +35,7 @@ import {
   type BackoffPolicy,
   type DedupePolicy,
   type KeepStatePolicy,
+  type TraceContext,
   JobCancelledError,
   JobId,
   type JobNotCancellableError,
@@ -523,9 +524,19 @@ const Proto = {
             ? Duration.toMillis(options.delay)
             : this.defaults.delayMs
         )
-      return Effect.zip(Schema.encodeEffect(this.payloadJsonSchema)(payload), delayMs).pipe(
+      // The enqueue span's context rides along on the record, so the
+      // handler's span joins the producing trace across processes.
+      const trace = Effect.currentSpan.pipe(
+        Effect.map((span): TraceContext | undefined => ({
+          traceId: span.traceId,
+          spanId: span.spanId,
+          sampled: span.sampled
+        })),
+        Effect.catchTag("NoSuchElementError", () => Effect.succeed(undefined))
+      )
+      return Effect.all([Schema.encodeEffect(this.payloadJsonSchema)(payload), delayMs, trace]).pipe(
         Effect.orDie,
-        Effect.flatMap(([encoded, resolvedDelayMs]) =>
+        Effect.flatMap(([encoded, resolvedDelayMs, trace]) =>
           Effect.flatMap(this.store, (store) =>
             store.enqueue({
               id,
@@ -545,6 +556,7 @@ const Proto = {
                 ? Duration.toMillis(options.timeout)
                 : this.defaults.timeoutMs,
               dedupe,
+              trace,
               delayMs: resolvedDelayMs
             }))
         ),
