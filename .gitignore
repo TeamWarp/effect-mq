@@ -12,3 +12,7 @@ plan.md
 skills-lock.json
 package.json.dev
 .npmrc
+
+# vitepress
+docs/.vitepress/dist
+docs/.vitepress/cache

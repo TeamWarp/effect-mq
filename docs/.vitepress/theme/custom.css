@@ -1,0 +1,277 @@
+/**
+ * effect-mq docs theme: monospace minimalism.
+ *
+ * Rules of the house:
+ *  - one type family (the system mono stack), sized for reading
+ *  - black on off-white; off-white on near-black in dark mode
+ *  - zero border radii, hairline borders, no gradients, no shadows
+ */
+
+:root {
+  --mq-mono:
+    ui-monospace,
+    "SF Mono",
+    SFMono-Regular,
+    "Cascadia Mono",
+    "JetBrains Mono",
+    Menlo,
+    Consolas,
+    "Liberation Mono",
+    monospace;
+
+  --vp-font-family-base: var(--mq-mono);
+  --vp-font-family-mono: var(--mq-mono);
+
+  /* ink on paper */
+  --vp-c-bg: #faf9f5;
+  --vp-c-bg-alt: #f3f1ea;
+  --vp-c-bg-soft: #f3f1ea;
+  --vp-c-bg-elv: #faf9f5;
+
+  --vp-c-text-1: #16161d;
+  --vp-c-text-2: #4b4b4b;
+  --vp-c-text-3: #757575;
+
+  --vp-c-divider: #dedbd0;
+  --vp-c-border: #16161d;
+  --vp-c-gutter: #dedbd0;
+
+  /* "brand" is just ink */
+  --vp-c-brand-1: #16161d;
+  --vp-c-brand-2: #3c3c3c;
+  --vp-c-brand-3: #16161d;
+  --vp-c-brand-soft: rgba(22, 22, 29, 0.07);
+
+  --vp-c-tip-1: var(--vp-c-text-1);
+  --vp-c-tip-soft: var(--vp-c-brand-soft);
+
+  --vp-button-brand-bg: #16161d;
+  --vp-button-brand-text: #faf9f5;
+  --vp-button-brand-border: #16161d;
+  --vp-button-brand-hover-bg: #faf9f5;
+  --vp-button-brand-hover-text: #16161d;
+  --vp-button-brand-hover-border: #16161d;
+  --vp-button-brand-active-bg: #faf9f5;
+  --vp-button-brand-active-text: #16161d;
+  --vp-button-brand-active-border: #16161d;
+
+  --vp-button-alt-bg: transparent;
+  --vp-button-alt-text: #16161d;
+  --vp-button-alt-border: #16161d;
+  --vp-button-alt-hover-bg: #16161d;
+  --vp-button-alt-hover-text: #faf9f5;
+  --vp-button-alt-hover-border: #16161d;
+  --vp-button-alt-active-bg: #16161d;
+  --vp-button-alt-active-text: #faf9f5;
+  --vp-button-alt-active-border: #16161d;
+
+  /* hero: plain ink, no gradient clip */
+  --vp-home-hero-name-color: var(--vp-c-text-1);
+  --vp-home-hero-name-background: transparent;
+
+  --vp-code-color: var(--vp-c-text-1);
+  --vp-code-bg: rgba(22, 22, 29, 0.06);
+  --vp-code-block-bg: #f3f1ea;
+
+  --vp-custom-block-tip-border: var(--vp-c-border);
+  --vp-custom-block-tip-text: var(--vp-c-text-1);
+  --vp-custom-block-tip-bg: transparent;
+  --vp-custom-block-info-border: var(--vp-c-divider);
+  --vp-custom-block-info-bg: transparent;
+  --vp-custom-block-warning-bg: transparent;
+  --vp-custom-block-danger-bg: transparent;
+
+  --vp-nav-bg-color: var(--vp-c-bg);
+  --vp-sidebar-bg-color: var(--vp-c-bg);
+}
+
+.dark {
+  --vp-c-bg: #0e0e10;
+  --vp-c-bg-alt: #161618;
+  --vp-c-bg-soft: #161618;
+  --vp-c-bg-elv: #0e0e10;
+
+  --vp-c-text-1: #ecebe6;
+  --vp-c-text-2: #b3b2ad;
+  --vp-c-text-3: #8a8985;
+
+  --vp-c-divider: #2c2c2f;
+  --vp-c-border: #ecebe6;
+  --vp-c-gutter: #2c2c2f;
+
+  --vp-c-brand-1: #ecebe6;
+  --vp-c-brand-2: #c9c8c3;
+  --vp-c-brand-3: #ecebe6;
+  --vp-c-brand-soft: rgba(236, 235, 230, 0.09);
+
+  --vp-button-brand-bg: #ecebe6;
+  --vp-button-brand-text: #0e0e10;
+  --vp-button-brand-border: #ecebe6;
+  --vp-button-brand-hover-bg: #0e0e10;
+  --vp-button-brand-hover-text: #ecebe6;
+  --vp-button-brand-hover-border: #ecebe6;
+  --vp-button-brand-active-bg: #0e0e10;
+  --vp-button-brand-active-text: #ecebe6;
+  --vp-button-brand-active-border: #ecebe6;
+
+  --vp-button-alt-bg: transparent;
+  --vp-button-alt-text: #ecebe6;
+  --vp-button-alt-border: #ecebe6;
+  --vp-button-alt-hover-bg: #ecebe6;
+  --vp-button-alt-hover-text: #0e0e10;
+  --vp-button-alt-hover-border: #ecebe6;
+  --vp-button-alt-active-bg: #ecebe6;
+  --vp-button-alt-active-text: #0e0e10;
+  --vp-button-alt-active-border: #ecebe6;
+
+  --vp-code-bg: rgba(236, 235, 230, 0.08);
+  --vp-code-block-bg: #161618;
+}
+
+/* No rounded corners, anywhere. */
+:root :is(
+  .VPButton,
+  .VPFeature,
+  .vp-doc div[class*="language-"],
+  .vp-code-group .tabs,
+  .custom-block,
+  .VPLocalSearchBox .shell,
+  .DocSearch-Button,
+  .VPNavBarSearchButton,
+  .pager-link,
+  .vp-doc :not(pre) > code,
+  .vp-doc pre,
+  .vp-doc table,
+  .vp-doc th,
+  .vp-doc td,
+  .VPBadge,
+  .VPSwitch,
+  .VPSwitch .check,
+  .VPSwitch .icon,
+  .option,
+  img,
+  input,
+  button
+) {
+  border-radius: 0 !important;
+}
+
+/* Type: mono reads best a step smaller with generous leading. */
+:root {
+  --vp-font-size-base: 15px;
+}
+.VPDoc .vp-doc {
+  font-size: 15px;
+  line-height: 1.75;
+}
+.vp-doc h1 {
+  font-size: 26px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.vp-doc h2 {
+  font-size: 19px;
+  font-weight: 600;
+  border-top: 1px solid var(--vp-c-divider);
+  margin-top: 40px;
+  padding-top: 20px;
+}
+.vp-doc h3 {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+/* Links: underlined ink, never a color. */
+.vp-doc a {
+  color: var(--vp-c-text-1);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  font-weight: inherit;
+}
+.vp-doc a:hover {
+  color: var(--vp-c-text-2);
+}
+
+/* Hero: quiet and typographic. */
+.VPHero .name,
+.VPHero .text {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.VPHero .tagline {
+  color: var(--vp-c-text-2);
+}
+
+/* Feature cards: hairline boxes, not tiles. */
+.VPFeature {
+  border: 1px solid var(--vp-c-divider);
+  background: transparent;
+}
+.VPFeature:hover {
+  border-color: var(--vp-c-border);
+}
+
+/* Code blocks: hairline border, no floating chrome. */
+.vp-doc div[class*="language-"] {
+  border: 1px solid var(--vp-c-divider);
+}
+.vp-doc [class*="language-"] > button.copy {
+  border-radius: 0;
+  border: 1px solid var(--vp-c-divider);
+  background-color: var(--vp-code-block-bg);
+}
+.vp-doc [class*="language-"] > span.lang {
+  font-family: var(--mq-mono);
+}
+
+/* Tables: full hairline grid. */
+.vp-doc table {
+  border-collapse: collapse;
+  width: 100%;
+  display: table;
+}
+.vp-doc th,
+.vp-doc td {
+  border: 1px solid var(--vp-c-divider);
+}
+.vp-doc th {
+  background: var(--vp-c-bg-alt);
+  font-weight: 600;
+}
+.vp-doc tr:nth-child(2n) {
+  background: transparent;
+}
+
+/* Custom blocks: left rule, no fill. */
+.vp-doc .custom-block {
+  border: 1px solid var(--vp-c-divider);
+  border-left: 3px solid var(--vp-c-border);
+}
+
+/* Sidebar + nav: flat, hairline-separated. */
+.VPSidebar {
+  border-right: 1px solid var(--vp-c-divider);
+}
+.VPNavBar,
+.VPNavBar:not(.home) {
+  border-bottom: 1px solid var(--vp-c-divider);
+}
+.VPSidebarItem.level-0 > .item > .text {
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+}
+.VPSidebarItem .link:hover .text {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+/* Kill decorative transitions and shadows globally. */
+.VPNavBar,
+.VPLocalSearchBox .shell,
+.VPFlyout .menu,
+.VPMenu {
+  box-shadow: none !important;
+  border: 1px solid var(--vp-c-divider);
+}
