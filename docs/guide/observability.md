@@ -1,10 +1,10 @@
 # Tracing & metrics
 
-effect-mq is built on Effect's tracer and `Metric` primitives, so observability is wiring, not integration work: attach any Effect-compatible tracer/exporter and spans and instruments flow into your existing stack. Without one, the overhead is negligible.
+effect-mq is built on Effect's tracer and `Metric` primitives, so observability is wiring: attach any Effect-compatible tracer/exporter and spans and instruments flow into your existing stack. Without one, the overhead is negligible.
 
 ## Tracing across processes
 
-Producer → handler traces connect **across processes and storage**. When you enqueue inside a span, that span's context — `traceId`, `spanId`, `sampled` — is persisted on the job record. When a worker later claims the job (possibly hours later, on another machine), it wraps the handler run in a span attached to that external context via `Tracer.externalSpan`. Your invite handler appears in the same trace as the HTTP request that scheduled it.
+Producer → handler traces connect **across processes and storage**. When you enqueue inside a span, the store persists that span's context (`traceId`, `spanId`, `sampled`) on the job record. When a worker later claims the job (possibly hours later, on another machine), it wraps the handler run in a span attached to that external context via `Tracer.externalSpan`. Your invite handler appears in the same trace as the HTTP request that scheduled it.
 
 The run span is named `` `${name}.run` `` by default and carries three attributes:
 
@@ -24,11 +24,11 @@ const WorkerLive = Worker.layer({
 })
 ```
 
-Producer verbs (`enqueue`, `poll`, `cancel`, `schedule`, ...) already run in their own spans. The worker's claim-loop iterations are deliberately unspanned — the handler run is the meaningful trace unit, and per-claim spans would flood your backend.
+Producer verbs (`enqueue`, `poll`, `cancel`, `schedule`, ...) already run in their own spans. The worker's claim-loop iterations carry no spans: the handler run is the meaningful trace unit, and per-claim spans would flood your backend.
 
 ## How the handler span attaches
 
-A five-day-delayed job as a *child* of its producer span makes a five-day-wide trace: it renders badly and defeats tail sampling. So the attachment mode follows the delay, controlled by `Worker.layer({ traceLinking })`:
+A five-day-delayed job as a *child* of its producer span makes a five-day-wide trace: it renders badly and defeats tail sampling. The attachment mode follows the delay instead, controlled by `Worker.layer({ traceLinking })`:
 
 | Mode | Behavior |
 | --- | --- |
@@ -39,14 +39,14 @@ A five-day-delayed job as a *child* of its producer span makes a five-day-wide t
 
 Two properties make `"auto"` deterministic:
 
-- The delayed/immediate split keys off **scheduling intent captured at enqueue** — did the producer pass `delay`/`at` — not off when the job actually ran. Queue backlog never changes your trace shapes.
-- The flag is persisted on the record, so **every retry attempt keeps its mode**: attempt 3 of an immediate job is still a child of the producer span.
+- The delayed/immediate split keys off **scheduling intent captured at enqueue** (did the producer pass `delay`/`at`), not off when the job ran. Queue backlog never changes your trace shapes.
+- The store persists the flag on the record, so **every retry attempt keeps its mode**: attempt 3 of an immediate job is still a child of the producer span.
 
 ## Metrics
 
-Workers and producers emit Effect `Metric` instruments, exported as the `Metrics` module from `effect-mq`. They are **process-local operational signal, not persisted state** — they live in the emitting process's metric registry, and you export them with whatever your app already runs (the Otlp modules from `effect/unstable/observability`, `@effect/opentelemetry`, a Prometheus scraper). Retention lives in that backend.
+Workers and producers emit Effect `Metric` instruments, exported as the `Metrics` module from `effect-mq`. They are **process-local operational signal, not persisted state**: they live in the emitting process's metric registry, and you export them with whatever your app already runs (the Otlp modules from `effect/unstable/observability`, `@effect/opentelemetry`, a Prometheus scraper). Retention lives in that backend.
 
-The *durable* analogues stay in the store: `store.counts()` for live depth and the [attempts ledger](/guide/retries-and-timeouts) for per-run history — both queryable forever.
+The *durable* analogues stay in the store: `store.counts()` for live depth and the [attempts ledger](/guide/retries-and-timeouts) for per-run history, both queryable forever.
 
 | Instrument | Metric name | Type | Tags |
 | --- | --- | --- | --- |
@@ -57,20 +57,20 @@ The *durable* analogues stay in the store: `store.counts()` for live depth and t
 | `claims` | `effect_mq_claims` | counter | `queue`, `result` (claimed \| empty) |
 | `jobsInFlight` | `effect_mq_jobs_in_flight` | gauge | `queue` |
 | `queueDepth` | `effect_mq_queue_depth` | gauge | `queue`, `state` |
-| `locksLost` | `effect_mq_locks_lost` | counter | — |
-| `cancelInterrupts` | `effect_mq_cancel_interrupts` | counter | — |
+| `locksLost` | `effect_mq_locks_lost` | counter | none |
+| `cancelInterrupts` | `effect_mq_cancel_interrupts` | counter | none |
 | `stalledRecovered` | `effect_mq_stalled_recovered` | counter | `outcome` (requeued \| failed) |
 | `scheduleTicks` | `effect_mq_schedule_ticks` | counter | `name` |
 
-Everything is tagged with low-cardinality attributes only — job name, queue, outcome — never ids or keys.
+All tags are low-cardinality attributes: job name, queue, outcome. Ids and keys never appear as tags.
 
 A few of these deserve reading notes:
 
 - `job_wait_duration_ms` is the queue-latency headline: time between a job becoming runnable (past its `runAt`) and its claim.
-- `job_run_duration_ms` measures claim to ack for a single run, so payload decode and the ack round trip are included, not just handler time.
-- `job_runs{outcome="released"}` counts jobs handed back on graceful shutdown — they consumed no attempt.
+- `job_run_duration_ms` measures claim to ack for a single run, so it includes payload decode and the ack round trip on top of handler time.
+- `job_runs{outcome="released"}` counts jobs handed back on graceful shutdown; they consumed no attempt.
 - `locks_lost` counts locks found gone at heartbeat renewal; each one means a job may run twice, so a nonzero rate is worth an alert.
-- A high `claims{result="empty"}` ratio means takers outnumber work — lower `concurrency` or consolidate workers.
+- A high `claims{result="empty"}` ratio means takers outnumber work: lower `concurrency` or consolidate workers.
 
 ## Queue depth is opt-in
 
@@ -97,11 +97,11 @@ const failedRuns = Effect.gen(function*() {
 ```
 
 ::: tip
-Metric names are stable, dashboard-ready strings — build your Grafana/Prometheus queries against the `effect_mq_*` names in the table above.
+Metric names are stable, dashboard-ready strings. Build your Grafana/Prometheus queries against the `effect_mq_*` names in the table above.
 :::
 
 ## Where to next
 
-- [Retries & timeouts](/guide/retries-and-timeouts) — the attempt ledger behind the run metrics.
-- [Workers & handlers](/guide/workers) — the worker options referenced here, in context.
-- [Reference: options](/reference/options) — every `Worker.layer` knob with defaults.
+- [Retries & timeouts](/guide/retries-and-timeouts): the attempt ledger behind the run metrics.
+- [Workers & handlers](/guide/workers): the worker options referenced here, in context.
+- [Reference: options](/reference/options): every `Worker.layer` knob with defaults.

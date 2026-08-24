@@ -1,6 +1,6 @@
 # Postgres (drizzle)
 
-The Postgres store (`effect-mq/drizzle-postgres`) runs on drizzle v1's Effect driver (`drizzle-orm/effect-postgres`, built on `@effect/sql-pg` — works on Node and Bun). Its tables live inside *your* drizzle schema, so your migration pipeline owns the DDL and your product code queries the queue like any other table.
+The Postgres store (`effect-mq/drizzle-postgres`) runs on drizzle v1's Effect driver (`drizzle-orm/effect-postgres`, built on `@effect/sql-pg`; works on Node and Bun). Its tables live inside *your* drizzle schema, so your migration pipeline owns the DDL and your product code queries the queue like any other table.
 
 Install the optional peers:
 
@@ -15,7 +15,7 @@ bun add drizzle-orm@rc @effect/sql-pg@rc
 
 ## 1. Put the tables in your drizzle schema
 
-The factories are the single source of truth for the table layout. Re-export them from your schema file — the library never runs DDL, so there is no parallel migration system to reconcile with yours:
+The factories are the single source of truth for the table layout. Re-export them from your schema file. The library never runs DDL, so there is no parallel migration system to reconcile with yours:
 
 ```ts
 // db/schema.ts
@@ -31,16 +31,16 @@ export const jobQueues = mqQueueControl()       // default: effect_mq_queue_cont
 export const jobDedupe = mqDedupe()             // default: effect_mq_dedupe
 ```
 
-Then generate and run the migration exactly like any other schema change:
+Then generate and run the migration like any other schema change:
 
 ```sh
 drizzle-kit generate   # emits the CREATE TABLE migration next to your others
 drizzle-kit migrate
 ```
 
-When a future effect-mq version changes the layout, the factory changes and `drizzle-kit generate` diffs it — you get a normal, reviewable migration.
+When a future effect-mq version changes the layout, the factory changes and `drizzle-kit generate` diffs it: you get a normal, reviewable migration.
 
-Every factory takes an optional table name (the first argument — except `mqJobAttempts`, which takes the jobs table first) and an `extraConfig` callback — the same shape as drizzle's third `pgTable` argument — for your own indexes on top of the built-ins (which cover claiming, listing, metadata containment, and `name`/`state`/`finishedAt` history):
+Every factory takes an optional table name as the first argument (`mqJobAttempts` takes the jobs table first) and an `extraConfig` callback, the same shape as drizzle's third `pgTable` argument, for your own indexes on top of the built-ins (which cover claiming, listing, metadata containment, and `name`/`state`/`finishedAt` history):
 
 ```ts
 export const jobs = mqJobs<JobNames>("effect_mq_jobs", {
@@ -73,7 +73,7 @@ const JobStoreLive = DrizzleJobStore.layer({
 | --- | --- | --- |
 | `jobs`, `attempts`, `schedules`, `queues`, `dedupe` | required | the table instances from the factories above |
 | `store` | default `JobStore` | bind to a [named store](/storage/stores) key |
-| `historyTtl` | off | store-level retention ceiling — one duration or a per-state split (see [Retention](/guide/retention)) |
+| `historyTtl` | off | store-level retention ceiling: one duration or a per-state split (see [Retention](/guide/retention)) |
 | `historySweepInterval` | 1 minute | history sweep cadence |
 | `idGenerator` | `j-<seq>` | generator for store-assigned job ids |
 | `extraValues` | metadata convention | override values for `extend`ed columns |
@@ -83,7 +83,7 @@ The startup probe fails with a clear message when the tables are missing or mism
 
 ## Custom columns
 
-Need real columns — a tenant id you can FK, RLS-scope, and join — populated at job creation instead of patched in from job logic? `extend` the jobs table. At enqueue the store fills each extended column from the job's `metadata` entry with the same TS key (the definition's `metadata: (payload) => ...` is your creation-time hook), NULL when absent:
+To get real columns (a tenant id you can FK, RLS-scope, and join) populated at job creation rather than patched in from job logic, `extend` the jobs table. At enqueue the store fills each extended column from the job's `metadata` entry with the same TS key (the definition's `metadata: (payload) => ...` is your creation-time hook), NULL when absent:
 
 ```ts
 class SyncBenefits extends Job.make("sync-benefits", {
@@ -100,7 +100,7 @@ export const jobs = mqJobs<JobNames>("effect_mq_jobs", {
 })
 ```
 
-When the metadata convention isn't enough — coercions, renames — override the mapping at the store level:
+When the metadata convention isn't enough (coercions, renames), override the mapping at the store level:
 
 ```ts
 DrizzleJobStore.layer({ ...tables, extraValues: ({ metadata }) => ({ companyId: metadata.companyId }) })
@@ -110,9 +110,9 @@ The rules:
 
 - `db.select().from(jobs).where(eq(jobs.companyId, tenant))` is fully typed.
 - A dedupe `replace` rewrites the extended columns with the latest values.
-- A missing metadata key on a `NOT NULL` column fails the enqueue loudly with a `JobStoreError` — no silent partial rows.
+- A missing metadata key on a `NOT NULL` column fails the enqueue with a `JobStoreError`; no silent partial rows.
 
-Memory and Redis need nothing here — there the metadata projection is already the queryable surface (`store.list({ metadata: { companyId } })`).
+Memory and Redis need nothing here: there the metadata projection is the queryable surface (`store.list({ metadata: { companyId } })`).
 
 ## Custom job ids
 
@@ -127,19 +127,19 @@ DrizzleJobStore.layer({
 })
 ```
 
-The generator only runs for store-assigned ids — `idempotencyKey` ids and repeatable-schedule tick ids stay deterministic (exactly-once depends on them). Collisions are retried a bounded number of times, then the enqueue fails; bring real entropy.
+The generator only runs for store-assigned ids: `idempotencyKey` ids and repeatable-schedule tick ids stay deterministic (exactly-once depends on them). The store retries collisions a bounded number of times, then fails the enqueue; bring real entropy.
 
 ## How it works
 
 Three mechanics worth knowing when you operate this store:
 
-- **Claims use `FOR UPDATE SKIP LOCKED`** — any number of worker processes claim concurrently without lock contention; a partial index on `(queue, priority desc, seq)` serves the claim path.
-- **Wake-ups use LISTEN/NOTIFY, queue-filtered** — the NOTIFY payload names the queue, so an enqueue wakes only the takers watching that queue; many queues don't amplify into many claims. The worker's `pollInterval` is just the fallback (the 5s default is fine). If the LISTEN subscription drops, wake-ups degrade to polling until it resubscribes.
-- **All time arrives as bind parameters from the Effect Clock** — never SQL `now()` — so the [conformance suite](/storage/writing-a-driver) runs against real Postgres under `TestClock`.
+- **Claims use `FOR UPDATE SKIP LOCKED`**: any number of worker processes claim concurrently without lock contention; a partial index on `(queue, priority desc, seq)` serves the claim path.
+- **Wake-ups use LISTEN/NOTIFY, queue-filtered**: the NOTIFY payload names the queue, so an enqueue wakes only the takers watching that queue; many queues don't amplify into many claims. The worker's `pollInterval` is the fallback (the 5s default is fine). If the LISTEN subscription drops, wake-ups degrade to polling until it resubscribes.
+- **All time arrives as bind parameters from the Effect Clock**, never SQL `now()`, so the [conformance suite](/storage/writing-a-driver) runs against real Postgres under `TestClock`.
 
 ## Reads yes, writes no
 
-Product UIs read the tables directly with drizzle — fully typed:
+Product UIs read the tables directly with drizzle, fully typed:
 
 ```ts
 db.select().from(jobs).where(and(
@@ -153,16 +153,16 @@ db.select().from(jobAttempts)
 ```
 
 ::: warning
-Never mutate job rows yourself. Mutations must go through the store — `MyJob.retry(id)`, `store.remove(id)` — so lock tokens, attempt accounting, and wake-up notifications stay coherent.
+Never mutate job rows yourself. Mutations must go through the store (`MyJob.retry(id)`, `store.remove(id)`) so lock tokens, attempt accounting, and wake-up notifications stay coherent.
 :::
 
 ## Upgrading
 
-Layout changes ride your normal migration flow: bump effect-mq, run `drizzle-kit generate`, review the diff. 0.4.0 added the `trace` jsonb column to the jobs table (cross-process [trace propagation](/guide/observability)) — `drizzle-kit generate` picks it up as one small migration.
+Ship layout changes through your normal migration flow: bump effect-mq, run `drizzle-kit generate`, review the diff. 0.4.0 added the `trace` jsonb column to the jobs table (cross-process [trace propagation](/guide/observability)); `drizzle-kit generate` picks it up as one small migration.
 
 ## Where to next
 
-- [Multiple stores](/storage/stores) — bind jobs to named stores across infrastructures.
-- [Retention](/guide/retention) — `keep` and `historyTtl` interplay.
-- [Redis](/storage/redis) — the other production store.
-- [Writing a driver](/storage/writing-a-driver) — the conformance suite this store passes.
+- [Multiple stores](/storage/stores): bind jobs to named stores across infrastructures.
+- [Retention](/guide/retention): `keep` and `historyTtl` interplay.
+- [Redis](/storage/redis): the other production store.
+- [Writing a driver](/storage/writing-a-driver): the conformance suite this store passes.

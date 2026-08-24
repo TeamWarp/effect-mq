@@ -1,6 +1,6 @@
 # What is effect-mq?
 
-effect-mq is a background job library for [Effect](https://effect.website). You define a job once — a name, a schema-typed payload, optional success/error schemas, and defaults — then enqueue it from producers and handle it in workers, possibly in different processes on different machines, against shared storage.
+effect-mq is a background job library for [Effect](https://effect.website). You define a job once: a name, a schema-typed payload, optional success/error schemas, and defaults. You then enqueue it from producers and handle it in workers, in the same process or on different machines, against shared storage.
 
 ```ts
 class SendEmail extends Job.make("SendEmail", {
@@ -20,32 +20,32 @@ The library is one npm package, `effect-mq`, with tree-shakeable subpath modules
 | `effect-mq/redis` | Redis store over Effect's `Redis` service |
 | `effect-mq/testing` | `TestJobStore` for unit tests, driver conformance suite |
 
-The non-core subpaths declare their dependencies as optional peers — install only what you use.
+The non-core subpaths declare their dependencies as optional peers, so install only what you use.
 
 ## Why Effect-native matters
 
-Most job libraries treat the handler as an opaque callback and manage it with process-level machinery. Because effect-mq handlers are Effect fibers, the runtime can *actually control them*:
+Most job libraries treat the handler as an opaque callback and manage it with process-level machinery. effect-mq handlers are Effect fibers, so the runtime controls them:
 
-- **Timeouts interrupt the handler cleanly** — finalizers run, the attempt is recorded, retry accounting proceeds. Not something a callback-based processor can do to itself.
-- **Cancellation reaches running jobs across processes** — `MyJob.cancel(id)` flags the store; the owning worker interrupts the fiber on its next heartbeat.
+- **Timeouts interrupt the handler**: finalizers run, the worker records the attempt, and retry accounting proceeds. A callback-based processor cannot do that to itself.
+- **Cancellation reaches running jobs across processes**: `MyJob.cancel(id)` flags the store; the owning worker interrupts the fiber on its next heartbeat.
 - **Graceful shutdown releases in-flight jobs** back to `waiting` without consuming an attempt.
-- **Schemas own the payload boundary** — what you enqueue is validated and encoded; what your handler receives is decoded and typed, including `Redacted` and `DateTime` fields.
+- **Schemas own the payload boundary**: the library validates and encodes what you enqueue, and your handler receives it decoded and typed, including `Redacted` and `DateTime` fields.
 
 ## The two-sided contract
 
-A job definition is used from both sides, and the type system keeps them apart:
+Both sides use the same job definition, and the type system keeps them apart:
 
-- **Producers** call `MyJob.enqueue(payload)` / `MyJob.execute(payload)`. These require the job's *store* in context — never the `Worker`. This is enforced at the type level, so your API server can enqueue without ever depending on handler code.
+- **Producers** call `MyJob.enqueue(payload)` / `MyJob.execute(payload)`. These require the job's *store* in context, never the `Worker`. The type system enforces this, so your API server can enqueue without depending on handler code.
 - **Runners** provide `MyJob.toLayer(handler)` on top of `Worker.layer()`, bound to the same store.
 
 ## Storage is a seam, not a backend
 
-Everything the library does goes through one interface — `JobStore` — whose operations are individually atomic: claim with locks, token-guarded acks, dedup, schedule ticks. Three drivers ship in the box (Postgres via your drizzle schema, Redis via atomic Lua scripts, in-memory), and a public conformance suite of ~60 behavioral tests keeps any driver — including [yours](/storage/writing-a-driver) — honest.
+Everything the library does goes through one interface, `JobStore`, and each of its operations is atomic: claim with locks, token-guarded acks, dedup, schedule ticks. Three drivers ship in the box (Postgres via your drizzle schema, Redis via atomic Lua scripts, in-memory), and a public conformance suite of ~60 behavioral tests keeps any driver honest, including [yours](/storage/writing-a-driver).
 
-Delivery is **at-least-once**: a claimed job holds a lock that its worker heartbeats; if the worker dies, the stalled sweeper recovers the job for another attempt. Design handlers to be idempotent — the [idempotency key](/guide/defining-jobs#idempotency) and [dedup](/guide/deduplication) primitives exist to make that easy.
+Delivery is **at-least-once**: a claimed job holds a lock that its worker heartbeats; if the worker dies, the stalled sweeper recovers the job for another attempt. Design handlers to be idempotent; the [idempotency key](/guide/defining-jobs#idempotency) and [dedup](/guide/deduplication) primitives make that easy.
 
 ## Where to next
 
-- [Getting started](/guide/getting-started) — install to running worker in five minutes.
-- [Defining jobs](/guide/defining-jobs) — schemas, defaults, idempotency.
-- [Postgres](/storage/postgres) or [Redis](/storage/redis) — production storage.
+- [Getting started](/guide/getting-started): install to running worker in five minutes.
+- [Defining jobs](/guide/defining-jobs): schemas, defaults, idempotency.
+- [Postgres](/storage/postgres) or [Redis](/storage/redis): production storage.

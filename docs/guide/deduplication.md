@@ -1,12 +1,12 @@
 # Deduplication
 
-Deduplication stops redundant enqueues of the same logical work: syncing an employer's benefits twice in the same minute, rebuilding a search index for every keystroke, piling up delayed reminders for the same user. A dedup key is a **separate, name-scoped value** — it never rewrites job ids. Whatever produced the id (an explicit `jobId`, `idempotencyKey`, a store `idGenerator`, or the default sequence) stays in charge; dedup only decides whether a new enqueue creates a job at all.
+Deduplication stops redundant enqueues of the same logical work: syncing an employer's benefits twice in the same minute, or rebuilding a search index for every keystroke. A dedup key is a **separate, name-scoped value**: it never rewrites job ids. Whatever produced the id (an explicit `jobId`, `idempotencyKey`, a store `idGenerator`, or the default sequence) stays in charge; dedup only decides whether a new enqueue creates a job at all.
 
 A deduplicated enqueue is a silent no-op that returns the keyed job's id (`duplicate: true` at the store level), so producers keep a usable handle whether they created the job or joined an existing one.
 
 ## Choosing the key
 
-Set the key in the definition — derived per payload — or per enqueue. The per-enqueue value overrides the definition's callback:
+Set the key in the definition, derived per payload, or per enqueue. The per-enqueue value overrides the definition's callback:
 
 ```ts
 import { Job } from "effect-mq"
@@ -44,11 +44,11 @@ Three fields compose into four behaviors:
 
 ### Pending dedup (the default)
 
-`{ key }` alone dedupes while the keyed job is *pending* — waiting, delayed, or active. The moment that job reaches a terminal state (completed, failed, or cancelled), the key is free and the next enqueue creates a fresh job. This is the "one in flight at a time" mode: enqueue as often as you like, at most one sync per employer is ever queued or running.
+`{ key }` alone dedupes while the keyed job is *pending*: waiting, delayed, or active. The moment that job reaches a terminal state (completed, failed, or cancelled), the key is free and the next enqueue creates a fresh job. This is the "one in flight at a time" mode: enqueue as often as you like, at most one sync per employer is ever queued or running.
 
 ### Throttle
 
-Add a `ttl` and the key holds for the whole window, regardless of whether the keyed job has finished — at most one job per key per window:
+Add a `ttl` and the key holds for the whole window, whether or not the keyed job has finished, so you get at most one job per key per window:
 
 ```ts
 // At most one cache refresh per employer per five minutes:
@@ -59,23 +59,23 @@ yield* RefreshCache.enqueue({ employerId }, {
 
 ### Debounce
 
-`extend: true` (requires `ttl` — validated at enqueue) makes every deduplicated enqueue push the window out again. The first edit in a burst creates the job; every later one is dropped and re-arms the window, so the key only frees — and the next edit can only create a new job — `ttl` after the burst ends.
+`extend: true` (requires `ttl`, validated at enqueue) makes every deduplicated enqueue push the window out again. The first edit in a burst creates the job; the store drops each later one and re-arms the window, so the key frees `ttl` after the burst ends, and only then can the next edit create a new job.
 
 ### Replace while delayed
 
-`{ key, replace: true }` is latest-wins for future work. While the keyed job is still **delayed**, a new enqueue replaces its payload, `metadata`, `priority`, `attempts`, `backoff`, `keep`, `timeout`, and `delay`/`at` — same job id, run ledger preserved. If a `ttl` is set, a landed replace re-arms the window from the replace. In any other state (waiting, active), normal dedup applies: the enqueue is dropped and the existing id returned.
+`{ key, replace: true }` is latest-wins for future work. While the keyed job is still **delayed**, a new enqueue replaces its payload, `metadata`, `priority`, `attempts`, `backoff`, `keep`, `timeout`, and `delay`/`at`: same job id, run ledger preserved. With a `ttl` set, a landed replace re-arms the window from the replace. In any other state (waiting, active), normal dedup applies: the store drops the enqueue and returns the existing id.
 
-This is the mode behind the [one-shot future work pattern](/guide/repeatable-jobs#one-shot-future-work) — schedule something for later, reschedule it by enqueueing again, no job-id bookkeeping.
+This is the mode behind the [one-shot future work pattern](/guide/repeatable-jobs#one-shot-future-work): schedule something for later and reschedule it by enqueueing again, with no job-id bookkeeping.
 
 ## Cancelling by key
 
-`cancelByKey` cancels whatever pending job currently holds a dedup key. It is idempotent by design — it returns `false` when nothing pending holds the key — so "cancel it if anything is scheduled" needs no existence check:
+`cancelByKey` cancels whatever pending job holds a dedup key. It is idempotent by design: it returns `false` when nothing pending holds the key, so "cancel it if anything is scheduled" needs no existence check:
 
 ```ts
 const wasPending = yield* SyncBenefits.cancelByKey("emp-1")
 ```
 
-Cancellation semantics match [`cancel`](/guide/cancellation-and-admin): waiting/delayed jobs become terminal immediately; an active job's handler fiber is interrupted on its worker's next heartbeat.
+Cancellation semantics match [`cancel`](/guide/cancellation-and-admin): waiting/delayed jobs become terminal immediately; the worker interrupts an active job's handler fiber on its next heartbeat.
 
 ## Dedup vs `idempotencyKey`
 
@@ -84,17 +84,17 @@ Both prevent duplicates; they answer different questions and coexist on purpose:
 | | `idempotencyKey` | `dedupe` |
 | --- | --- | --- |
 | What it controls | the job **id** itself | whether an enqueue creates a job |
-| Lifetime | permanent — the id exists as long as the record does | temporal — pending state or a `ttl` window |
+| Lifetime | permanent; the id exists as long as the record does | temporal; pending state or a `ttl` window |
 | Use it for | deterministic identity, joinable from your domain tables | rate policy: one-in-flight, throttle, debounce, latest-wins |
 
 `idempotencyKey` makes enqueue a no-op while a job with that id *exists at all* (retention decides how long that is); `dedupe` is policy with its own lifecycle and never touches the id. See [Defining jobs](/guide/defining-jobs) for the idempotency side.
 
 ::: tip
-On Postgres, dedup adds one table and one jobs column — export `mqDedupe()` from your schema and `drizzle-kit generate` diffs both into one migration. Memory and Redis need nothing. See [Postgres](/storage/postgres).
+On Postgres, dedup adds one table and one jobs column: export `mqDedupe()` from your schema and `drizzle-kit generate` diffs both into one migration. Memory and Redis need nothing. See [Postgres](/storage/postgres).
 :::
 
 ## Where to next
 
-- [Repeatable jobs](/guide/repeatable-jobs) — cron/interval schedules, and the replace + `at` + `cancelByKey` one-shot pattern.
-- [Enqueueing](/guide/enqueueing) — `delay`, `at`, priorities, and the rest of the enqueue options.
-- [Cancellation & admin](/guide/cancellation-and-admin) — `cancel`, `promote`, pause/resume.
+- [Repeatable jobs](/guide/repeatable-jobs): cron/interval schedules, and the replace + `at` + `cancelByKey` one-shot pattern.
+- [Enqueueing](/guide/enqueueing): `delay`, `at`, priorities, and the rest of the enqueue options.
+- [Cancellation & admin](/guide/cancellation-and-admin): `cancel`, `promote`, pause/resume.

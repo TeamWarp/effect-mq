@@ -6,11 +6,11 @@ Install the package:
 bun add effect-mq        # or npm install / pnpm add / yarn add
 ```
 
-`effect-mq` targets **Effect v4** (`effect@4.0.0-rc`). The Postgres and Redis stores have optional peer dependencies — you'll add those in the storage step.
+`effect-mq` targets **Effect v4** (`effect@4.0.0-rc`). The Postgres and Redis stores have optional peer dependencies; you'll add those in the storage step.
 
 ## 1. Define a job
 
-A job is a class: a tag, a payload schema, and defaults. The definition is shared by everyone who enqueues it and whoever runs it.
+A job is a class: a tag, a payload schema, and defaults. Producers and runners share this one definition.
 
 ```ts
 import { Job } from "effect-mq"
@@ -29,17 +29,17 @@ class SendEmail extends Job.make("SendEmail", {
 }) {}
 ```
 
-Payloads are real schemas: `Redacted`, `DateTimeUtc`, branded types, unions — all round-trip through storage and come back typed in the handler.
+Payloads are real schemas. `Redacted`, `DateTimeUtc`, branded types, and unions round-trip through storage and come back typed in the handler.
 
 ## 2. Enqueue from anywhere
 
-Producers need the job's **store** in context — never the worker. That means your API server can enqueue without depending on any handler code.
+Producers need the job's **store** in context, never the worker. Your API server can enqueue without depending on any handler code.
 
 ```ts
 import { Effect } from "effect"
 
 const program = Effect.gen(function*() {
-  // fire and forget — returns the JobId
+  // fire and forget: returns the JobId
   const jobId = yield* SendEmail.enqueue({ to: "ada@example.com", subject: "hi" })
 
   // ...or enqueue and await the typed result
@@ -54,7 +54,7 @@ Thanks to `idempotencyKey`, enqueueing the same email twice is a no-op that retu
 
 ## 3. Run a worker
 
-Handlers are Effects; workers are Layers. Compose them wherever you deploy — same process or a dedicated machine.
+Handlers are Effects; workers are Layers. Compose them wherever you deploy: same process or a dedicated machine.
 
 ```ts
 import { Worker, MemoryJobStore } from "effect-mq"
@@ -69,11 +69,11 @@ const RunnerLive = SendEmail.toLayer(
 )
 ```
 
-Provide `RunnerLive` to your app and the worker claims, runs, retries, and records jobs. Interrupting the layer's scope shuts down gracefully: in-flight jobs are released back to `waiting` without consuming an attempt.
+Provide `RunnerLive` to your app and the worker claims, runs, retries, and records jobs. Interrupting the layer's scope triggers a graceful shutdown: the worker releases in-flight jobs back to `waiting` without consuming an attempt.
 
 ## 4. Pick real storage
 
-`MemoryJobStore` is for tests and demos. For production, swap the layer — nothing else changes:
+`MemoryJobStore` is for tests and demos. For production, swap the layer; nothing else changes:
 
 ::: code-group
 
@@ -110,11 +110,11 @@ const status = yield* SendEmail.poll(jobId)        // Option<JobStatus>
 const runs = yield* SendEmail.attempts(jobId)      // the decoded run ledger
 ```
 
-Every attempt — success, retry, failure, stall — is persisted and decodes back to a typed exit.
+Every attempt (success, retry, failure, stall) is persisted and decodes back to a typed exit.
 
 ## Where to next
 
-- [Defining jobs](/guide/defining-jobs) — everything `Job.make` accepts.
-- [Enqueueing](/guide/enqueueing) — delays, absolute times, priorities, batches.
-- [Workers & handlers](/guide/workers) — concurrency, locks, shutdown.
-- [Testing your app](/guide/testing) — assert what your services enqueue, without a worker.
+- [Defining jobs](/guide/defining-jobs): everything `Job.make` accepts.
+- [Enqueueing](/guide/enqueueing): delays, absolute times, priorities, batches.
+- [Workers & handlers](/guide/workers): concurrency, locks, shutdown.
+- [Testing your app](/guide/testing): assert what your services enqueue, without a worker.
