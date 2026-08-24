@@ -4,7 +4,7 @@ All notable changes to `effect-mq`. Versions follow 0.x semver: **minor
 bumps may break** (the `JobStore` driver contract in particular); patch
 bumps are additive.
 
-## 0.4.2 (unreleased)
+## 0.4.2 — 2026-08-24
 
 - **Failure logging + `onJobFailure` hook** — workers now log every failed
   run through Effect's logger: `logWarning` while retries remain (with the
