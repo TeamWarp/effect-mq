@@ -102,7 +102,8 @@ export default defineConfig({
     },
     outline: { level: [2, 3] },
     footer: {
-      message: "Released under the MIT License."
+      message:
+        'Released under the MIT License.<br>Made with ❤️ by <a href="https://www.warp.co/careers#open-roles">Warp (We\'re hiring)</a>.'
     }
   }
 })
