@@ -41,12 +41,17 @@ during the initial build (BullMQ v6's Redis/Postgres backends,
 
 ## P2 — scale & topology
 
-- [ ] **Parent-child fan-out (flows)** — `waiting-children` state +
-  dependency table (parent key, child key, status, returned value); children
-  decrement the parent's pending count in their ack transaction; per-child
-  failure policies (fail/continue/ignore parent). Known trap from BullMQ's PG
+- [ ] **Parent-child fan-out (flows), cross-store** — a parent job fans out
+  N children (possibly on a *different store*: Postgres cron parent → 10k
+  Redis email children), suspends in `waiting-children`, and resumes with
+  typed results. The parent's store owns the flow (manifest, per-child
+  results, pending counter), so settle-exactly-once is single-store atomic;
+  cross-store needs only at-least-once idempotent reports. Full build-ready
+  design: [designs/parent-child-flows.md](./designs/parent-child-flows.md)
+  (two-phase `fanOut`/`collect` handler, `Flow.make`, store ops, crash
+  matrix, fail-fast semantics, v2 outbox relay). Known trap from BullMQ's PG
   backend: child-finish vs parent-removal deadlocks through the FK cascade —
-  serialize on a per-parent advisory lock.
+  serialize on a per-parent lock ordering.
 - [ ] **Global queue concurrency + rate limiting** — store-enforced "≤ N
   active per queue" checked in `claim` (today concurrency is per-worker), and
   a `{ max, duration }` limiter with `claim` returning the retry-after so
