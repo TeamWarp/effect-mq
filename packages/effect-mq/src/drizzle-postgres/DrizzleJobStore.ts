@@ -136,6 +136,7 @@ type ScheduleRow = {
   readonly backoff: JobStore.BackoffPolicy | null
   readonly keep: JobStore.KeepPolicy | null
   readonly timeoutMs: number | string | null
+  readonly group: string | null
   readonly nextRunAt: Date
 }
 
@@ -153,6 +154,7 @@ const toSchedule = (row: ScheduleRow): JobStore.ScheduleRecord => ({
   backoff: row.backoff ?? undefined,
   keep: row.keep ?? undefined,
   timeoutMs: row.timeoutMs === null ? undefined : Number(row.timeoutMs),
+  group: row.group ?? undefined,
   nextRunAt: row.nextRunAt.getTime()
 })
 
@@ -1340,20 +1342,21 @@ export const make = (
       upsertSchedule: (schedule) =>
         db.execute(sql`
           INSERT INTO ${schedules} (key, job_name, queue, cron, tz, every_ms, payload, metadata,
-            priority, attempts_max, backoff, keep, timeout_ms, next_run_at)
+            priority, attempts_max, backoff, keep, timeout_ms, group_name, next_run_at)
           VALUES (${schedule.key}, ${schedule.jobName}, ${schedule.queue},
             ${schedule.cron ?? null}, ${schedule.tz ?? null}, ${schedule.everyMs ?? null},
             ${JSON.stringify(schedule.payload ?? null)}::jsonb, ${JSON.stringify(schedule.metadata)}::jsonb,
             ${schedule.priority}, ${schedule.attemptsMax},
             ${schedule.backoff === undefined ? null : JSON.stringify(schedule.backoff)}::jsonb,
             ${schedule.keep === undefined ? null : JSON.stringify(schedule.keep)}::jsonb,
-            ${schedule.timeoutMs ?? null}, ${new Date(schedule.nextRunAt)})
+            ${schedule.timeoutMs ?? null}, ${schedule.group ?? null}, ${new Date(schedule.nextRunAt)})
           ON CONFLICT (key) DO UPDATE SET
             job_name = EXCLUDED.job_name, queue = EXCLUDED.queue, cron = EXCLUDED.cron,
             tz = EXCLUDED.tz, every_ms = EXCLUDED.every_ms, payload = EXCLUDED.payload,
             metadata = EXCLUDED.metadata, priority = EXCLUDED.priority,
             attempts_max = EXCLUDED.attempts_max, backoff = EXCLUDED.backoff,
             keep = EXCLUDED.keep, timeout_ms = EXCLUDED.timeout_ms,
+            group_name = EXCLUDED.group_name,
             next_run_at = CASE
               WHEN ${schedules.cron} IS NOT DISTINCT FROM EXCLUDED.cron
                 AND ${schedules.tz} IS NOT DISTINCT FROM EXCLUDED.tz
@@ -1383,6 +1386,9 @@ export const make = (
           if (listOptions?.queue !== undefined) {
             conditions.push(sql`${schedules.queue} = ${listOptions.queue}`)
           }
+          if (listOptions?.group !== undefined) {
+            conditions.push(sql`${schedules.group} = ${listOptions.group}`)
+          }
           const rows = rowsOf(yield* db.execute<ScheduleRow>(sql`
             SELECT ${schedules.key} AS "key", ${schedules.jobName} AS "jobName",
               ${schedules.queue} AS "queue", ${schedules.cron} AS "cron", ${schedules.tz} AS "tz",
@@ -1390,7 +1396,7 @@ export const make = (
               ${schedules.metadata} AS "metadata", ${schedules.priority} AS "priority",
               ${schedules.attemptsMax} AS "attemptsMax", ${schedules.backoff} AS "backoff",
               ${schedules.keep} AS "keep", ${schedules.timeoutMs} AS "timeoutMs",
-              ${schedules.nextRunAt} AS "nextRunAt"
+              ${schedules.group} AS "group", ${schedules.nextRunAt} AS "nextRunAt"
             FROM ${schedules}
             WHERE ${sql.join(conditions, sql` AND `)}
             ORDER BY ${schedules.key}
@@ -1408,7 +1414,7 @@ export const make = (
               ${schedules.metadata} AS "metadata", ${schedules.priority} AS "priority",
               ${schedules.attemptsMax} AS "attemptsMax", ${schedules.backoff} AS "backoff",
               ${schedules.keep} AS "keep", ${schedules.timeoutMs} AS "timeoutMs",
-              ${schedules.nextRunAt} AS "nextRunAt"
+              ${schedules.group} AS "group", ${schedules.nextRunAt} AS "nextRunAt"
             FROM ${schedules}
             WHERE ${schedules.nextRunAt} <= ${now}
             ORDER BY ${schedules.nextRunAt} ASC

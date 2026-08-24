@@ -107,6 +107,7 @@ const toSchedule = (hash: ReadonlyMap<string, string>): JobStore.ScheduleRecord 
   backoff: optionalJson<JobStore.BackoffPolicy>(hash.get("backoff")),
   keep: optionalJson<JobStore.KeepPolicy>(hash.get("keep")),
   timeoutMs: optionalNumber(hash.get("timeoutMs")),
+  group: optionalString(hash.get("group")),
   nextRunAt: Number(hash.get("nextRunAt") ?? 0)
 })
 
@@ -746,6 +747,7 @@ export const make = (
           schedule.backoff === undefined ? "" : JSON.stringify(schedule.backoff),
           schedule.keep === undefined ? "" : JSON.stringify(schedule.keep),
           schedule.timeoutMs === undefined ? "" : String(schedule.timeoutMs),
+          schedule.group ?? "",
           schedule.nextRunAt
         ).pipe(
           Effect.mapError(storeError("upsertSchedule failed")),

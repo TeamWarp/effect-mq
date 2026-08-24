@@ -753,7 +753,8 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
       Effect.sync(() =>
         Array.from(schedules.values()).filter((schedule) =>
           (options?.jobName === undefined || schedule.jobName === options.jobName) &&
-          (options?.queue === undefined || schedule.queue === options.queue)
+          (options?.queue === undefined || schedule.queue === options.queue) &&
+          (options?.group === undefined || schedule.group === options.group)
         )
       ),
 

@@ -450,6 +450,12 @@ export interface ScheduleRecord {
   readonly backoff: BackoffPolicy | undefined
   readonly keep: KeepPolicy | undefined
   readonly timeoutMs: number | undefined
+  /**
+   * Ownership label for declarative reconciliation (`JobSchedules.layer`):
+   * a reconciler only ever prunes schedules carrying ITS group. Unlabeled
+   * schedules (plain `.schedule()` calls) are never pruned.
+   */
+  readonly group: string | undefined
   /** Epoch millis of the next occurrence to enqueue. */
   readonly nextRunAt: number
 }
@@ -796,6 +802,8 @@ export interface Service {
   readonly listSchedules: (options?: {
     readonly jobName?: string | undefined
     readonly queue?: QueueName | undefined
+    /** Only schedules carrying this ownership group. */
+    readonly group?: string | undefined
   }) => Effect.Effect<ReadonlyArray<ScheduleRecord>, JobStoreError>
 
   /** Schedules whose `nextRunAt` is due (per the Effect `Clock`). */

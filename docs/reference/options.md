@@ -55,6 +55,19 @@ Passed to `MyJob.schedule(key, options)`. Set exactly one of `cron` or `every`; 
 | `backoff` | immediate | Retry backoff for each occurrence |
 | `keep` | keep forever | Retention for each occurrence's terminal record |
 | `timeout` | none | Per-run limit for each occurrence |
+| `group` | none | Ownership label for reconciliation; set by `JobSchedules.layer`, unlabeled rows are never pruned |
+
+## `JobSchedules.layer(options)`
+
+Declarative schedule reconciliation; see [Repeatable jobs](/guide/repeatable-jobs#declaring-the-full-set-reconciliation).
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `group` | required | Ownership label; the layer only prunes schedules carrying this group |
+| `schedules` | required | The full declared set: `JobSchedules.schedule(job, key, options)` entries |
+| `removal` | `"warn"` | `"warn"` logs undeclared group members; `"group"` prunes them |
+| `removeAfter` | none | Grace window before pruning (requires `removal: "group"`) |
+| `stores` | none | Extra store keys to reconcile when no entry references them |
 
 ## `Worker.layer(options)`
 

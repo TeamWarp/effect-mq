@@ -201,6 +201,8 @@ const schedulesColumns = <JobName extends string, Queue extends string>() => ({
   backoff: jsonb("backoff").$type<BackoffPolicy>(),
   keep: jsonb("keep").$type<KeepPolicy>(),
   timeoutMs: bigint("timeout_ms", { mode: "number" }),
+  /** Ownership label for declarative reconciliation; NULL = never pruned. */
+  group: text("group_name"),
   nextRunAt: timestamp("next_run_at", { withTimezone: true, mode: "date" }).notNull()
 })
 

@@ -52,19 +52,6 @@ during the initial build (BullMQ v6's Redis/Postgres backends,
   matrix, fail-fast semantics, v2 outbox relay). Known trap from BullMQ's PG
   backend: child-finish vs parent-removal deadlocks through the FK cascade —
   serialize on a per-parent lock ordering.
-- [ ] **Declarative schedule reconciliation** — `JobSchedules.layer({ group,
-  schedules, removal })`: declare the full schedule set for a service; on
-  startup the layer upserts everything declared (already idempotent and
-  cadence-preserving) and handles *deletion drift* — the schedule whose
-  `.schedule()` call was deleted from code but keeps firing forever. Safety
-  design, settled in discussion: pruning is scoped to an ownership `group`
-  (new nullable field on `ScheduleRecord` + `listSchedules({ group })`;
-  plain `.schedule()` rows are unlabeled and never pruned), the default
-  `removal: "warn"` only logs undeclared group members (destructive pruning
-  is an explicit opt-in via `"group"`), and an optional grace window
-  (`removeAfter`) keeps rolling deploys — old and new replicas reconciling
-  different lists — from thrash-pruning, which matters because re-adding an
-  `every` schedule re-anchors its grid.
 - [ ] **Global queue concurrency + rate limiting** — store-enforced "≤ N
   active per queue" checked in `claim` (today concurrency is per-worker), and
   a `{ max, duration }` limiter with `claim` returning the retry-after so

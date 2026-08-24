@@ -12,6 +12,14 @@
 export * as Job from "./Job.ts"
 
 /**
+ * Declarative schedule reconciliation: declare a service's full schedule
+ * set as a layer; startup upserts it and detects deletion drift.
+ *
+ * @since 0.5.0
+ */
+export * as JobSchedules from "./JobSchedules.ts"
+
+/**
  * The storage seam: the `JobStore` service, job records and typed errors.
  *
  * @since 0.1.0

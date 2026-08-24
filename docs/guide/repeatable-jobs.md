@@ -61,6 +61,33 @@ Re-registering an existing key with an **unchanged cadence** (same `cron`/`tz`/`
 The payload and options are part of the row: re-registering with a new payload replaces what future occurrences run with, even when the cadence is unchanged. On deploy that is usually what you want; don't expect two processes registering *different* payloads under one key to coexist.
 :::
 
+## Declaring the full set: reconciliation
+
+`.schedule()` creates and updates, but a schedule whose call was deleted from code keeps firing forever. `JobSchedules.layer` declares a service's full schedule set; on startup it upserts everything declared and detects the drift:
+
+```ts
+import { JobSchedules } from "effect-mq"
+
+const SchedulesLive = JobSchedules.layer({
+  group: "billing-service",
+  schedules: [
+    JobSchedules.schedule(SendDigest, "daily", { cron: "0 9 * * *", payload: {} }),
+    JobSchedules.schedule(GenerateInvoice, "monthly", { cron: "0 0 1 * *", payload: {} })
+  ],
+  removal: "group",           // default "warn": log drift, prune nothing
+  removeAfter: "10 minutes"   // grace window for rolling deploys
+})
+```
+
+The safety model rests on the ownership `group`:
+
+- The layer only ever prunes schedules carrying *its own* group. Plain `.schedule()` calls are unlabeled and never pruned; other groups' schedules are never touched. Use one group per service.
+- The default `removal: "warn"` logs undeclared group members and removes nothing. Destructive pruning is the explicit `removal: "group"` opt-in.
+- `removeAfter` delays the prune and re-checks the store when it fires. During a rolling deploy, replicas on the previous release re-declare schedules the new release dropped; pruning immediately and re-adding would re-anchor `every` grids. Shutting down before the window fires skips the prune; the next startup re-evaluates.
+- Reconciliation reaches the stores your entries reference. When a release drops the last schedule a store had, pass the store key in `stores: [Durable]` so drift detection still runs there.
+
+Upserts stay cadence-preserving, so running the layer on every deploy never re-anchors unchanged schedules. Duplicate declarations and `removeAfter` without the `"group"` opt-in fail loudly at startup.
+
 ## One-shot future work
 
 Some future-dated work runs once. For "run once at time T, reschedulable and cancellable" (a signup invite, a trial-expiry email), skip the schedule row and combine three primitives: a [`replace` dedup key](/guide/deduplication#replace-while-delayed), an absolute `at`, and `cancelByKey`:

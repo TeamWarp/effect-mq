@@ -436,6 +436,7 @@ if (!available) {
           backoff: undefined,
           keep: undefined,
           timeoutMs: undefined,
+          group: undefined,
           nextRunAt: 0
         })
         const fired = yield* store.tickSchedule(

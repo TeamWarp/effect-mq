@@ -94,6 +94,7 @@ export const createTablesSql = (
     backoff jsonb,
     keep jsonb,
     timeout_ms bigint,
+    group_name text,
     next_run_at timestamptz NOT NULL
   )`,
   `CREATE INDEX "${schedules}_due_idx" ON "${schedules}" (next_run_at)`,

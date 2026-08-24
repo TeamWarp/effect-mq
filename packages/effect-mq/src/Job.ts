@@ -352,6 +352,12 @@ export interface ScheduleOptions<PayloadInput> {
   readonly keep?: KeepInput | undefined
   /** Per-run execution time limit for each occurrence. */
   readonly timeout?: Duration.Input | undefined
+  /**
+   * Ownership label for declarative reconciliation: `JobSchedules.layer`
+   * prunes only schedules carrying its own group. Unlabeled schedules are
+   * never pruned. Usually set by `JobSchedules`, not by hand.
+   */
+  readonly group?: string | undefined
 }
 
 /**
@@ -984,6 +990,7 @@ const Proto = {
         timeoutMs: options.timeout !== undefined
           ? Duration.toMillis(options.timeout)
           : self.defaults.timeoutMs,
+        group: options.group,
         nextRunAt
       }
       const store = yield* self.store

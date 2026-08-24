@@ -833,6 +833,7 @@ export const upsertSchedule = Redis.script(
     backoffJson: string,
     keepJson: string,
     timeoutMs: string,
+    group: string,
     nextRunAt: number
   ) => [
     prefix,
@@ -849,6 +850,7 @@ export const upsertSchedule = Redis.script(
     backoffJson,
     keepJson,
     timeoutMs,
+    group,
     nextRunAt
   ],
   {
@@ -856,7 +858,7 @@ export const upsertSchedule = Redis.script(
     lua: `${HELPERS}
 local key = ARGV[2]
 local sk = prefix .. ":schedule:" .. key
-local nextRunAt = tonumber(ARGV[15])
+local nextRunAt = tonumber(ARGV[16])
 local prevCron = redis.call("HGET", sk, "cron")
 if prevCron ~= false
   and prevCron == ARGV[5]
@@ -872,7 +874,7 @@ redis.call("HSET", sk,
   "payload", ARGV[8], "metadata", ARGV[9],
   "priority", ARGV[10], "attemptsMax", ARGV[11],
   "backoff", ARGV[12], "keep", ARGV[13], "timeoutMs", ARGV[14],
-  "nextRunAt", fmt(nextRunAt))
+  "group", ARGV[15], "nextRunAt", fmt(nextRunAt))
 redis.call("ZADD", prefix .. ":schedules", nextRunAt, key)
 return '{"ok":true}'
 `
@@ -908,6 +910,7 @@ for _, key in ipairs(keys) do
   local matches = true
   if filters.jobName ~= nil and byName.jobName ~= filters.jobName then matches = false end
   if matches and filters.queue ~= nil and byName.queue ~= filters.queue then matches = false end
+  if matches and filters.group ~= nil and byName.group ~= filters.group then matches = false end
   if matches then out[#out + 1] = record end
 end
 if #out == 0 then return "[]" end

@@ -805,6 +805,7 @@ export const jobStoreConformance = (
             backoff: { _tag: "fixed", delayMs: 1_000 },
             keep: undefined,
             timeoutMs: 5_000,
+            group: undefined,
             nextRunAt: 60_000
           }
           yield* store.upsertSchedule(schedule)
@@ -847,8 +848,48 @@ export const jobStoreConformance = (
       backoff: undefined,
       keep: undefined,
       timeoutMs: undefined,
+      group: undefined,
       nextRunAt: 60_000
     })
+
+    it.effect("schedule group labels persist and filter listSchedules", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const base = minutelySchedule()
+          yield* store.upsertSchedule({
+            ...base,
+            key: JobStore.ScheduleKey("TestJob/labeled"),
+            group: "svc-a"
+          })
+          yield* store.upsertSchedule({
+            ...base,
+            key: JobStore.ScheduleKey("TestJob/other"),
+            group: "svc-b"
+          })
+          yield* store.upsertSchedule({ ...base, key: JobStore.ScheduleKey("TestJob/plain") })
+
+          const labeled = yield* store.listSchedules({ group: "svc-a" })
+          expect(labeled.map((schedule) => schedule.key)).toEqual(["TestJob/labeled"])
+          expect(labeled[0]?.group).toBe("svc-a")
+
+          const all = yield* store.listSchedules()
+          expect(all).toHaveLength(3)
+          expect(all.find((schedule) => schedule.key === "TestJob/plain")?.group).toBeUndefined()
+
+          // Re-upsert relabels; an unchanged cadence still keeps its next
+          // occurrence (the reconciler re-registers on every startup).
+          yield* store.upsertSchedule({
+            ...base,
+            key: JobStore.ScheduleKey("TestJob/labeled"),
+            group: "svc-c",
+            nextRunAt: 999_999
+          })
+          const relabeled = yield* store.listSchedules({ group: "svc-c" })
+          expect(relabeled.map((schedule) => schedule.key)).toEqual(["TestJob/labeled"])
+          expect(relabeled[0]?.nextRunAt).toBe(60_000)
+          expect(yield* store.listSchedules({ group: "svc-a" })).toEqual([])
+        })
+      ))
 
     it.effect("tickSchedule fires a slot exactly once and advances atomically", () =>
       withStore((store) =>
@@ -1226,6 +1267,7 @@ export const jobStoreConformance = (
             backoff: undefined,
             keep: undefined,
             timeoutMs: undefined,
+            group: undefined,
             nextRunAt: 60_000
           }
           yield* store.upsertSchedule(base)
@@ -1261,6 +1303,7 @@ export const jobStoreConformance = (
             backoff: undefined,
             keep: undefined,
             timeoutMs: undefined,
+            group: undefined,
             nextRunAt: 90_000
           }
           const cronSchedule: JobStore.ScheduleRecord = {
@@ -1352,6 +1395,7 @@ export const jobStoreConformance = (
             backoff: undefined,
             keep: undefined,
             timeoutMs: undefined,
+            group: undefined,
             nextRunAt: 60_000
           }
           yield* store.upsertSchedule(schedule)

@@ -4,6 +4,23 @@ All notable changes to `effect-mq`. Versions follow 0.x semver: **minor
 bumps may break** (the `JobStore` driver contract in particular); patch
 bumps are additive.
 
+## 0.5.0 (unreleased)
+
+- **Declarative schedule reconciliation** — `JobSchedules.layer({ group,
+  schedules, removal, removeAfter, stores })` declares a service's full
+  schedule set: startup upserts everything declared (idempotent,
+  cadence-preserving) and detects deletion drift, the schedule whose
+  `.schedule()` call was deleted from code but keeps firing. Pruning is
+  scoped to the ownership `group`: unlabeled schedules (plain `.schedule()`)
+  and other groups are never touched, the default `removal: "warn"` only
+  logs, and destructive pruning is the explicit `removal: "group"` opt-in
+  with an optional `removeAfter` grace window that keeps rolling deploys
+  from thrash-pruning (the deferred prune re-checks the store when it
+  fires and dies with the layer scope). Store contract (breaking for
+  driver authors): `ScheduleRecord.group` + `listSchedules({ group })`;
+  `ScheduleOptions.group` on `Job.schedule`. Postgres adds a nullable
+  `group_name` column to the schedules table (one drizzle-kit migration).
+
 ## 0.4.2 — 2026-08-24
 
 - **Failure logging + `onJobFailure` hook** — workers now log every failed
