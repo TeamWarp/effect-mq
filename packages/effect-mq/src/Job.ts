@@ -89,6 +89,28 @@ export interface BackoffInput {
 }
 
 /**
+ * The `error` option for `Job.make`: one schema, or a list of schemas the
+ * definition unions for you — the tagged-error-list style of Effect's
+ * `HttpApiEndpoint`:
+ *
+ * ```ts
+ * error: PaymentDeclined
+ * error: [InvoiceNotFound, PaymentDeclined, ProviderTimeout]
+ * ```
+ *
+ * @since 0.4.2
+ */
+export type ErrorInput = Schema.Top | ReadonlyArray<Schema.Top>
+
+/**
+ * The schema a job actually carries for its `error` option: lists become a
+ * `Schema.Union` of their members, single schemas pass through.
+ *
+ * @since 0.4.2
+ */
+export type ResolvedError<E extends ErrorInput> = E extends ReadonlyArray<Schema.Top> ? Schema.Union<E> : E
+
+/**
  * User-facing retention configuration for terminal jobs.
  *
  * @since 0.1.0
@@ -1051,7 +1073,7 @@ export const make = <
   const Name extends string,
   Payload extends Schema.Struct.Fields | AnyStructSchema,
   Success extends Schema.Top = Schema.Void,
-  Error extends Schema.Top = Schema.Never,
+  Error extends ErrorInput = Schema.Never,
   StoreId = JobStore
 >(
   name: Name,
@@ -1060,7 +1082,11 @@ export const make = <
     readonly payload: Payload
     /** Schema for the handler's success value (decodable via `awaitResult`/`attempts`). Default `Schema.Void`. */
     readonly success?: Success | undefined
-    /** Schema for the handler's typed failure (round-trips through storage). Default `Schema.Never`. */
+    /**
+     * Schema for the handler's typed failure — one schema, or a list of
+     * schemas unioned for you (round-trips through storage). Default
+     * `Schema.Never`.
+     */
     readonly error?: Error | undefined
     /**
      * Derive a stable job id from the payload. Enqueueing the same key twice
@@ -1099,7 +1125,7 @@ export const make = <
      */
     readonly retryable?:
       | ((
-        error: Error["Type"]
+        error: ResolvedError<Error>["Type"]
       ) => boolean)
       | undefined
     /** The queue this job runs on. Default `"default"`. */
@@ -1116,7 +1142,7 @@ export const make = <
   Name,
   Payload extends Schema.Struct.Fields ? Schema.Struct<Payload> : Payload,
   Success,
-  Error,
+  ResolvedError<Error>,
   StoreId
 > => {
   // SAFETY: `Schema.isSchema` discriminates the `Payload` union at runtime;
@@ -1126,7 +1152,14 @@ export const make = <
     ? options.payload as AnyStructSchema
     : Schema.Struct(options.payload as Schema.Struct.Fields)
   const successSchema = options.success ?? Schema.Void
-  const errorSchema = options.error ?? Schema.Never
+  // SAFETY: `Array.isArray` discriminates the `ErrorInput` union at runtime;
+  // TypeScript cannot narrow an unresolved generic, so each branch asserts
+  // the side the guard just proved.
+  const errorSchema = options.error === undefined
+    ? Schema.Never
+    : Array.isArray(options.error)
+    ? Schema.Union(options.error as ReadonlyArray<Schema.Top>)
+    : options.error as Schema.Top
   // Wrapping the whole Exit schema in the JSON codec makes the *encoded* side
   // plain JSON (a live Exit/Cause instance would not survive serializing
   // drivers like Redis/Postgres).

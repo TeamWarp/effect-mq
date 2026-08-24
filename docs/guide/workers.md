@@ -57,6 +57,7 @@ The registration options are `concurrency` (taker fibers for this job's queue; t
 | `queueMetricsInterval` | off | sample `store.counts()` per queue into the depth gauge |
 | `handlerSpanName` | `` `${name}.run` `` | name of the span wrapping each handler run |
 | `traceLinking` | `auto` | how handler spans attach to the producer trace; see [Observability](/guide/observability) |
+| `onJobFailure` | none | callback after each failed run is acked; see [Failure reporting](#failure-reporting) |
 | `id` | random | identifier used in lock tokens (handy for telling workers apart in the store) |
 
 Per-queue concurrency resolves as: the worker's `queues` entry, then the registration's `concurrency`, then the worker's `concurrency`, then 1.
@@ -88,6 +89,23 @@ The heartbeat also delivers cross-process [cancellation](/guide/cancellation-and
 Every `stalledInterval`, the worker sweeps the store for active jobs whose lock has expired, the signature of a crashed or partitioned worker. Any worker on the store performs recovery; the one that lost the job holds no special role. Each recovered job gets a `stalled` entry in its run ledger and its stall counter incremented; it returns to `waiting` unless the counter now exceeds `maxStalledCount`, in which case the worker fails it outright with a `failedReason` (a job that keeps taking workers down should stop retrying). With the default of 1, the first stall re-queues the job and a second fails it.
 
 Stalls use their own counter: they do not consume the retry budget, since the handler may never have misbehaved. See [Retries & timeouts](/guide/retries-and-timeouts) for how the two budgets interact in the ledger.
+
+## Failure reporting
+
+The worker logs each failed run through Effect's logger: `logWarning` while retries remain (with the backoff delay), `logError` once a job lands terminal `failed`, including jobs failed by stall exhaustion. Log entries carry `effectMqJobId`, `effectMqQueue`, and `effectMqAttempt` annotations plus the failure cause, so log-based alerting works out of the box. Silence or reroute them with standard `Logger` configuration; the worker adds no extra knob.
+
+For custom reporting (error trackers, paging), pass `onJobFailure`:
+
+```ts
+Worker.layer({
+  onJobFailure: ({ jobId, name, attempt, attemptsMax, willRetry, cause }) =>
+    willRetry
+      ? Effect.void
+      : Sentry.report(name, jobId, cause)
+})
+```
+
+The hook receives job identity, attempt accounting, `willRetry`, and the `Cause`. It runs isolated after the ack: a failing hook is logged and never disturbs job processing, and it cannot delay or lose the ledger write.
 
 ## Graceful shutdown
 

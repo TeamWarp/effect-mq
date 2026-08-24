@@ -1183,3 +1183,136 @@ describe("handler context isolation", () => {
       expect(b).toBe(2)
     }))
 })
+
+class RouteMissing extends Schema.TaggedError<RouteMissing>()("RouteMissing", {
+  host: Schema.String
+}) {}
+
+describe("failure reporting", () => {
+  it.effect("a list of error schemas unions the failure channel", () =>
+    Effect.gen(function*() {
+      const Multi = Job.make("Multi", {
+        payload: { to: Schema.String },
+        error: [SendFailure, RouteMissing],
+        // Type-level pin: the predicate sees the union of both members.
+        retryable: (error) => error._tag === "SendFailure"
+      })
+      const handlers = Multi.toLayer(({ to }) =>
+        to === "mars" ? new RouteMissing({ host: to }) : new SendFailure({ reason: to })
+      )
+
+      const errors = yield* Effect.gen(function*() {
+        const first = yield* Effect.forkChild(Effect.flip(Multi.execute({ to: "mars" })))
+        yield* settle
+        yield* TestClock.adjust("1 second")
+        const routeMissing = yield* Fiber.join(first)
+        const second = yield* Effect.forkChild(Effect.flip(Multi.execute({ to: "moon" })))
+        yield* settle
+        yield* TestClock.adjust("1 second")
+        const sendFailure = yield* Fiber.join(second)
+        return [routeMissing, sendFailure] as const
+      }).pipe(Effect.provide(harness(handlers)))
+
+      expect(errors[0]._tag).toBe("RouteMissing")
+      assert(errors[0]._tag === "RouteMissing")
+      expect(errors[0].host).toBe("mars")
+      expect(errors[1]._tag).toBe("SendFailure")
+    }))
+
+  it.effect("onJobFailure fires per failed attempt, then terminally", () =>
+    Effect.gen(function*() {
+      const Fragile = Job.make("Fragile", {
+        payload: { id: Schema.String },
+        error: SendFailure,
+        defaults: { attempts: 2, backoff: { type: "fixed", delay: "1 second" } }
+      })
+      const failures: Array<Worker.JobFailure> = []
+      const handlers = Fragile.toLayer(() => new SendFailure({ reason: "nope" }))
+
+      yield* Effect.gen(function*() {
+        const id = yield* Fragile.enqueue({ id: "a" })
+        yield* settle
+        yield* TestClock.adjust("1 second")
+        yield* settle
+        yield* TestClock.adjust("1 second")
+        yield* settle
+        const status = yield* Fragile.poll(id)
+        assert(Option.isSome(status))
+        expect(status.value.state).toBe("failed")
+      }).pipe(Effect.provide(harness(handlers, {
+        onJobFailure: (failure) => Effect.sync(() => void failures.push(failure))
+      })))
+
+      expect(failures).toHaveLength(2)
+      expect(failures[0]?.willRetry).toBe(true)
+      expect(failures[0]?.attempt).toBe(1)
+      expect(failures[1]?.willRetry).toBe(false)
+      expect(failures[1]?.attempt).toBe(2)
+      expect(failures[1]?.name).toBe("Fragile")
+      expect(failures[1]?.attemptsMax).toBe(2)
+      expect(failures[1]?.queue).toBe("default")
+      expect(failures[1]?.cause).toBeDefined()
+    }))
+
+  it.effect("a failing onJobFailure hook never disturbs job processing", () =>
+    Effect.gen(function*() {
+      const Solid = Job.make("Solid", { payload: { n: Schema.Number }, success: Schema.Number })
+      const Broken = Job.make("Broken", { payload: {}, error: SendFailure })
+      const handlers = Layer.mergeAll(
+        Broken.toLayer(() => new SendFailure({ reason: "always" })),
+        Solid.toLayer(({ n }) => Effect.succeed(n))
+      )
+
+      const result = yield* Effect.gen(function*() {
+        yield* Broken.enqueue({})
+        yield* settle
+        yield* TestClock.adjust("1 second")
+        yield* settle
+        const fiber = yield* Effect.forkChild(Solid.execute({ n: 7 }))
+        yield* settle
+        yield* TestClock.adjust("1 second")
+        return yield* Fiber.join(fiber)
+      }).pipe(Effect.provide(harness(handlers, {
+        onJobFailure: () => Effect.die(new Error("hook exploded"))
+      })))
+
+      expect(result).toBe(7)
+    }))
+
+  it.effect("stall exhaustion reports a terminal failure", () =>
+    Effect.gen(function*() {
+      const Stall = Job.make("Stall", { payload: {} })
+      const Idle = Job.make("Idle", { payload: {} })
+      const failures: Array<Worker.JobFailure> = []
+      const handlers = Idle.toLayer(() => Effect.void)
+
+      yield* Effect.gen(function*() {
+        const store = yield* JobStore.JobStore
+        const id = yield* Stall.enqueue({})
+        // Fake a dead worker: claim directly and never heartbeat. The live
+        // worker only claims its registered name ("Idle"), so it cannot
+        // steal this job first.
+        const claim = yield* store.claim({
+          queue: QueueName("default"),
+          names: ["Stall"],
+          token: "dead-worker",
+          lockDurationMs: 1_000
+        })
+        assert(claim._tag === "Claimed")
+        yield* TestClock.adjust("3 seconds")
+        yield* settle
+        const status = yield* Stall.poll(id)
+        assert(Option.isSome(status))
+        expect(status.value.state).toBe("failed")
+      }).pipe(Effect.provide(harness(handlers, {
+        stalledInterval: "2 seconds",
+        maxStalledCount: 0,
+        onJobFailure: (failure) => Effect.sync(() => void failures.push(failure))
+      })))
+
+      expect(failures).toHaveLength(1)
+      expect(failures[0]?.willRetry).toBe(false)
+      expect(failures[0]?.name).toBe("Stall")
+      expect(failures[0]?.jobId).toBeDefined()
+    }))
+})

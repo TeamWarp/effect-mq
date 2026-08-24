@@ -28,7 +28,7 @@ Everything `Job.make` accepts:
 | --- | --- | --- |
 | `payload` | struct fields or a `Schema.Struct` | what producers pass in, what handlers receive |
 | `success` | schema (default `Schema.Void`) | the handler's result, decodable via `awaitResult`/`attempts` |
-| `error` | schema (default `Schema.Never`) | the handler's typed failure, round-trips through storage |
+| `error` | schema or list (default `Schema.Never`) | the handler's typed failure, round-trips through storage; a list of schemas becomes their union |
 | `idempotencyKey` | `(payload) => string` | derive a stable job id from business data |
 | `dedupe` | `(payload) => DedupeInput` | temporal dedup key; see [Deduplication](/guide/deduplication) |
 | `metadata` | `(payload) => Record<string, string>` | queryable business context, indexed by every driver |
@@ -51,6 +51,16 @@ class Remind extends Job.make("remind", {
 ```
 
 `success` and `error` follow the same rule: the worker encodes handler exits through an exit schema and persists them in the attempt ledger, so `MyJob.awaitResult(id)` in another process returns the typed success or the typed failure.
+
+A job that can fail more than one way takes `error` as a list, and the definition unions the members for you. `retryable`, `execute`, `awaitResult`, and the decoded ledger all see the union type:
+
+```ts
+class GenerateInvoice extends Job.make("generate-invoice", {
+  payload: { invoiceId: Schema.String },
+  error: [InvoiceNotFound, PaymentDeclined, ProviderTimeout],
+  retryable: (error) => error._tag === "ProviderTimeout"
+}) {}
+```
 
 ## Redacted fields
 

@@ -4,6 +4,23 @@ All notable changes to `effect-mq`. Versions follow 0.x semver: **minor
 bumps may break** (the `JobStore` driver contract in particular); patch
 bumps are additive.
 
+## 0.4.2 (unreleased)
+
+- **Failure logging + `onJobFailure` hook** — workers now log every failed
+  run through Effect's logger: `logWarning` while retries remain (with the
+  backoff delay), `logError` once a job lands terminal `failed` — including
+  jobs failed by stall exhaustion — annotated with
+  `effectMqJobId`/`effectMqQueue`/`effectMqAttempt` and the failure cause,
+  so log-based alerting works with no setup. For custom reporting,
+  `Worker.layer({ onJobFailure })` receives `{ jobId, name, queue, attempt,
+  attemptsMax, willRetry, cause }` after each failed ack; the hook runs
+  isolated (a failing hook is logged, never disturbs processing).
+- **Error schema lists** — `Job.make({ error: [A, B, C] })` accepts a list
+  of schemas and unions the members (the `HttpApiEndpoint` style), so
+  multi-way failures need no manual `Schema.Union`. `retryable`, `execute`,
+  `awaitResult`, and the decoded attempts ledger see the union type. Single
+  schemas are unchanged.
+
 ## 0.4.1 — 2026-08-23
 
 - **Typed queue and job-name columns in the drizzle factories** — the

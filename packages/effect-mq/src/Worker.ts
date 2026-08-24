@@ -142,8 +142,37 @@ export interface WorkerOptions<StoreId = JobStore> {
    * - `"none"`: spans and attributes only, no cross-trace edge.
    */
   readonly traceLinking?: "auto" | "parent" | "link" | "none" | undefined
+  /**
+   * Called after a failed run is acked — both retryable attempts and
+   * terminal failures (`JobFailure.willRetry` tells them apart), including
+   * jobs failed by stall exhaustion. Runs isolated on the worker fiber: a
+   * failing hook is logged and never disturbs job processing. The worker
+   * also logs failures itself (`logWarning` for retries, `logError` for
+   * terminal failures), so the hook is for custom reporting (error
+   * trackers, paging), not a logging prerequisite.
+   */
+  readonly onJobFailure?: ((failure: JobFailure) => Effect.Effect<void>) | undefined
   /** Identifier used in lock tokens (default: random). */
   readonly id?: string | undefined
+}
+
+/**
+ * What `Worker.layer({ onJobFailure })` receives after a failed run is
+ * acked: job identity, attempt accounting, whether the store will retry,
+ * and the failure cause.
+ *
+ * @since 0.4.2
+ */
+export interface JobFailure {
+  readonly jobId: JobId
+  readonly name: string
+  readonly queue: QueueName
+  /** The attempt that failed (1-based). */
+  readonly attempt: number
+  readonly attemptsMax: number
+  /** True when the store will re-run the job after its backoff. */
+  readonly willRetry: boolean
+  readonly cause: Cause.Cause<unknown>
 }
 
 /**
@@ -312,6 +341,34 @@ export const make = <StoreId = JobStore>(
         )
       )
 
+    // Every failed run is logged (warning while retries remain, error once
+    // terminal) and handed to the onJobFailure hook. The hook runs isolated:
+    // whatever it does, job processing proceeds.
+    const reportFailure = (failure: JobFailure, retryDelayMs: number | undefined) =>
+      Effect.gen(function*() {
+        yield* (failure.willRetry
+          ? Effect.logWarning(
+            `effect-mq: job "${failure.name}" failed (attempt ${failure.attempt}/${failure.attemptsMax}); ` +
+              `retrying in ${retryDelayMs ?? 0}ms`,
+            failure.cause
+          )
+          : Effect.logError(
+            `effect-mq: job "${failure.name}" failed terminally ` +
+              `(attempt ${failure.attempt}/${failure.attemptsMax})`,
+            failure.cause
+          )).pipe(Effect.annotateLogs({
+            effectMqJobId: failure.jobId,
+            effectMqQueue: failure.queue,
+            effectMqAttempt: failure.attempt
+          }))
+        const hook = options?.onJobFailure
+        if (hook !== undefined) {
+          yield* hook(failure).pipe(
+            Effect.catchCause((cause) => Effect.logError("effect-mq: onJobFailure hook failed", cause))
+          )
+        }
+      })
+
     const routeFailure = (record: JobRecord, exit: JobRecord["exit"]): AckOutcome => {
       const attempt = record.attemptsMade + 1
       if (attempt >= record.attemptsMax) {
@@ -471,6 +528,22 @@ export const make = <StoreId = JobStore>(
             ? { _tag: "Fail", exit: exitValue }
             : routeFailure(record, exitValue)
           yield* ackSafely(store.ack(record.id, token, outcome), "ack")
+          if (outcome._tag === "Fail" || outcome._tag === "Retry") {
+            const cause = Exit.isFailure(effective)
+              ? effective.cause
+              : Cause.die(
+                new Error(`effect-mq: success value for job "${record.name}" could not be encoded`)
+              )
+            yield* reportFailure({
+              jobId: record.id,
+              name: record.name,
+              queue: record.queue,
+              attempt: context.attempt,
+              attemptsMax: record.attemptsMax,
+              willRetry: outcome._tag === "Retry",
+              cause
+            }, outcome._tag === "Retry" ? outcome.delayMs : undefined)
+          }
           yield* recordRun(
             outcome._tag === "Complete"
               ? "completed"
@@ -627,6 +700,25 @@ export const make = <StoreId = JobStore>(
           )
         }
         yield* Effect.logWarning("effect-mq: recovered stalled jobs", recovered)
+        // Stall exhaustion lands jobs in terminal `failed` without an ack, so
+        // report those here like any other terminal failure (whichever
+        // worker's sweep recovered them reports them, exactly once).
+        for (const entry of recovered) {
+          if (!entry.failed) continue
+          const job = yield* retryStore(store.getJob(entry.id))
+          if (Option.isNone(job)) continue
+          yield* reportFailure({
+            jobId: job.value.id,
+            name: job.value.name,
+            queue: job.value.queue,
+            attempt: job.value.attemptsMade + 1,
+            attemptsMax: job.value.attemptsMax,
+            willRetry: false,
+            cause: Cause.die(
+              new Error(job.value.failedReason ?? "effect-mq: job stalled past maxStalledCount")
+            )
+          }, undefined)
+        }
       }
     }).pipe(
       Effect.catchCause((cause) => Effect.logError("effect-mq: stalled sweep failed", cause)),

@@ -42,6 +42,10 @@ Two properties make `"auto"` deterministic:
 - The delayed/immediate split keys off **scheduling intent captured at enqueue** (did the producer pass `delay`/`at`), not off when the job ran. Queue backlog never changes your trace shapes.
 - The store persists the flag on the record, so **every retry attempt keeps its mode**: attempt 3 of an immediate job is still a child of the producer span.
 
+## Failure logs
+
+Failed runs also reach your logs: the worker emits `logWarning` for attempts that will retry and `logError` for terminal failures, annotated with `effectMqJobId`, `effectMqQueue`, and `effectMqAttempt`. Alert on the error level and you catch every terminally failed job, stall exhaustion included. For structured reporting beyond logs, see [`onJobFailure`](/guide/workers#failure-reporting).
+
 ## Metrics
 
 Workers and producers emit Effect `Metric` instruments, exported as the `Metrics` module from `effect-mq`. They are **process-local operational signal, not persisted state**: they live in the emitting process's metric registry, and you export them with whatever your app already runs (the Otlp modules from `effect/unstable/observability`, `@effect/opentelemetry`, a Prometheus scraper). Retention lives in that backend.

@@ -10,7 +10,7 @@ The definition is the shared contract between producers and runners; see [Defini
 | --- | --- | --- |
 | `payload` | required | Payload schema: a `Schema.Struct` or its bare fields object |
 | `success` | `Schema.Void` | Schema for the handler's success value, decodable via `awaitResult`/`attempts` |
-| `error` | `Schema.Never` | Schema for the handler's typed failure; round-trips through storage |
+| `error` | `Schema.Never` | Schema for the handler's typed failure, or a list of schemas unioned for you; round-trips through storage |
 | `idempotencyKey` | none | `(payload) => string`: derives a stable job id; re-enqueueing the same key is a no-op |
 | `dedupe` | none | `(payload) => DedupeInput`: derives a dedup key (never changes the job id); see [Deduplication](/guide/deduplication) |
 | `metadata` | none | `(payload) => Record<string, string>`: queryable business context, indexed by every driver |
@@ -74,6 +74,7 @@ All optional. See [Workers & handlers](/guide/workers) for how these interact at
 | `queueMetricsInterval` | off | Sample `store.counts()` per registered queue into the depth gauge at this cadence |
 | `handlerSpanName` | `` `${name}.run` `` | `(context) => string`: names the span wrapping each handler run |
 | `traceLinking` | `"auto"` | Parent for immediate jobs, causal link for delayed ones; `"parent"` / `"link"` force a mode, `"none"` disables the cross-trace edge |
+| `onJobFailure` | none | Callback after each failed run is acked (`{ jobId, name, queue, attempt, attemptsMax, willRetry, cause }`); runs isolated |
 | `id` | random | Identifier used in lock tokens |
 
 `MyJob.toLayer(handler, options)` also accepts `concurrency` (taker fibers for this job's queue; the first registration for a queue decides) and `queue` (consume a different queue than the definition's).
