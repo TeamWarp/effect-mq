@@ -16,6 +16,9 @@ import {
   type ClaimResult,
   type EnqueueRequest,
   type ExtendLocksResult,
+  type FlowChildRecord,
+  type FlowChildSpec,
+  type FlowSweepWork,
   type HistoryTtlByState,
   type HistoryTtlInput,
   type IdGenerator,
@@ -56,6 +59,8 @@ interface MemJob {
   cancelRequested: boolean
   readonly dedupeKey: string | undefined
   trace: JobRecord["trace"]
+  readonly parent: JobRecord["parent"]
+  flow: JobRecord["flow"]
   runAt: number
   readonly enqueuedAt: number
   processedAt: number | undefined
@@ -87,6 +92,8 @@ const snapshot = (job: MemJob): JobRecord => ({
   cancelRequested: job.cancelRequested,
   dedupeKey: job.dedupeKey,
   trace: job.trace,
+  parent: job.parent,
+  flow: job.flow,
   runAt: job.runAt,
   enqueuedAt: job.enqueuedAt,
   processedAt: job.processedAt,
@@ -110,10 +117,25 @@ interface MemoryStore {
   readonly sweepHistory: (now: number, ttlByState: HistoryTtlByState) => void
 }
 
+interface MemFlowChild {
+  readonly flowId: JobId
+  readonly childKey: string
+  readonly storeKey: string
+  readonly spec: EnqueueRequest
+  status: FlowChildRecord["status"]
+  exit: unknown
+  failedReason: string | undefined
+  cascaded: boolean
+  readonly pendingSince: number
+}
+
 const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemoryStore => {
   const jobs = new Map<string, MemJob>()
   const schedules = new Map<ScheduleKey, ScheduleRecord>()
   const paused = new Set<QueueName>()
+  // Flow dependency rows, keyed by parent job id then child key. Insertion
+  // order is FanOut spec order; listChildResults sorts by child key.
+  const flowChildren = new Map<JobId, Map<string, MemFlowChild>>()
   // Dedup registry: one entry per (name, key). `expiresAt` is set for
   // ttl/throttle windows; pending-mode entries live as long as their job.
   const dedupes = new Map<string, { jobId: JobId; expiresAt: number | undefined }>()
@@ -198,9 +220,39 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
     }
   }
 
+  // A pruned/removed flow parent takes its dependency rows with it.
+  const deleteJob = (id: string) => {
+    jobs.delete(id)
+    // SAFETY: flowChildren keys are JobIds; a plain string that is not one
+    // simply misses.
+    flowChildren.delete(id as JobId)
+  }
+
+  // Settle-time marking: remaining pending rows flip to cancelled (NOT
+  // cascaded — the sweeper still owes the child stores real cancels), so
+  // late reports find their row terminal and drop, and `listChildResults`
+  // stays truthful. Lock order note: in this driver everything is one
+  // synchronous block, but the row-then-parent order is still observed.
+  const markPendingRowsCancelled = (flowId: JobId) => {
+    const rows = flowChildren.get(flowId)
+    if (rows === undefined) return
+    for (const row of rows.values()) {
+      if (row.status === "pending") {
+        row.status = "cancelled"
+        row.cascaded = false
+      }
+    }
+  }
+
   const markCancelled = (job: MemJob, now: number) => {
     clearLock(job)
     job.cancelRequested = false
+    if (job.state === "waiting-children") {
+      markPendingRowsCancelled(job.id)
+      if (job.flow !== undefined) {
+        job.flow = { ...job.flow, pending: 0 }
+      }
+    }
     job.state = "cancelled"
     job.finishedAt = now
     recordAttempt(job, "cancelled", now, undefined)
@@ -253,7 +305,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
       }
     }
     for (const id of remove) {
-      jobs.delete(id)
+      deleteJob(id)
     }
   }
 
@@ -268,7 +320,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
       // name is pruned on the timer, not only when its group is acked.
       const effective = keepAge !== undefined && (ttl === undefined || keepAge < ttl) ? keepAge : ttl
       if (effective !== undefined && job.finishedAt <= now - effective) {
-        jobs.delete(job.id)
+        deleteJob(job.id)
       }
     }
     // Dead dedup entries: expired window, or a pointer at a vanished job.
@@ -289,7 +341,8 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
       }
       switch (job.state) {
         case "waiting":
-        case "delayed": {
+        case "delayed":
+        case "waiting-children": {
           markCancelled(job, now)
           return
         }
@@ -321,6 +374,8 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
       cancelRequested: false,
       dedupeKey: request.dedupe?.key,
       trace: request.trace,
+      parent: request.parent,
+      flow: undefined,
       runAt: now + Math.max(0, request.delayMs),
       enqueuedAt: now,
       processedAt: undefined,
@@ -466,9 +521,64 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
         if (job.state !== "active" || job.lockToken !== token) {
           return yield* new LockLostError({ jobId: id })
         }
+        if (
+          outcome._tag === "FanOut" &&
+          outcome.children.some((child) => child.request.id === undefined)
+        ) {
+          // Validate BEFORE any mutation, so a bad spec cannot leave the job
+          // half-acked (lock cleared, ledger written, still active).
+          return yield* new JobStoreError({
+            message: "FanOut child specs require an explicit request.id"
+          })
+        }
         clearLock(job)
-        job.attemptsMade += 1
+        // A fan-out is a phase transition, not a completed run — the attempt
+        // budget spans both phases.
+        if (outcome._tag !== "FanOut") {
+          job.attemptsMade += 1
+        }
         switch (outcome._tag) {
+          case "FanOut": {
+            recordAttempt(job, "fanned-out", now, undefined)
+            if (job.flow === undefined) {
+              job.flow = { failFast: outcome.failFast, pending: outcome.children.length }
+              const rows = new Map<string, MemFlowChild>()
+              for (const child of outcome.children) {
+                rows.set(child.childKey, {
+                  flowId: job.id,
+                  childKey: child.childKey,
+                  storeKey: child.storeKey,
+                  spec: child.request,
+                  status: "pending",
+                  exit: undefined,
+                  failedReason: undefined,
+                  cascaded: false,
+                  pendingSince: now
+                })
+              }
+              flowChildren.set(job.id, rows)
+            }
+            // A manifest that was already present is kept untouched (double
+            // fan-out converges on the persisted children); the state
+            // transition follows the persisted pending count either way.
+            if (job.cancelRequested) {
+              // A cancel raced the fan-out: cancellation wins. The rows exist
+              // and get marked, so the sweeper cascades (mostly no-op cancels
+              // for never-enqueued children).
+              markCancelled(job, now)
+              break
+            }
+            if (job.flow.pending > 0) {
+              job.state = "waiting-children"
+            } else {
+              // Empty spec: settle straight to runnable `collect`.
+              job.state = "waiting"
+              job.runAt = now
+              job.seq = ++seq
+              signalWake(job.queue)
+            }
+            break
+          }
           case "Complete": {
             job.cancelRequested = false
             job.state = "completed"
@@ -797,12 +907,142 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
         return true
       }),
 
+    recordChildResult: (report) =>
+      Effect.gen(function*() {
+        const now = yield* Clock.currentTimeMillis
+        // Lock order: dependency row first, parent row second.
+        const row = flowChildren.get(report.flowId)?.get(report.childKey)
+        if (row === undefined || row.status !== "pending") {
+          return { applied: false, parentSettled: false }
+        }
+        row.status = report.outcome
+        row.exit = report.exit
+        row.failedReason = report.failedReason
+        // The outcome came from the child's store: no cancel to deliver.
+        row.cascaded = true
+        const parent = jobs.get(report.flowId)
+        if (parent === undefined || parent.flow === undefined) {
+          return { applied: true, parentSettled: false }
+        }
+        parent.flow = { ...parent.flow, pending: Math.max(0, parent.flow.pending - 1) }
+        if (parent.state !== "waiting-children") {
+          return { applied: true, parentSettled: false }
+        }
+        if (parent.flow.failFast && report.outcome === "failed") {
+          // First failure settles the parent terminally (store-side, like
+          // stall exhaustion) and marks the remaining rows in the same op.
+          markPendingRowsCancelled(parent.id)
+          parent.flow = { ...parent.flow, pending: 0 }
+          parent.cancelRequested = false
+          parent.state = "failed"
+          parent.finishedAt = now
+          parent.failedReason = `effect-mq: flow child "${report.childKey}" failed`
+          recordAttempt(parent, "failed", now, undefined)
+          releaseDedupe(parent, now)
+          applyKeep(parent, now)
+          return { applied: true, parentSettled: true }
+        }
+        if (parent.flow.pending === 0) {
+          // All children settled: the parent resumes runnable, phase collect.
+          parent.state = "waiting"
+          parent.runAt = now
+          parent.seq = ++seq
+          signalWake(parent.queue)
+          return { applied: true, parentSettled: true }
+        }
+        return { applied: true, parentSettled: false }
+      }),
+
+    listChildResults: (flowId, options) =>
+      Effect.sync(() => {
+        const limit = Math.max(1, options?.limit ?? 1000)
+        const rows = Array.from(flowChildren.get(flowId)?.values() ?? [])
+          .toSorted((a, b) => (a.childKey < b.childKey ? -1 : a.childKey > b.childKey ? 1 : 0))
+          .filter((row) => options?.cursor === undefined || row.childKey > options.cursor)
+        const page = rows.slice(0, limit)
+        const items: Array<FlowChildRecord> = page.map((row) => ({
+          flowId: row.flowId,
+          childKey: row.childKey,
+          name: row.spec.name,
+          storeKey: row.storeKey,
+          // SAFETY: FanOut validated every spec id at ack time.
+          childJobId: row.spec.id as JobId,
+          status: row.status,
+          exit: row.exit,
+          failedReason: row.failedReason,
+          cascaded: row.cascaded
+        }))
+        const last = page[page.length - 1]
+        return {
+          items,
+          cursor: rows.length > limit && last !== undefined ? last.childKey : undefined
+        }
+      }),
+
+    flowSweepWork: (options) =>
+      Effect.gen(function*() {
+        const now = yield* Clock.currentTimeMillis
+        const limit = Math.max(1, options.limit ?? 1000)
+        const threshold = now - options.pendingAgeMs
+        const reconcile: Array<{ flowId: JobId; children: Array<FlowChildSpec> }> = []
+        const cascade: Array<
+          { flowId: JobId; children: Array<{ childKey: string; storeKey: string; childJobId: JobId }> }
+        > = []
+        let reconcileCount = 0
+        let cascadeCount = 0
+        for (const [flowId, rows] of flowChildren) {
+          const parent = jobs.get(flowId)
+          const reconciling = parent !== undefined && parent.state === "waiting-children"
+          let reconcileGroup: Array<FlowChildSpec> | undefined
+          let cascadeGroup:
+            | Array<{ childKey: string; storeKey: string; childJobId: JobId }>
+            | undefined
+          for (const row of rows.values()) {
+            if (
+              reconciling && row.status === "pending" &&
+              row.pendingSince <= threshold && reconcileCount < limit
+            ) {
+              reconcileGroup ??= []
+              reconcileGroup.push({ childKey: row.childKey, storeKey: row.storeKey, request: row.spec })
+              reconcileCount += 1
+            }
+            if (row.status === "cancelled" && !row.cascaded && cascadeCount < limit) {
+              cascadeGroup ??= []
+              cascadeGroup.push({
+                childKey: row.childKey,
+                storeKey: row.storeKey,
+                // SAFETY: FanOut validated every spec id at ack time.
+                childJobId: row.spec.id as JobId
+              })
+              cascadeCount += 1
+            }
+          }
+          if (reconcileGroup !== undefined) reconcile.push({ flowId, children: reconcileGroup })
+          if (cascadeGroup !== undefined) cascade.push({ flowId, children: cascadeGroup })
+        }
+        const work: FlowSweepWork = { reconcile, cascade }
+        return work
+      }),
+
+    markChildrenCascaded: (flowId, childKeys) =>
+      Effect.sync(() => {
+        const rows = flowChildren.get(flowId)
+        if (rows === undefined) return
+        for (const key of childKeys) {
+          const row = rows.get(key)
+          if (row !== undefined) {
+            row.cascaded = true
+          }
+        }
+      }),
+
     counts: (queue) =>
       Effect.sync(() => {
         const counts = {
           waiting: 0,
           delayed: 0,
           active: 0,
+          "waiting-children": 0,
           completed: 0,
           failed: 0,
           cancelled: 0
@@ -817,8 +1057,10 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
     remove: (id) =>
       Effect.sync(() => {
         const job = jobs.get(id)
-        if (job === undefined || job.state === "active") return false
-        jobs.delete(id)
+        if (job === undefined || job.state === "active" || job.state === "waiting-children") {
+          return false
+        }
+        deleteJob(id)
         return true
       })
   })

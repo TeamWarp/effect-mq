@@ -29,6 +29,7 @@ const rawRequest = (name: string, id?: string): JobStore.EnqueueRequest => ({
   timeoutMs: undefined,
   dedupe: undefined,
   trace: undefined,
+  parent: undefined,
   delayMs: 0
 })
 
@@ -824,6 +825,7 @@ describe("deduplication", () => {
         timeoutMs: undefined,
         dedupe: { key: "k", ttlMs: undefined, extend: false, replace: false },
         trace: undefined,
+        parent: undefined,
         delayMs: 0
       }
       const first = yield* store.enqueue(request)

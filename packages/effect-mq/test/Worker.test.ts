@@ -824,6 +824,7 @@ describe("Worker hardening", () => {
           timeoutMs: undefined,
           dedupe: undefined,
           trace: undefined,
+          parent: undefined,
           delayMs: 0
         })
         yield* settle

@@ -133,3 +133,44 @@ export const stalledRecovered = Metric.counter("effect_mq_stalled_recovered", {
 export const scheduleTicks = Metric.counter("effect_mq_schedule_ticks", {
   description: "Repeatable-schedule occurrences enqueued by the schedule sweep"
 })
+
+/**
+ * Flow fan-outs acked (manifests landed). Tags: `flow`.
+ *
+ * @since 0.6.0
+ */
+export const flowFanOuts = Metric.counter("effect_mq_flow_fanouts", {
+  description: "Flow fan-out acks (child manifests persisted)"
+})
+
+/**
+ * Child results recorded into parent stores. Tags: `flow`, `outcome`
+ * (completed | failed | cancelled), `source` (`report` = pushed by the
+ * child's worker before its ack; `reconcile` = synthesized by the flow
+ * sweeper from child-store state). Only applied reports count — duplicates
+ * dropped by the dependency row do not.
+ *
+ * @since 0.6.0
+ */
+export const flowChildReports = Metric.counter("effect_mq_flow_child_reports", {
+  description: "Applied flow child-result reports by outcome and delivery path"
+})
+
+/**
+ * Cancels delivered into child stores after a flow settle. Tags: `flow`.
+ *
+ * @since 0.6.0
+ */
+export const flowCascades = Metric.counter("effect_mq_flow_cascades", {
+  description: "Child cancels cascaded into child stores after a flow settled"
+})
+
+/**
+ * Flow children failed because the claiming worker had no registration for
+ * their flow (`Worker.layer({ flows })` missing). Tags: `flow`.
+ *
+ * @since 0.6.0
+ */
+export const flowUnreportableChildren = Metric.counter("effect_mq_flow_unreportable_children", {
+  description: "Flow children failed unrecoverably by workers unable to report to their flow"
+})

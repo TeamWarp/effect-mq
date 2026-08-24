@@ -20,6 +20,7 @@ const request = (overrides?: Partial<JobStore.EnqueueRequest>): JobStore.Enqueue
   timeoutMs: undefined,
   dedupe: undefined,
   trace: undefined,
+  parent: undefined,
   delayMs: 0,
   ...overrides
 })

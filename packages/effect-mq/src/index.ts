@@ -5,6 +5,14 @@
  */
 
 /**
+ * Cross-store parent-child flows: `Flow.make`, `Flow.children`, the
+ * two-phase `fanOut`/`collect` handler.
+ *
+ * @since 0.6.0
+ */
+export * as Flow from "./Flow.ts"
+
+/**
  * Schema-first job definitions: `Job.make`, `enqueue`, `toLayer`.
  *
  * @since 0.1.0

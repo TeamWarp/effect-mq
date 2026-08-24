@@ -145,6 +145,7 @@ if (!available) {
             timeoutMs: undefined,
             dedupe: undefined,
             trace: undefined,
+            parent: undefined,
             delayMs: 0
           })
           expect((yield* durable.counts()).waiting).toBe(1)
@@ -200,6 +201,7 @@ if (!available) {
           timeoutMs: undefined,
           dedupe: undefined,
           trace: undefined,
+          parent: undefined,
           delayMs: 0
         }
         const first = yield* store.enqueue({ ...base, name: "Gen" })
@@ -237,6 +239,7 @@ if (!available) {
           timeoutMs: undefined,
           dedupe: { key: "race", ttlMs: undefined, extend: false, replace: false },
           trace: undefined,
+          parent: undefined,
           delayMs: 0
         }
         const results = yield* Effect.all(
@@ -292,6 +295,7 @@ if (!available) {
           timeoutMs: undefined,
           dedupe: undefined,
           trace: undefined,
+          parent: undefined,
           delayMs: 0
         }
         // Default mapping: metadata[<TS key>] lands in the column at INSERT.
@@ -333,6 +337,7 @@ if (!available) {
           metadata: { companyId: "acme", objectId: "v1" },
           dedupe: { key: "obj", ttlMs: undefined, extend: false, replace: true },
           trace: undefined,
+          parent: undefined,
           delayMs: 60_000
         }
         const job = yield* store.enqueue(keyed)
@@ -385,6 +390,7 @@ if (!available) {
           timeoutMs: undefined,
           dedupe: undefined,
           trace: undefined,
+          parent: undefined,
           delayMs: 0
         }
         // The batch INSERT is a second hand-rolled VALUES list; it must fill
@@ -493,6 +499,7 @@ if (!available) {
           timeoutMs: undefined,
           dedupe: undefined,
           trace: undefined,
+          parent: undefined,
           delayMs: 0
         }
         const done = yield* store.enqueue({ ...base, name: "Swept" })
@@ -588,6 +595,7 @@ if (!available) {
           timeoutMs: undefined,
           dedupe: undefined,
           trace: undefined,
+          parent: undefined,
           delayMs: 0
         })
         const woken = yield* Fiber.join(waiter)
@@ -611,6 +619,7 @@ if (!available) {
             timeoutMs: undefined,
             dedupe: undefined,
             trace: undefined,
+            parent: undefined,
             delayMs: 0
           })
         }
