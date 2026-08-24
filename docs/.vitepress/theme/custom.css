@@ -255,8 +255,16 @@
 .VPSidebar {
   border-right: 1px solid var(--vp-c-divider);
 }
-.VPNavBar {
-  border-bottom: 1px solid var(--vp-c-divider);
+/* The default theme keeps the sidebar-layout navbar transparent and only
+   paints a curtain divider on scroll; that lets content bleed through above
+   the logo. Make the navbar opaque with its own hairline in every state. */
+.VPNavBar,
+.VPNavBar:not(.home.top) {
+  background-color: var(--vp-c-bg) !important;
+  border-bottom: 1px solid var(--vp-c-divider) !important;
+}
+.VPNavBar .content-body {
+  background-color: transparent !important;
 }
 .VPNavBar .divider {
   display: none;
