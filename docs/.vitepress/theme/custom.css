@@ -248,13 +248,21 @@
   border-left: 3px solid var(--vp-c-border);
 }
 
-/* Sidebar + nav: flat, hairline-separated. */
+/* Sidebar + nav: flat, hairline-separated. One full-width line under the
+   navbar; the theme's own segmented dividers (logo-title underline, the
+   curtain line offset by the sidebar width) are removed so hairlines never
+   double up. */
 .VPSidebar {
   border-right: 1px solid var(--vp-c-divider);
 }
-.VPNavBar,
-.VPNavBar:not(.home) {
+.VPNavBar {
   border-bottom: 1px solid var(--vp-c-divider);
+}
+.VPNavBar .divider {
+  display: none;
+}
+.VPNavBarTitle.has-sidebar .title {
+  border-bottom-color: transparent;
 }
 .VPSidebarItem.level-0 > .item > .text {
   font-weight: 600;
@@ -268,7 +276,9 @@
 }
 
 /* Kill decorative transitions and shadows globally. */
-.VPNavBar,
+.VPNavBar {
+  box-shadow: none !important;
+}
 .VPLocalSearchBox .shell,
 .VPFlyout .menu,
 .VPMenu {
