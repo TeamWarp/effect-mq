@@ -9,15 +9,29 @@ export default defineConfig({
   head: [
     ["meta", { name: "theme-color", content: "#111111" }],
     ["meta", { property: "og:type", content: "website" }],
-    ["meta", { property: "og:title", content: "effect-mq" }],
-    [
-      "meta",
-      {
-        property: "og:description",
-        content: "Effect-native background jobs. Schema-typed payloads, swappable storage, at-least-once execution."
-      }
-    ]
+    ["meta", { property: "og:site_name", content: "effect-mq" }],
+    ["meta", { property: "og:image", content: "https://www.effect-mq.com/og.png" }],
+    ["meta", { property: "og:image:width", content: "1200" }],
+    ["meta", { property: "og:image:height", content: "630" }],
+    ["meta", { name: "twitter:card", content: "summary_large_image" }],
+    ["meta", { name: "twitter:image", content: "https://www.effect-mq.com/og.png" }]
   ],
+  // Per-page share cards: the branded og.png plus this page's own title and
+  // description (og:title/og:description are per page, so they live here
+  // instead of the static head).
+  transformPageData(pageData) {
+    const title = pageData.title === "" || pageData.title === "effect-mq"
+      ? "effect-mq"
+      : `${pageData.title} · effect-mq`
+    const description = pageData.description === ""
+      ? "Effect-native background jobs. Schema-typed payloads, swappable storage, at-least-once execution."
+      : pageData.description
+    pageData.frontmatter.head ??= []
+    pageData.frontmatter.head.push(
+      ["meta", { property: "og:title", content: title }],
+      ["meta", { property: "og:description", content: description }]
+    )
+  },
   markdown: {
     theme: { light: "github-light", dark: "github-dark" }
   },
