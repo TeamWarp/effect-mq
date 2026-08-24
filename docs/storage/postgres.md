@@ -86,7 +86,7 @@ The startup probe fails with a clear message when the tables are missing or mism
 To get real columns (a tenant id you can FK, RLS-scope, and join) populated at job creation rather than patched in from job logic, `extend` the jobs table. At enqueue the store fills each extended column from the job's `metadata` entry with the same TS key (the definition's `metadata: (payload) => ...` is your creation-time hook), NULL when absent:
 
 ```ts
-class SyncBenefits extends Job.make("sync-benefits", {
+class SyncPayments extends Job.make("sync-payments", {
   payload: { companyId: Schema.String, objectId: Schema.String },
   metadata: ({ companyId, objectId }) => ({ companyId, objectId })
 }) {}

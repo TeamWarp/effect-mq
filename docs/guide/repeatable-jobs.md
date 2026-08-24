@@ -63,19 +63,19 @@ The payload and options are part of the row: re-registering with a new payload r
 
 ## One-shot future work
 
-Some future-dated work runs once. For "run once at time T, reschedulable and cancellable" (an onboarding invite, a trial-expiry email), skip the schedule row and combine three primitives: a [`replace` dedup key](/guide/deduplication#replace-while-delayed), an absolute `at`, and `cancelByKey`:
+Some future-dated work runs once. For "run once at time T, reschedulable and cancellable" (a signup invite, a trial-expiry email), skip the schedule row and combine three primitives: a [`replace` dedup key](/guide/deduplication#replace-while-delayed), an absolute `at`, and `cancelByKey`:
 
 ```ts
 import { DateTime, Schema } from "effect"
 import { Job } from "effect-mq"
 
 class SendInvite extends Job.make("send-invite", {
-  payload: { employeeId: Schema.String },
-  dedupe: ({ employeeId }) => ({ key: employeeId, replace: true })
+  payload: { userId: Schema.String },
+  dedupe: ({ userId }) => ({ key: userId, replace: true })
 }) {}
 
 // Schedule for a wall-clock instant:
-yield* SendInvite.enqueue({ employeeId }, {
+yield* SendInvite.enqueue({ userId }, {
   at: DateTime.makeZonedUnsafe(
     { year: 2026, month: 8, day: 24, hours: 9 },
     { timeZone: "America/New_York", adjustForTimeZone: true }
@@ -83,10 +83,10 @@ yield* SendInvite.enqueue({ employeeId }, {
 })
 
 // Reschedule: the same call with a new time; replace moves the delayed job.
-yield* SendInvite.enqueue({ employeeId }, { at: nextDay })
+yield* SendInvite.enqueue({ userId }, { at: nextDay })
 
-// Not onboarding after all: cancel whatever is pending, if anything.
-const wasPending = yield* SendInvite.cancelByKey(employeeId)
+// The user bailed: cancel whatever is pending, if anything.
+const wasPending = yield* SendInvite.cancelByKey(userId)
 ```
 
 Your business logic keeps no job-id bookkeeping: the dedup key is the handle, and every verb is idempotent.

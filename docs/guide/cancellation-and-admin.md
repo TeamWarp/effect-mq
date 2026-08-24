@@ -35,7 +35,7 @@ The driver conformance suite pins two races:
 When a job was enqueued under a [dedup key](/guide/deduplication), cancel whatever is pending without tracking job ids:
 
 ```ts
-const wasPending = yield* SendInvite.cancelByKey(employeeId)
+const wasPending = yield* SendInvite.cancelByKey(userId)
 ```
 
 `cancelByKey` is idempotent: it returns `false` when no pending job holds the key, so "cancel it if anything is scheduled" needs no existence check. Pending states follow the same rules as `cancel`: waiting/delayed become terminal, active gets the heartbeat flag.

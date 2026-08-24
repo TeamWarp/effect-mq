@@ -1,6 +1,6 @@
 # Deduplication
 
-Deduplication stops redundant enqueues of the same logical work: syncing an employer's benefits twice in the same minute, or rebuilding a search index for every keystroke. A dedup key is a **separate, name-scoped value**: it never rewrites job ids. Whatever produced the id (an explicit `jobId`, `idempotencyKey`, a store `idGenerator`, or the default sequence) stays in charge; dedup only decides whether a new enqueue creates a job at all.
+Deduplication stops redundant enqueues of the same logical work: syncing an account's payments twice in the same minute, or rebuilding a search index for every keystroke. A dedup key is a **separate, name-scoped value**: it never rewrites job ids. Whatever produced the id (an explicit `jobId`, `idempotencyKey`, a store `idGenerator`, or the default sequence) stays in charge; dedup only decides whether a new enqueue creates a job at all.
 
 A deduplicated enqueue is a silent no-op that returns the keyed job's id (`duplicate: true` at the store level), so producers keep a usable handle whether they created the job or joined an existing one.
 
@@ -12,24 +12,24 @@ Set the key in the definition, derived per payload, or per enqueue. The per-enqu
 import { Job } from "effect-mq"
 import { Effect, Schema } from "effect"
 
-class SyncBenefits extends Job.make("sync-benefits", {
-  payload: { employerId: Schema.String },
-  dedupe: ({ employerId }) => employerId          // string shorthand = { key }
+class SyncPayments extends Job.make("sync-payments", {
+  payload: { accountId: Schema.String },
+  dedupe: ({ accountId }) => accountId          // string shorthand = { key }
 }) {}
 
 const program = Effect.gen(function*() {
   // Definition-derived key:
-  yield* SyncBenefits.enqueue({ employerId: "emp-1" })
+  yield* SyncPayments.enqueue({ accountId: "acct-1" })
 
   // Per-enqueue override, with a mode:
-  yield* SyncBenefits.enqueue(
-    { employerId: "emp-1" },
-    { dedupe: { key: "emp-1", ttl: "1 minute" } }
+  yield* SyncPayments.enqueue(
+    { accountId: "acct-1" },
+    { dedupe: { key: "acct-1", ttl: "1 minute" } }
   )
 })
 ```
 
-A bare string is shorthand for `{ key }`. Keys must be non-empty and are scoped per job name, so `"emp-1"` on `sync-benefits` and `"emp-1"` on `send-invite` never collide.
+A bare string is shorthand for `{ key }`. Keys must be non-empty and are scoped per job name, so `"acct-1"` on `sync-payments` and `"acct-1"` on `send-invite` never collide.
 
 ## The four modes
 
@@ -44,16 +44,16 @@ Three fields compose into four behaviors:
 
 ### Pending dedup (the default)
 
-`{ key }` alone dedupes while the keyed job is *pending*: waiting, delayed, or active. The moment that job reaches a terminal state (completed, failed, or cancelled), the key is free and the next enqueue creates a fresh job. This is the "one in flight at a time" mode: enqueue as often as you like, at most one sync per employer is ever queued or running.
+`{ key }` alone dedupes while the keyed job is *pending*: waiting, delayed, or active. The moment that job reaches a terminal state (completed, failed, or cancelled), the key is free and the next enqueue creates a fresh job. This is the "one in flight at a time" mode: enqueue as often as you like, at most one sync per account is ever queued or running.
 
 ### Throttle
 
 Add a `ttl` and the key holds for the whole window, whether or not the keyed job has finished, so you get at most one job per key per window:
 
 ```ts
-// At most one cache refresh per employer per five minutes:
-yield* RefreshCache.enqueue({ employerId }, {
-  dedupe: { key: employerId, ttl: "5 minutes" }
+// At most one cache refresh per account per five minutes:
+yield* RefreshCache.enqueue({ accountId }, {
+  dedupe: { key: accountId, ttl: "5 minutes" }
 })
 ```
 
@@ -72,7 +72,7 @@ This is the mode behind the [one-shot future work pattern](/guide/repeatable-job
 `cancelByKey` cancels whatever pending job holds a dedup key. It is idempotent by design: it returns `false` when nothing pending holds the key, so "cancel it if anything is scheduled" needs no existence check:
 
 ```ts
-const wasPending = yield* SyncBenefits.cancelByKey("emp-1")
+const wasPending = yield* SyncPayments.cancelByKey("acct-1")
 ```
 
 Cancellation semantics match [`cancel`](/guide/cancellation-and-admin): waiting/delayed jobs become terminal immediately; the worker interrupts an active job's handler fiber on its next heartbeat.

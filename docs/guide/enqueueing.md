@@ -41,9 +41,9 @@ Scheduling takes a relative `delay` (any `Duration.Input`) *or* an absolute `at`
 ```ts
 import { DateTime } from "effect"
 
-yield* SendInvite.enqueue({ employeeId }, { delay: "5 minutes" })
+yield* SendInvite.enqueue({ userId }, { delay: "5 minutes" })
 
-yield* SendInvite.enqueue({ employeeId }, {
+yield* SendInvite.enqueue({ userId }, {
   at: DateTime.makeZonedUnsafe(
     { year: 2026, month: 8, day: 24, hours: 9 },
     { timeZone: "America/New_York", adjustForTimeZone: true }

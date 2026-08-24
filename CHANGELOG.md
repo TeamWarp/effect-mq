@@ -87,7 +87,7 @@ bumps are additive.
   are process-local — export them with your observability stack; durable
   history stays in the store (`counts()`, the attempt ledger).
 
-## 0.3.0 (unreleased)
+## 0.3.0 — 2026-08-22
 
 - **Retention split by terminal state** — both per-job `keep` and the
   store-level `historyTtl` accept `{ completed?, failed?, cancelled? }`
