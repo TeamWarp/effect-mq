@@ -117,7 +117,7 @@ Every driver accepts `idGenerator` (generator for store-assigned ids; default a 
 | Option | Memory | Postgres (drizzle) | Redis |
 | --- | --- | --- | --- |
 | `idGenerator` / `historyTtl` / `historySweepInterval` | yes | yes | yes |
-| Table instances (`jobs`, `attempts`, `schedules`, `queues`, `dedupe`) | no | required | no |
+| Table instances (`jobs`, `attempts`, `schedules`, `queues`, `dedupe`, `flowChildren`) | no | required | no |
 | `extraValues`: fill `extend`ed columns at enqueue | no | yes | no |
 | `store`: bind to a named store key | via `layerFor` | option | via `layerFor` |
 | `validate`: probe tables at startup (default `true`) | no | yes | no |
@@ -130,7 +130,7 @@ MemoryJobStore.layer                        // no options
 MemoryJobStore.layerWith({ historyTtl: "7 days" })
 MemoryJobStore.layerFor(Durable, options)   // named store
 
-DrizzleJobStore.layer({ jobs, attempts, schedules, queues, dedupe, ...options })
+DrizzleJobStore.layer({ jobs, attempts, schedules, queues, dedupe, flowChildren, ...options })
 
 RedisJobStore.layer({ prefix: "myapp-jobs" })
 RedisJobStore.layerFor(Ephemeral, options)  // named store

@@ -183,6 +183,106 @@ if (!available) {
         expect(claims.filter((claim) => claim._tag === "Claimed")).toHaveLength(1)
       }).pipe(Effect.scoped, Effect.provide(redisLive())))
 
+    it.effect("a FanOut past the 500-child chunk size stages atomically and lands one manifest", () =>
+      Effect.gen(function*() {
+        const store = yield* RedisJobStore.make({ prefix: freshPrefix() })
+        const queue = JobStore.QueueName("default")
+        const base = {
+          id: undefined,
+          name: "BigFlow",
+          queue,
+          payload: {},
+          metadata: {},
+          priority: 0,
+          attemptsMax: 1,
+          backoff: undefined,
+          keep: undefined,
+          timeoutMs: undefined,
+          dedupe: undefined,
+          trace: undefined,
+          parent: undefined,
+          delayMs: 0
+        }
+        const { id } = yield* store.enqueue(base)
+        const claim = yield* store.claim({
+          queue,
+          names: ["BigFlow"],
+          token: "t-big",
+          lockDurationMs: 30_000
+        })
+        assert(claim._tag === "Claimed")
+
+        // 750 children forces the driver through two staging chunks (500 +
+        // 250, the second carrying the manifest + state flip). Zero-padded
+        // keys make childKey order equal numeric order.
+        const children: Array<JobStore.FlowChildSpec> = Array.from({ length: 750 }, (_, i) => {
+          const key = `c${String(i).padStart(4, "0")}`
+          return {
+            childKey: key,
+            storeKey: "effect-mq/JobStore/children",
+            request: {
+              ...base,
+              id: JobStore.JobId(`flow/main/${id}/${key}`),
+              name: "Child",
+              parent: {
+                flowName: "big",
+                flowId: id,
+                childKey: key,
+                parentStoreKey: "main"
+              }
+            }
+          }
+        })
+        yield* store.ack(id, "t-big", { _tag: "FanOut", failFast: false, children })
+
+        const parent = yield* store.getJob(id)
+        assert(Option.isSome(parent))
+        expect(parent.value.state).toBe("waiting-children")
+        expect(parent.value.flow).toEqual({ failFast: false, pending: 750 })
+
+        // The full manifest paginates in childKey order.
+        const seen: Array<string> = []
+        let cursor: string | undefined = undefined
+        do {
+          const page: {
+            items: ReadonlyArray<JobStore.FlowChildRecord>
+            cursor: string | undefined
+          } = yield* store.listChildResults(id, { cursor, limit: 300 })
+          for (const row of page.items) seen.push(row.childKey)
+          cursor = page.cursor
+        } while (cursor !== undefined)
+        expect(seen).toEqual(children.map((child) => child.childKey))
+
+        // Reports decrement the persisted counter; duplicates drop.
+        const first = yield* store.recordChildResult({
+          flowId: id,
+          childKey: "c0000",
+          outcome: "completed",
+          exit: { ok: true },
+          failedReason: undefined
+        })
+        expect(first).toEqual({ applied: true, parentSettled: false })
+        const dup = yield* store.recordChildResult({
+          flowId: id,
+          childKey: "c0000",
+          outcome: "failed",
+          exit: undefined,
+          failedReason: undefined
+        })
+        expect(dup).toEqual({ applied: false, parentSettled: false })
+        yield* store.recordChildResult({
+          flowId: id,
+          childKey: "c0001",
+          outcome: "completed",
+          exit: { ok: true },
+          failedReason: undefined
+        })
+        const after = yield* store.getJob(id)
+        assert(Option.isSome(after))
+        expect(after.value.state).toBe("waiting-children")
+        expect(after.value.flow).toEqual({ failFast: false, pending: 748 })
+      }).pipe(Effect.scoped, Effect.provide(redisLive())))
+
     it.live("historyTtl sweeps terminal jobs; live jobs survive", () =>
       Effect.gen(function*() {
         const store = yield* RedisJobStore.make({

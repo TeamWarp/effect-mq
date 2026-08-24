@@ -2115,14 +2115,95 @@ export const jobStoreConformance = (
             childSpec(flowId, "a").request
           )
 
-          // A recorded row leaves the reconcile set; a settled parent leaves
-          // it entirely.
+          // Returned rows are re-armed: they leave the page for another full
+          // age, so a sweep page rotates instead of pinning its head.
+          const rearmed = yield* store.flowSweepWork({ pendingAgeMs: 30_000 })
+          expect(rearmed.reconcile).toEqual([])
+
+          // A recorded row leaves the reconcile set for good; a settled
+          // parent leaves it entirely.
           yield* store.recordChildResult(report(flowId, "a", "completed"))
+          yield* TestClock.adjust(30_000)
           const partial = yield* store.flowSweepWork({ pendingAgeMs: 30_000 })
           expect(partial.reconcile[0]?.children.map((child) => child.childKey)).toEqual(["b"])
           yield* store.recordChildResult(report(flowId, "b", "completed"))
+          yield* TestClock.adjust(30_000)
           const settled = yield* store.flowSweepWork({ pendingAgeMs: 30_000 })
           expect(settled.reconcile).toEqual([])
+        })
+      ))
+
+    it.effect("a fail-fast report that is also the last pending row settles as failed", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const flowId = yield* fanOutParent(store, { children: ["a", "b"], failFast: true })
+          yield* store.recordChildResult(report(flowId, "a", "completed"))
+          // This report triggers BOTH settle rules: pending hits zero AND it
+          // is the first failure under fail-fast. Fail-fast wins: terminal
+          // `failed`, never a resume into collect.
+          const last = yield* store.recordChildResult(report(flowId, "b", "failed"))
+          expect(last).toEqual({ applied: true, parentSettled: true })
+          const parent = yield* store.getJob(flowId)
+          assert(Option.isSome(parent))
+          expect(parent.value.state).toBe("failed")
+          expect(parent.value.failedReason).toContain("b")
+        })
+      ))
+
+    it.effect("an empty FanOut wakes takers parked on the parent's queue", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const { id } = yield* store.enqueue(baseRequest())
+          const claim = yield* store.claim(claimOptions({ token: "t-parent" }))
+          assert(claim._tag === "Claimed")
+          const empty = yield* store.claim(claimOptions({ token: "t-idle" }))
+          assert(empty._tag === "Empty")
+          const waiter = yield* Effect.forkChild(
+            store.awaitWake([QueueName("default")], empty.wakeToken)
+          )
+          yield* TestClock.adjust(1)
+          yield* store.ack(id, "t-parent", { _tag: "FanOut", failFast: false, children: [] })
+          yield* TestClock.adjust(1)
+          expect(yield* Fiber.join(waiter)).toBeUndefined()
+        })
+      ))
+
+    it.effect("automatic retention spares a settled parent that still owes cascades", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          // A fail-fast settle marks rows for cascade in the same op that
+          // makes the parent prunable — retention must not race the sweeper
+          // out of its only record that cancels are still owed.
+          const keep = { failed: { count: 1, ageMs: undefined } }
+          const { id: flowId } = yield* store.enqueue(baseRequest({ keep }))
+          const claim = yield* store.claim(claimOptions({ token: "t-parent" }))
+          assert(claim._tag === "Claimed")
+          yield* store.ack(flowId, "t-parent", {
+            _tag: "FanOut",
+            failFast: true,
+            children: [childSpec(flowId, "a"), childSpec(flowId, "b")]
+          })
+          yield* store.recordChildResult(report(flowId, "a", "failed"))
+
+          // A newer failed peer would evict the flow parent under count: 1 —
+          // but its "b" row is cancelled and not yet cascaded.
+          const { id: peer1 } = yield* store.enqueue(baseRequest({ keep }))
+          const claim1 = yield* store.claim(claimOptions({ token: "t-p1" }))
+          assert(claim1._tag === "Claimed")
+          yield* store.ack(peer1, "t-p1", { _tag: "Fail", exit: undefined })
+          const spared = yield* store.getJob(flowId)
+          assert(Option.isSome(spared))
+          expect(spared.value.state).toBe("failed")
+          expect((yield* store.listChildResults(flowId)).items.length).toBe(2)
+
+          // Once the cascade is delivered, retention applies normally.
+          yield* store.markChildrenCascaded(flowId, ["b"])
+          const { id: peer2 } = yield* store.enqueue(baseRequest({ keep }))
+          const claim2 = yield* store.claim(claimOptions({ token: "t-p2" }))
+          assert(claim2._tag === "Claimed")
+          yield* store.ack(peer2, "t-p2", { _tag: "Fail", exit: undefined })
+          expect(Option.isNone(yield* store.getJob(flowId))).toBe(true)
+          expect((yield* store.listChildResults(flowId)).items).toEqual([])
         })
       ))
 

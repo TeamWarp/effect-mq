@@ -28,6 +28,25 @@ As-built deviations from this document:
   (at-least-once); there is no "child lost" failure synthesis. The
   retention guidance (child terminal `keep` > sweep interval) is what
   prevents pruned-terminal-but-unreported re-runs.
+- **Report ordering** (revised after the implementation review): the child
+  worker acks FIRST and reports only after its ack landed, inverting this
+  document's report-before-ack. Report-first let a lock-lost worker's stale
+  result poison the flow (its rejected ack meant the child re-ran, but its
+  report had already won the row first-writer-wins). Ack-first means only
+  the run that owns the lock reports; a report that then fails to deliver
+  is synthesized by the sweeper from the child's own terminal record — so
+  children even keep completing through parent-store outages, which this
+  document had deferred to the v2 outbox.
+- **Sweep fairness**: `flowSweepWork` re-arms the eligibility timestamp of
+  every reconcile row it returns, so pages rotate instead of pinning their
+  head (healthy in-flight children and rows a given sweeper cannot act on
+  no longer starve the rows behind them). Redis additionally purges staged
+  orphans (rows whose parent went terminal without ever landing a
+  manifest) during the sweep.
+- **Retention vs cascades**: automatic pruning (keep policies, historyTtl)
+  skips a settled parent whose rows still owe cascade cancels — those rows
+  are the only record that cancels are due in the child stores. `remove`
+  stays an operator override.
 
 ## Goal
 

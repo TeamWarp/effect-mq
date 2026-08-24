@@ -4,6 +4,56 @@ All notable changes to `effect-mq`. Versions follow 0.x semver: **minor
 bumps may break** (the `JobStore` driver contract in particular); patch
 bumps are additive.
 
+## 0.6.0 — unreleased
+
+- **Parent-child flows, cross-store** — the new `Flow` module: a parent job
+  fans out N children (each bound to its own store — a Postgres cron parent
+  can fan 10k idempotent sends into Redis), parks in the new
+  `waiting-children` state, and resumes with their typed results.
+  `Flow.make({ parent, children, onChildFailure })` +
+  `Flow.children(job, items)` + the two-phase
+  `flow.toLayer({ fanOut, collect })` handler; the producer surface
+  (`enqueue`/`execute`/`poll`/`awaitResult`/`cancel`/`schedule`, ...)
+  delegates to the parent job. Child workers declare
+  `Worker.layer({ flows })` and report each child's terminal result into
+  the parent store right after their ack; a parent-side flow sweeper
+  (`flowSweepInterval`, default 30s) reconciles everything the fast path
+  can miss — crashes between fan-out and enqueue, stall-exhausted or
+  directly-cancelled children, dropped reports, misconfigured workers —
+  from storage alone, and cascades cancels after fail-fast/cancel settles.
+  Child keys are the idempotency mechanism (deterministic ids
+  `flow/<parentStore>/<flowId>/<key>`; the child's `idempotencyKey`/
+  `dedupe` do not apply); duplicate keys and payload-validation bugs fail
+  the fan-out unrecoverably. New metrics: `effect_mq_flow_fanouts`,
+  `effect_mq_flow_child_reports` (by `outcome`/`source`),
+  `effect_mq_flow_cascades`, `effect_mq_flow_unreportable_children`; the
+  parent's ledger records a `fanned-out` entry (consuming no attempt).
+  Docs: [Parent-child flows](https://www.effect-mq.com/guide/flows).
+- **Postgres migration (applies to every drizzle user, flows or not)** —
+  the jobs table gains nullable `parent` jsonb, `flow_fail_fast` boolean,
+  and `flow_pending` integer columns; a new `effect_mq_flow_children`
+  table ships via the new `mqFlowChildren()` schema factory; and
+  `DrizzleJobStore.layer` now **requires** the `flowChildren` table option
+  (a compile error until you add it — run `drizzle-kit generate`/`migrate`
+  before deploying). The Redis driver needs no migration: old hashes
+  simply decode without the new fields.
+- **Store contract (breaking for driver authors)** — `JobState` gains
+  `"waiting-children"` (counts bucket included; never claimable;
+  promote/retry reject it; cancel settles it and marks its children);
+  `EnqueueRequest.parent`/`JobRecord.parent` (opaque envelope, persisted
+  like `trace`) and `JobRecord.flow`; `AckOutcome` gains `FanOut`;
+  new ops `recordChildResult` (idempotent, settle-exactly-once,
+  dependency-row-then-parent lock order), `listChildResults`,
+  `flowSweepWork` (returned rows re-arm — pages rotate), and
+  `markChildrenCascaded`; `AttemptRecord.outcome` gains `"fanned-out"`;
+  automatic retention must skip settled parents whose rows still owe
+  cascade cancels. All conformance-pinned (the suite grew ~20 flow tests,
+  including the settle-race, fail-fast-tie, cancel-racing-fan-out, and
+  retention-exemption pins).
+- Also fixed while under review: the Postgres driver's `list()` had been
+  omitting `dedupeKey` and `trace` from listed records (now
+  conformance-pinned via a list/getJob parity check).
+
 ## 0.5.0 — 2026-08-24
 
 - **Declarative schedule reconciliation** — `JobSchedules.layer({ group,

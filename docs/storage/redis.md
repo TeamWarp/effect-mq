@@ -66,6 +66,8 @@ Everything lives under the configurable prefix (`p` below):
 | `p:paused` | set | paused queues |
 | `p:schedules` / `p:schedule:<key>` | zset + hash | repeatable-job schedules by `nextRunAt` |
 | `p:dedupe:<name>\0<key>` / `p:dedupes` | hash + zset | dedup-key registry and window index |
+| `p:flowchild:<flowId>\0<key>` / `p:flowchildren:<flowId>` | hash + zset | [flow](/guide/flows) dependency rows and their per-flow index |
+| `p:flowpending` / `p:flowcascade` | zset | the flow sweeper's reconcile and cascade work indexes |
 
 The layout is an implementation detail: inspect it with `redis-cli`, but mutate only through the store, the same [rule as Postgres](/storage/postgres#reads-yes-writes-no).
 

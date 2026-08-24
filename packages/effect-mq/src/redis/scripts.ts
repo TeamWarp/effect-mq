@@ -28,7 +28,7 @@
  * - `p:schedules` / `p:schedule:<key>`  ZSET by nextRunAt + HASH per record
  * - `p:dedupe:<name>\0<key>`   HASH {jobId, expiresAt} + `p:dedupes` index
  *                               ZSET (score = window expiry, +inf = pending)
- * - `p:flowchild:<flowId>:<childKey>`  HASH of one flow dependency row
+ * - `p:flowchild:<flowId>\0<childKey>`  HASH of one flow dependency row
  * - `p:flowchildren:<flowId>`  ZSET (score 0, member = childKey; ZRANGEBYLEX
  *                               gives child-key order + cursor pagination)
  * - `p:flowpending`             ZSET, member `<flowId>\0<childKey>`, score
@@ -82,9 +82,11 @@ local function appendAttempt(id, outcome, startedAt, finishedAt, exitJson)
     ',"outcome":"' .. outcome .. '"' .. ex .. '}')
 end
 -- Flow dependency rows live in the parent store, one hash per child plus a
--- per-flow member index (childKey order via ZRANGEBYLEX). The sweep indexes
--- join flowId and childKey with NUL — ids and keys may contain ":".
-local function flowChildKey(flowId, childKey) return prefix .. ":flowchild:" .. flowId .. ":" .. childKey end
+-- per-flow member index (childKey order via ZRANGEBYLEX). Row keys and the
+-- sweep-index members join flowId and childKey with NUL — ids and keys may
+-- both contain ":", so a printable separator could alias two distinct
+-- (flowId, childKey) pairs onto one row.
+local function flowChildKey(flowId, childKey) return prefix .. ":flowchild:" .. flowId .. "\0" .. childKey end
 local function flowIndexKey(flowId) return prefix .. ":flowchildren:" .. flowId end
 local function flowMember(flowId, childKey) return flowId .. "\0" .. childKey end
 -- Settle-time marking: remaining pending rows flip to cancelled (NOT
@@ -100,6 +102,22 @@ local function markPendingRowsCancelled(flowId)
       redis.call("ZADD", prefix .. ":flowcascade", 0, flowMember(flowId, keys[i]))
     end
   end
+end
+-- A settled flow parent whose rows still owe cascade cancels is exempt from
+-- AUTOMATIC retention (keep policies, the history sweep): deleting it would
+-- delete the only record that the child stores are still owed real cancels.
+-- The explicit remove verb is the operator override and is NOT exempted.
+-- Cheap for non-parents: the per-flow index only exists for fanned-out jobs.
+local function owesCascades(id)
+  if redis.call("EXISTS", flowIndexKey(id)) == 0 then return false end
+  local keys = redis.call("ZRANGE", flowIndexKey(id), 0, -1)
+  for i = 1, #keys do
+    local rk = flowChildKey(id, keys[i])
+    if redis.call("HGET", rk, "status") == "cancelled" and redis.call("HGET", rk, "cascaded") == "0" then
+      return true
+    end
+  end
+  return false
 end
 -- Remove a job and every index entry that references it. A flow parent takes
 -- its dependency rows and their sweep-index members with it (flowId = job id).
@@ -145,9 +163,13 @@ local function applyKeep(name, state, keepJson, now)
     end
   end
   local tkey = terminalKey(name, state)
+  -- Retention exemption: parents still owing cascade cancels are spared
+  -- (they still occupy a keep-count slot, exactly like the memory driver).
   if keep.ageMs ~= nil then
     local old = redis.call("ZRANGEBYSCORE", tkey, "-inf", now - keep.ageMs)
-    for i = 1, #old do deleteJob(old[i]) end
+    for i = 1, #old do
+      if not owesCascades(old[i]) then deleteJob(old[i]) end
+    end
   end
   -- Floor + clamp: a fractional/negative count must degrade like the memory
   -- driver's slice(), never error mid-script (writes before an error stick).
@@ -166,7 +188,9 @@ local function applyKeep(name, state, keepJson, now)
       if a.fa ~= b.fa then return a.fa > b.fa end
       return a.seq > b.seq
     end)
-    for i = count + 1, #arr do deleteJob(arr[i].id) end
+    for i = count + 1, #arr do
+      if not owesCascades(arr[i].id) then deleteJob(arr[i].id) end
+    end
   end
 end
 local function dedupeStoreKey(name, key) return prefix .. ":dedupe:" .. name .. "\0" .. key end
@@ -1182,7 +1206,9 @@ for i = 1, #batch, 2 do
         end
       end
     end
-    if cutoffAge ~= nil and finishedAt <= now - cutoffAge then
+    -- Parents still owing cascade cancels are exempt from automatic
+    -- retention; they count as scanned so the offset cursor walks past them.
+    if cutoffAge ~= nil and finishedAt <= now - cutoffAge and not owesCascades(id) then
       deleteJob(id)
       deleted = deleted + 1
     end
@@ -1437,6 +1463,8 @@ return '{"applied":true,"parentSettled":false}'
 /**
  * listChildResults(prefix, flowId, cursor, limit) — child-key order via
  * ZRANGEBYLEX over the per-flow index; cursor = last childKey (exclusive).
+ * Items are positional HMGET tuples (the field list must stay in lockstep
+ * with the driver's CHILD_ROW_FIELDS) — the full spec JSON stays server-side.
  */
 export const listChildResults = Redis.script(
   (prefix: string, flowId: string, cursor: string, limit: number) => [prefix, flowId, cursor, limit],
@@ -1449,7 +1477,8 @@ local limit = tonumber(ARGV[4])
 local keys = redis.call("ZRANGEBYLEX", flowIndexKey(flowId), min, "+", "LIMIT", 0, limit + 1)
 local items = {}
 for i = 1, math.min(#keys, limit) do
-  items[#items + 1] = redis.call("HGETALL", flowChildKey(flowId, keys[i]))
+  items[#items + 1] = redis.call("HMGET", flowChildKey(flowId, keys[i]),
+    "childKey", "storeKey", "childJobId", "name", "status", "exit", "failedReason", "cascaded")
 end
 if #items == 0 then return '{"items":[],"more":false}' end
 return cjson.encode({ items = items, more = #keys > limit })
@@ -1459,12 +1488,24 @@ return cjson.encode({ items = items, more = #keys > limit })
 
 /**
  * flowSweepWork(prefix, pendingAgeMs, limit, now) -> {reconcile, cascade}
- * grouped by flowId. Reconcile scans the flowpending zset (score =
- * pendingSince) but yields only rows whose parent is still parked in
- * waiting-children — other members are skipped WITHOUT removal (the parent
- * may re-park). Cascade lists flowcascade members (cancels still owed to
- * child stores). Spec/exit JSON strings pass through untouched — the script
- * never cjson-decodes stored payloads (precision, lone surrogates).
+ * grouped by flowId. Reconcile scans the flowpending zset (score = the row's
+ * sweep-eligibility timestamp) and yields rows whose parent is still parked
+ * in waiting-children. Every scanned member is re-armed or purged so no
+ * member can pin the head of the page:
+ *
+ * - parent missing, or terminal with NO manifest: a crashed fan-out's
+ *   staged orphan — purge the row, its index member, and the flowpending
+ *   member (left alone their old scores would head-pin every page forever);
+ * - parent alive but not waiting-children (mid-staging): re-arm to $now so
+ *   it rotates behind fresher work;
+ * - returned rows: re-arm to $now (defer-on-return, per the contract) so a
+ *   full page rotates across sweeps;
+ * - a non-pending row's membership is stale (rows never return to pending):
+ *   self-heal by removing the member.
+ *
+ * Cascade lists flowcascade members (cancels still owed to child stores).
+ * Spec/exit JSON strings pass through untouched — the script never
+ * cjson-decodes stored payloads (precision, lone surrogates).
  */
 export const flowSweepWork = Redis.script(
   (prefix: string, pendingAgeMs: number, limit: number, now: number) => [prefix, pendingAgeMs, limit, now],
@@ -1481,21 +1522,39 @@ for _, member in ipairs(due) do
   local sep = string.find(member, "\0", 1, true)
   local flowId = string.sub(member, 1, sep - 1)
   local childKey = string.sub(member, sep + 1)
-  if redis.call("HGET", jobKey(flowId), "state") == "waiting-children" then
+  local jk = jobKey(flowId)
+  local state = redis.call("HGET", jk, "state")
+  local pendingField = redis.call("HGET", jk, "flowPending")
+  local hasManifest = pendingField ~= false and pendingField ~= ""
+  local terminal = state == "completed" or state == "failed" or state == "cancelled"
+  if state == false or (terminal and not hasManifest) then
+    -- Staged orphan (parent gone, or went terminal before a manifest ever
+    -- landed): purge, or its old score head-pins every future page.
+    redis.call("DEL", flowChildKey(flowId, childKey))
+    redis.call("ZREM", flowIndexKey(flowId), childKey)
+    redis.call("ZREM", prefix .. ":flowpending", member)
+  elseif state ~= "waiting-children" then
+    -- Alive but not parked (e.g. mid-staging): not this sweep's business —
+    -- rotate it behind fresher work.
+    redis.call("ZADD", prefix .. ":flowpending", now, member)
+  elseif redis.call("HGET", flowChildKey(flowId, childKey), "status") ~= "pending" then
+    -- Stale membership (rows never return to pending): self-heal.
+    redis.call("ZREM", prefix .. ":flowpending", member)
+  else
     local rk = flowChildKey(flowId, childKey)
-    if redis.call("HGET", rk, "status") == "pending" then
-      local group = rIndex[flowId]
-      if group == nil then
-        group = { flowId = flowId, children = {} }
-        rIndex[flowId] = group
-        reconcile[#reconcile + 1] = group
-      end
-      group.children[#group.children + 1] = {
-        childKey = childKey,
-        storeKey = redis.call("HGET", rk, "storeKey"),
-        spec = redis.call("HGET", rk, "spec")
-      }
+    local group = rIndex[flowId]
+    if group == nil then
+      group = { flowId = flowId, children = {} }
+      rIndex[flowId] = group
+      reconcile[#reconcile + 1] = group
     end
+    group.children[#group.children + 1] = {
+      childKey = childKey,
+      storeKey = redis.call("HGET", rk, "storeKey"),
+      spec = redis.call("HGET", rk, "spec")
+    }
+    -- Returned work defers its own re-eligibility by one age: page rotation.
+    redis.call("ZADD", prefix .. ":flowpending", now, member)
   end
 end
 local cascade, cIndex = {}, {}

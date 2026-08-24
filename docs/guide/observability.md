@@ -55,7 +55,7 @@ The *durable* analogues stay in the store: `store.counts()` for live depth and t
 | Instrument | Metric name | Type | Tags |
 | --- | --- | --- | --- |
 | `jobsEnqueued` | `effect_mq_jobs_enqueued` | counter | `name`, `queue`, `duplicate` |
-| `jobRuns` | `effect_mq_job_runs` | counter | `name`, `queue`, `outcome` (completed \| retried \| failed \| cancelled \| released) |
+| `jobRuns` | `effect_mq_job_runs` | counter | `name`, `queue`, `outcome` (completed \| retried \| failed \| cancelled \| released \| fanned-out) |
 | `jobRunDuration` | `effect_mq_job_run_duration_ms` | histogram | `name`, `queue`, `outcome` |
 | `jobWaitDuration` | `effect_mq_job_wait_duration_ms` | histogram | `name`, `queue` |
 | `claims` | `effect_mq_claims` | counter | `queue`, `result` (claimed \| empty) |
@@ -65,6 +65,10 @@ The *durable* analogues stay in the store: `store.counts()` for live depth and t
 | `cancelInterrupts` | `effect_mq_cancel_interrupts` | counter | none |
 | `stalledRecovered` | `effect_mq_stalled_recovered` | counter | `outcome` (requeued \| failed) |
 | `scheduleTicks` | `effect_mq_schedule_ticks` | counter | `name` |
+| `flowFanOuts` | `effect_mq_flow_fanouts` | counter | `flow` |
+| `flowChildReports` | `effect_mq_flow_child_reports` | counter | `flow`, `outcome`, `source` (report \| reconcile) |
+| `flowCascades` | `effect_mq_flow_cascades` | counter | none |
+| `flowUnreportableChildren` | `effect_mq_flow_unreportable_children` | counter | `flow` |
 
 All tags are low-cardinality attributes: job name, queue, outcome. Ids and keys never appear as tags.
 

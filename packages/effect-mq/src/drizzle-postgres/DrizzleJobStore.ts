@@ -205,7 +205,8 @@ type FlowChildRow = {
   readonly childKey: string
   readonly name: string
   readonly storeKey: string
-  readonly spec: JobStore.EnqueueRequest
+  /** Projected from `spec->>'id'` (never NULL: the FanOut ack validated it). */
+  readonly childJobId: string
   readonly status: JobStore.FlowChildRecord["status"]
   readonly exit: unknown
   readonly failedReason: string | null
@@ -217,8 +218,7 @@ const toFlowChildRecord = (row: FlowChildRow): JobStore.FlowChildRecord => ({
   childKey: row.childKey,
   name: row.name,
   storeKey: row.storeKey,
-  // SAFETY: the FanOut ack validated every spec id before persisting it.
-  childJobId: row.spec.id as JobStore.JobId,
+  childJobId: JobId(row.childJobId),
   status: row.status,
   exit: row.exit ?? undefined,
   failedReason: row.failedReason ?? undefined,
@@ -382,10 +382,17 @@ export const make = (
         for (const state of ["completed", "failed", "cancelled"] as const) {
           const ttl = ttlByState[state]
           // The CTE purges a pruned flow parent's dependency rows atomically.
+          // Parents still owing cascade cancels (rows `cancelled` and not
+          // `cascaded`) are exempt from the automatic sweep — those rows are
+          // the only record that cancels are still due in the child stores.
           yield* db.execute(sql`
             WITH deleted AS (
               DELETE FROM ${jobs}
-              WHERE ${jobs.state} = ${state} AND (
+              WHERE ${jobs.state} = ${state} AND NOT EXISTS (
+                SELECT 1 FROM ${flowChildren}
+                WHERE ${flowChildren.flowId} = ${jobs.id}
+                  AND ${flowChildren.status} = 'cancelled' AND ${flowChildren.cascaded} = FALSE
+              ) AND (
                 ${ttl !== undefined ? sql`${jobs.finishedAt} <= ${new Date(now.getTime() - ttl)}` : sql`FALSE`}
                 OR (
                   COALESCE(
@@ -486,12 +493,22 @@ export const make = (
         const keep = keepPolicyFor(row.keep, row.state)
         if (keep === undefined) return
         // The CTEs purge a pruned flow parent's dependency rows atomically.
+        // A settled flow parent whose rows still owe cascade cancels
+        // (`cancelled` and not `cascaded`) is exempt from automatic pruning:
+        // those rows are the only record that real cancels are still due in
+        // the child stores. The explicit `remove` verb is not exempted.
+        const owesCascades = sql`EXISTS (
+          SELECT 1 FROM ${flowChildren}
+          WHERE ${flowChildren.flowId} = ${jobs.id}
+            AND ${flowChildren.status} = 'cancelled' AND ${flowChildren.cascaded} = FALSE
+        )`
         if (keep.ageMs !== undefined) {
           yield* tx.execute(sql`
             WITH deleted AS (
               DELETE FROM ${jobs}
               WHERE ${jobs.name} = ${row.name} AND ${jobs.state} = ${row.state}
                 AND ${jobs.finishedAt} <= ${new Date(now.getTime() - keep.ageMs)}
+                AND NOT ${owesCascades}
               RETURNING ${jobs.id} AS id
             )
             DELETE FROM ${flowChildren}
@@ -509,6 +526,7 @@ export const make = (
                   ORDER BY ${jobs.finishedAt} DESC, ${jobs.seq} DESC
                   LIMIT ${keep.count}
                 )
+                AND NOT ${owesCascades}
               RETURNING ${jobs.id} AS id
             )
             DELETE FROM ${flowChildren}
@@ -749,6 +767,7 @@ export const make = (
                 name: string
                 keep: JobStore.KeepPolicy | null
                 dedupeKey: string | null
+                hasFlow: boolean
               }
             >(sql`
               UPDATE ${jobs} SET
@@ -759,7 +778,7 @@ export const make = (
               WHERE ${jobs.id} = ${id} AND ${jobs.state} IN ('waiting', 'delayed', 'active', 'waiting-children')
               RETURNING ${jobs.id} AS id, ${jobs.state} AS state,
                 ${jobs.processedAt} AS "processedAt", ${jobs.name} AS "name", ${jobs.keep} AS "keep",
-                ${jobs.dedupeKey} AS "dedupeKey"
+                ${jobs.dedupeKey} AS "dedupeKey", (${jobs.flowPending} IS NOT NULL) AS "hasFlow"
             `))
             const row = rows[0]
             if (row === undefined) {
@@ -773,6 +792,19 @@ export const make = (
               return yield* new JobStore.JobNotCancellableError({ jobId: id, state: found.state })
             }
             if (row.state === "cancelled") {
+              if (row.hasFlow) {
+                // Re-run the marking now that the parent lock is held: the
+                // first UPDATE above races a concurrent FanOut — its
+                // uncommitted dependency-row INSERTs are invisible, while
+                // this UPDATE's own EPQ re-check can still see the parent as
+                // 'waiting-children' after the FanOut commits. Without this
+                // pass those rows would stay 'pending' forever, invisible to
+                // both sweep classes.
+                yield* tx.execute(sql`
+                  UPDATE ${flowChildren} SET status = 'cancelled', cascaded = FALSE
+                  WHERE ${flowChildren.flowId} = ${id} AND ${flowChildren.status} = 'pending'
+                `)
+              }
               yield* insertAttempt(tx, id, "cancelled", row.processedAt, now, undefined)
               yield* releaseDedupe(tx, row.name, row.dedupeKey, id, now)
               yield* applyKeep(tx, { name: row.name, state: "cancelled", keep: row.keep }, now)
@@ -1769,10 +1801,12 @@ export const make = (
         Effect.gen(function*() {
           const limit = Math.max(1, listOptions?.limit ?? 1000)
           const cursor = listOptions?.cursor
+          // `spec->>'id'` instead of the whole spec: at 10k children the full
+          // payloads would transfer on every collect.
           const rows = rowsOf(yield* db.execute<FlowChildRow>(sql`
             SELECT ${flowChildren.flowId} AS "flowId", ${flowChildren.childKey} AS "childKey",
               ${flowChildren.name} AS "name", ${flowChildren.storeKey} AS "storeKey",
-              ${flowChildren.spec} AS "spec", ${flowChildren.status} AS "status",
+              ${flowChildren.spec}->>'id' AS "childJobId", ${flowChildren.status} AS "status",
               ${flowChildren.exit} AS "exit", ${flowChildren.failedReason} AS "failedReason",
               ${flowChildren.cascaded} AS "cascaded"
             FROM ${flowChildren}
@@ -1801,19 +1835,40 @@ export const make = (
             readonly storeKey: string
             readonly spec: JobStore.EnqueueRequest
           }
-          // Reconcile: pending rows past the threshold whose parent is still
-          // parked (a settled flow never re-drives work). The raw column
-          // names are safe: only table names vary across factory instances.
+          // Reconcile: pending rows past the eligibility threshold whose
+          // parent is still parked (a settled flow never re-drives work).
+          // Returning a row re-arms `pending_since` in the same statement, so
+          // a full page rotates across sweeps instead of pinning its head.
+          // SKIP LOCKED: rows a concurrent report/settle holds are its
+          // business, and never waiting means this statement cannot deadlock.
+          // The raw column names are safe: only table names vary across
+          // factory instances. RETURNING order is unspecified — sorted below.
           const reconcileRows = rowsOf(yield* db.execute<SweepRow>(sql`
-            SELECT c.flow_id AS "flowId", c.child_key AS "childKey",
-              c.store_key AS "storeKey", c.spec AS "spec"
-            FROM ${flowChildren} c
-            JOIN ${jobs} j ON j.id = c.flow_id
-            WHERE c.status = 'pending' AND c.pending_since <= ${threshold}
-              AND j.state = 'waiting-children'
-            ORDER BY c.flow_id, c.child_key
-            LIMIT ${limit}
+            WITH due AS (
+              SELECT c.flow_id, c.child_key
+              FROM ${flowChildren} c
+              JOIN ${jobs} j ON j.id = c.flow_id
+              WHERE c.status = 'pending' AND c.pending_since <= ${threshold}
+                AND j.state = 'waiting-children'
+              ORDER BY c.flow_id, c.child_key
+              LIMIT ${limit}
+              FOR UPDATE OF c SKIP LOCKED
+            )
+            UPDATE ${flowChildren} SET pending_since = ${now}
+            FROM due
+            WHERE ${flowChildren.flowId} = due.flow_id AND ${flowChildren.childKey} = due.child_key
+            RETURNING ${flowChildren.flowId} AS "flowId", ${flowChildren.childKey} AS "childKey",
+              ${flowChildren.storeKey} AS "storeKey", ${flowChildren.spec} AS "spec"
           `).pipe(Effect.mapError(storeError("flowSweepWork failed"))))
+            .toSorted((a, b) =>
+              a.flowId !== b.flowId
+                ? (a.flowId < b.flowId ? -1 : 1)
+                : a.childKey < b.childKey
+                ? -1
+                : a.childKey > b.childKey
+                ? 1
+                : 0
+            )
           // Cascade: cancelled rows whose cancel has not been delivered into
           // the child's store yet (any parent state).
           const cascadeRows = rowsOf(yield* db.execute<SweepRow>(sql`

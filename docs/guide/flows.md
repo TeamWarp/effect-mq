@@ -70,7 +70,7 @@ const EmailWorker = SendEmail.toLayer(handleEmail).pipe(
 )
 ```
 
-`flows` gives the worker the parent store, and the worker writes each child's terminal result into it *before* acking the child. A worker that claims a flow child without the registration fails it with a clear message instead of silently looping; the flow sweeper converts that failure into a failed report, so the parent learns about the misconfiguration instead of hanging. Workers that run the parent phases via `Flow.toLayer` get reporting rights on their own store for free, so same-store flows need no `flows` entry.
+`flows` gives the worker the parent store, and the worker writes each child's terminal result into it right after the child's ack lands — only the run that actually won the ack reports, so a worker whose lock was lost mid-run can never record a stale result. A worker that claims a flow child without the registration fails it with a clear message instead of silently looping; the flow sweeper converts that failure into a failed report, so the parent learns about the misconfiguration instead of hanging. Workers that run the parent phases via `Flow.toLayer` get reporting rights on their own store for free, so same-store flows need no `flows` entry.
 
 ## Children and idempotency
 
@@ -116,8 +116,8 @@ Cancelling a flow parent while it waits (`DigestFlow.cancel(flowId)`) settles it
 
 The parent's store owns the flow: the manifest, per-child results, and the pending counter live there, so "the flow settles exactly once" is a single-store atomic decision even when children live elsewhere. Cross-store coordination then needs only two at-least-once, idempotent mechanisms:
 
-1. **Reports** (fast path): the child's worker writes the result into the parent store before acking the child. If the parent store is down, the child is never acked; it stalls and re-runs, and the duplicate report drops on the recorded row.
-2. **Reconciliation** (repair path): every parent worker runs a flow sweeper (default every 30 seconds, `Worker.layer({ flowSweepInterval })`). For each child still pending past the sweep age it checks the child's store directly: a missing child is (re-)enqueued from the persisted spec, covering crashes between the fan-out ack and the enqueue; a terminal child gets its report synthesized from the child store's own record, covering stall-exhausted children, direct cancels, and misconfigured workers. In-flight children are left alone.
+1. **Reports** (fast path): the child's worker acks the child, then writes the result into the parent store. A report that fails to deliver (the parent store is down, the process crashes in between) loses nothing — the child's own record holds the result, and the sweeper picks it up.
+2. **Reconciliation** (repair path): every parent worker runs a flow sweeper (default every 30 seconds, `Worker.layer({ flowSweepInterval })`). For each child still pending past the sweep age it checks the child's store directly: a missing child is (re-)enqueued from the persisted spec, covering crashes between the fan-out ack and the enqueue; a terminal child gets its report synthesized from the child store's own record, covering dropped reports, stall-exhausted children, direct cancels, and misconfigured workers. In-flight children are left alone, and each sweep page rotates, so a large flow's healthy children never starve another flow's repair work.
 
 Every step dedups: enqueues on the deterministic id, reports on the dependency row, cancels on child state. A crash anywhere leaves work the next sweep finishes.
 
@@ -127,7 +127,7 @@ Results are copied into the parent store, so child stores can prune terminal chi
 
 ## Scale and observability
 
-Fan-out inserts dependency rows and enqueues children in chunks, so ten-thousand-child flows work out of the box. Each child completion writes one report into the parent store; the dependency rows update in parallel, while the pending-counter decrement serializes on the parent row. That lock is held sub-millisecond, so thousands of reports per second through one flow are fine, and it is a per-flow ceiling rather than a store-wide one.
+Fan-out inserts dependency rows and enqueues children in chunks, so ten-thousand-child flows work out of the box. Each child completion writes one report into the parent store; the dependency rows update in parallel, while the pending-counter decrement serializes on the parent row. On Postgres that lock spans the report transaction (a few client round trips), so expect a per-flow report throughput on the order of hundreds per second per millisecond of database RTT — a per-flow ceiling, not a store-wide one. Redis reports are single scripts and go faster, with one caveat: a fail-fast settle or parent cancel marks every remaining child inside one atomic script, which briefly holds the whole (single-threaded) server at very large fan-outs. If you routinely fan out far past ten thousand children, put the parent on Postgres.
 
 Child spans attach to the fan-out run's span context. For large fan-outs, one trace with ten thousand children renders badly; consider `traceLinking: "link"` on the child workers.
 

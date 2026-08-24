@@ -1039,9 +1039,15 @@ export interface Service {
 
   /**
    * The flow sweeper's work list (see `FlowSweepWork`). `pendingAgeMs`
-   * scopes reconciliation to rows that have been `pending` at least this
-   * long (giving the push path time); `limit` bounds the rows returned per
-   * class per sweep.
+   * scopes reconciliation to rows whose eligibility timestamp is at least
+   * this old (giving the push path time); `limit` bounds the rows returned
+   * per class per sweep.
+   *
+   * Returning a row for reconciliation re-arms its eligibility timestamp
+   * (it is not returned again until another `pendingAgeMs` elapses), so a
+   * full page ROTATES across sweeps: healthy in-flight children and rows
+   * this sweeper cannot act on never pin the head of the page and starve
+   * the rows behind them.
    *
    * @since 0.6.0
    */
@@ -1068,6 +1074,12 @@ export interface Service {
   /**
    * Remove a job (and its ledger; a flow parent's dependency rows go with
    * it). Refuses (returns false) when active or `waiting-children`.
+   *
+   * Note the retention asymmetry for flows: AUTOMATIC pruning (`keep`
+   * policies, the `historyTtl` sweep) must skip a settled flow parent whose
+   * rows still owe cascade cancels (`cancelled` and not `cascaded`) — those
+   * rows are the only record that real cancels are still due in the child
+   * stores. `remove` is the explicit operator override and deletes anyway.
    */
   readonly remove: (id: JobId) => Effect.Effect<boolean, JobStoreError>
 }

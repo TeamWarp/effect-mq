@@ -126,7 +126,8 @@ interface MemFlowChild {
   exit: unknown
   failedReason: string | undefined
   cascaded: boolean
-  readonly pendingSince: number
+  /** Sweep-eligibility timestamp: set at FanOut, re-armed on each return. */
+  pendingSince: number
 }
 
 const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemoryStore => {
@@ -228,6 +229,23 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
     flowChildren.delete(id as JobId)
   }
 
+  // A settled flow parent whose rows still owe cascade cancels is exempt
+  // from automatic retention (keep policies, the history sweep): deleting
+  // it would delete the only record that the child stores are still owed
+  // real cancels, leaving marked children running. Once the sweeper marks
+  // the rows cascaded, retention applies normally. The explicit `remove`
+  // verb is NOT exempted — it is an operator override.
+  const owesCascades = (id: string) => {
+    // SAFETY: flowChildren keys are JobIds; a plain string that is not one
+    // simply misses.
+    const rows = flowChildren.get(id as JobId)
+    if (rows === undefined) return false
+    for (const row of rows.values()) {
+      if (row.status === "cancelled" && !row.cascaded) return true
+    }
+    return false
+  }
+
   // Settle-time marking: remaining pending rows flip to cancelled (NOT
   // cascaded — the sweeper still owes the child stores real cancels), so
   // late reports find their row terminal and drop, and `listChildResults`
@@ -305,6 +323,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
       }
     }
     for (const id of remove) {
+      if (owesCascades(id)) continue
       deleteJob(id)
     }
   }
@@ -319,7 +338,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
       // The sweep honours min(per-row keep age, store ceiling) — a quiet job
       // name is pruned on the timer, not only when its group is acked.
       const effective = keepAge !== undefined && (ttl === undefined || keepAge < ttl) ? keepAge : ttl
-      if (effective !== undefined && job.finishedAt <= now - effective) {
+      if (effective !== undefined && job.finishedAt <= now - effective && !owesCascades(job.id)) {
         deleteJob(job.id)
       }
     }
@@ -1008,6 +1027,11 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
               reconcileGroup ??= []
               reconcileGroup.push({ childKey: row.childKey, storeKey: row.storeKey, request: row.spec })
               reconcileCount += 1
+              // Returned work defers its own re-eligibility by one age, so a
+              // full page rotates instead of pinning the head: healthy
+              // in-flight children stop occupying every sweep, and rows no
+              // sweeper can act on cannot starve the ones behind them.
+              row.pendingSince = now
             }
             if (row.status === "cancelled" && !row.cascaded && cascadeCount < limit) {
               cascadeGroup ??= []

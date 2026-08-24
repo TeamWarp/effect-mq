@@ -179,11 +179,21 @@ export interface ChildGroup<out J extends MemberJob = MemberJob> {
 }
 
 /**
+ * A naked-parameter distribution of `ChildGroup` over a union of members,
+ * so a group literal must pair a member's `job` with THAT member's payloads
+ * (the undistributed `ChildGroup<A | B>` would accept `A`'s job with `B`'s
+ * items).
+ *
+ * @since 0.6.0
+ */
+export type GroupsOf<J> = J extends MemberJob ? ChildGroup<J> : never
+
+/**
  * What `fanOut` returns: children of any of the flow's member types.
  *
  * @since 0.6.0
  */
-export type ChildrenInput<J extends MemberJob> = ChildGroup<J> | ReadonlyArray<ChildGroup<J>>
+export type ChildrenInput<J extends MemberJob> = GroupsOf<J> | ReadonlyArray<GroupsOf<J>>
 
 /**
  * Declare children of one member type. Payloads are validated through the
@@ -211,7 +221,7 @@ export interface CompletedChild<Name extends string, A> {
 /**
  * A child that failed terminally. `cause` carries the decoded typed failure
  * — or a die for store-side failures that never produced an exit (stall
- * exhaustion, unreportable workers, a child pruned before reporting).
+ * exhaustion, workers unable to report to the flow).
  *
  * @since 0.6.0
  */
@@ -486,8 +496,24 @@ export const make = <
             ))
           }
           seen.add(item.key)
-          const payload = member.payloadSchema.make(item.payload)
-          const encoded = yield* Schema.encodeEffect(member.payloadJsonSchema)(payload).pipe(Effect.orDie)
+          // Payload validation/encode failures are deterministic definition
+          // bugs like duplicate keys: retrying the fan-out would burn the
+          // whole attempt budget on the same throw, so die unrecoverably.
+          let payload: unknown
+          try {
+            payload = member.payloadSchema.make(item.payload)
+          } catch (error) {
+            return yield* Effect.die(unrecoverable(new Error(
+              `effect-mq: flow "${name}" child "${item.key}" payload failed validation: ${String(error)}`
+            )))
+          }
+          const encoded = yield* Schema.encodeEffect(member.payloadJsonSchema)(payload).pipe(
+            Effect.catch((error) =>
+              Effect.die(unrecoverable(new Error(
+                `effect-mq: flow "${name}" child "${item.key}" payload failed to encode: ${String(error)}`
+              )))
+            )
+          )
           // SAFETY: `metadata` is declared with a `never` parameter only to
           // make the structural constraint universal; at runtime it accepts
           // its own definition's payload, which is what `payload` is.

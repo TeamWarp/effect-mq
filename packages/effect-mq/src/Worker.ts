@@ -488,6 +488,29 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
         )
       )
 
+    // Like ackSafely, but says whether the ack definitely landed — flow
+    // reports and post-fan-out child enqueues must only follow an ack this
+    // worker actually won.
+    const ackLanded = (
+      effect: Effect.Effect<
+        void,
+        JobStoreError | JobNotFoundError | LockLostError
+      >,
+      what: string
+    ) =>
+      effect.pipe(
+        Effect.retry({
+          while: (error) => isJobStoreError(error),
+          schedule: storeRetryPolicy
+        }),
+        Effect.as(true),
+        Effect.catch((error) =>
+          Effect.logWarning(`effect-mq: ${what} dropped (${error._tag})`, error).pipe(
+            Effect.as(false)
+          )
+        )
+      )
+
     // Every failed run is logged (warning while retries remain, error once
     // terminal) and handed to the onJobFailure hook. The hook runs isolated:
     // whatever it does, job processing proceeds.
@@ -516,12 +539,13 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
         }
       })
 
-    // Report-first for flow children: the terminal result lands in the
-    // parent store BEFORE the child's own ack. If the parent store stays
-    // down past the bounded retries this dies — the child is never acked,
-    // stalls, and either re-runs (the duplicate report drops on the
-    // dependency row) or is stall-exhausted into a store-side failure the
-    // flow sweeper later reconciles. At-least-once holds end to end.
+    // Flow-child reporting runs AFTER a successful child ack — only the run
+    // that actually owns the lock reports (a lock-lost worker's stale result
+    // must never poison the flow: its ack is rejected, the new owner's ack
+    // wins, and the new owner reports). The report itself is best-effort: if
+    // it fails past the bounded retries, the child is already terminal in
+    // its own store and the flow sweeper synthesizes the report from that
+    // record on its next pass. At-least-once holds end to end.
     const reportToFlow = (
       record: JobRecord,
       outcome: "completed" | "failed" | "cancelled",
@@ -554,7 +578,14 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
             `effect-mq: flow "${envelope.flowName}" (${envelope.flowId}) settled failed-fast on child "${envelope.childKey}"`
           )
         }
-      })
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning(
+            "effect-mq: flow child report dropped; the flow sweeper will reconcile it",
+            cause
+          )
+        )
+      )
 
     const routeFailure = (record: JobRecord, exit: JobRecord["exit"]): AckOutcome => {
       const attempt = record.attemptsMade + 1
@@ -592,6 +623,38 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
               Math.max(0, finished - (record.processedAt ?? finished))
             )
           })
+        if (record.flow !== undefined && entry.flow === undefined) {
+          // A fanned-out flow parent claimed by a PLAIN handler registration
+          // (the flow was re-registered as an ordinary job in a deploy):
+          // running the plain handler would silently ack its result as the
+          // parent's terminal exit and discard the recorded child results.
+          // Fail visibly instead; once the deploy is fixed, an admin retry
+          // re-enters collect with the manifest intact.
+          return Effect.gen(function*() {
+            const cause = Cause.die(new Error(
+              `effect-mq: job "${record.name}" carries flow state (collect phase) but is registered as a plain handler; ` +
+                `register its flow via Flow.toLayer instead of Job.toLayer`
+            ))
+            const encoded = yield* Effect.exit(entry.encodeExit(Exit.failCause(cause)))
+            yield* ackSafely(
+              store.ack(record.id, token, {
+                _tag: "Fail",
+                exit: Exit.isSuccess(encoded) ? encoded.value : undefined
+              }),
+              "ack"
+            )
+            yield* reportFailure({
+              jobId: record.id,
+              name: record.name,
+              queue: record.queue,
+              attempt: context.attempt,
+              attemptsMax: record.attemptsMax,
+              willRetry: false,
+              cause
+            }, undefined)
+            yield* recordRun("failed")
+          })
+        }
         const envelope = record.parent
         if (envelope !== undefined && !reportTargets.has(envelope.flowName)) {
           // Misconfigured worker: it can RUN this flow child but cannot
@@ -707,8 +770,10 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
           // A cancel-request interrupt is terminal: ack Cancelled (even if a
           // shutdown races it — cancellation wins, the job must not revive).
           if (wasCancelled && Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)) {
-            yield* reportToFlow(record, "cancelled", undefined)
-            yield* ackSafely(store.ack(record.id, token, { _tag: "Cancelled" }), "ack")
+            const landed = yield* ackLanded(store.ack(record.id, token, { _tag: "Cancelled" }), "ack")
+            if (landed) {
+              yield* reportToFlow(record, "cancelled", undefined)
+            }
             return yield* recordRun("cancelled")
           }
 
@@ -755,9 +820,22 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
                 Metrics.flowFanOuts.pipe(Metric.withAttributes({ flow: flow.flowName })),
                 1
               )
-              // Fast path only: the flow sweeper re-drives whatever a crash
-              // here misses, straight from the persisted specs.
-              yield* flow.enqueueChildren(children)
+              // The ack may have settled the parent instead of parking it (a
+              // cancel raced the fan-out: cancellation wins and the rows are
+              // already marked for cascade) — children of a settled flow must
+              // not start. A settle that lands AFTER this check still
+              // converges: the marked rows make the sweeper cancel whatever
+              // we enqueue below.
+              const parked = children.length === 0 ? Option.none() : yield* retryStore(store.getJob(record.id))
+              if (Option.isSome(parked) && parked.value.state === "waiting-children") {
+                // Fast path only: the flow sweeper re-drives whatever a
+                // crash here misses, straight from the persisted specs.
+                yield* flow.enqueueChildren(children)
+              } else if (children.length > 0) {
+                yield* Effect.logInfo(
+                  `effect-mq: flow "${flow.flowName}" (${record.id}) settled during fan-out; children not enqueued`
+                )
+              }
             } else {
               // Lock lost or job vanished: the manifest did NOT land, so the
               // children must not run — another worker re-runs fanOut.
@@ -797,12 +875,14 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
             : unrecoverable
             ? { _tag: "Fail", exit: exitValue }
             : routeFailure(record, exitValue)
-          if (outcome._tag === "Complete") {
-            yield* reportToFlow(record, "completed", exitValue)
-          } else if (outcome._tag === "Fail") {
-            yield* reportToFlow(record, "failed", exitValue)
+          const landed = yield* ackLanded(store.ack(record.id, token, outcome), "ack")
+          if (landed) {
+            if (outcome._tag === "Complete") {
+              yield* reportToFlow(record, "completed", exitValue)
+            } else if (outcome._tag === "Fail") {
+              yield* reportToFlow(record, "failed", exitValue)
+            }
           }
-          yield* ackSafely(store.ack(record.id, token, outcome), "ack")
           if (outcome._tag === "Fail" || outcome._tag === "Retry") {
             const cause = Exit.isFailure(effective)
               ? effective.cause
@@ -1074,8 +1154,23 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
         if (Option.isNone(existing)) {
           // Never landed (crash between the FanOut ack and the enqueue), or
           // pruned before reporting (see the child-retention guidance) —
-          // (re-)drive it from the persisted spec.
+          // (re-)drive it from the persisted spec. The flow may have settled
+          // since this work item was snapshotted (another sweeper's cascade
+          // would then have found this child missing, marked its row
+          // cascaded, and moved on), so re-check the parent around the
+          // enqueue: before, to skip settled flows, and after, so a settle
+          // that lands inside the window cannot leave an orphan running.
+          const before = yield* retryStore(store.getJob(flowId))
+          if (Option.isNone(before) || before.value.state !== "waiting-children") return
           yield* retryStore(childStore.enqueue(child.request))
+          const after = yield* retryStore(store.getJob(flowId))
+          if (Option.isNone(after) || after.value.state !== "waiting-children") {
+            yield* retryStore(
+              childStore.cancel(id).pipe(
+                Effect.catchTag(["JobNotFoundError", "JobNotCancellableError"], () => Effect.void)
+              )
+            )
+          }
           return
         }
         const state = existing.value.state

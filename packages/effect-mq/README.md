@@ -395,16 +395,24 @@ migrations** — no library-run DDL, no parallel migration system:
 
 ```ts
 // db/schema.ts
-import { mqDedupe, mqJobAttempts, mqJobs, mqQueueControl, mqSchedules } from "effect-mq/drizzle-postgres"
+import {
+  mqDedupe,
+  mqFlowChildren,
+  mqJobAttempts,
+  mqJobs,
+  mqQueueControl,
+  mqSchedules
+} from "effect-mq/drizzle-postgres"
 
 // The `name` column is typed to your job tags (derived, not hand-written):
 type JobNames = typeof GenerateInvoice._tag | typeof SendEmail._tag
 
-export const jobs = mqJobs<JobNames>()          // default table: effect_mq_jobs
-export const jobAttempts = mqJobAttempts(jobs)  // default: effect_mq_job_attempts
-export const jobSchedules = mqSchedules()       // default: effect_mq_schedules
-export const jobQueues = mqQueueControl()       // default: effect_mq_queue_control
-export const jobDedupe = mqDedupe()             // default: effect_mq_dedupe
+export const jobs = mqJobs<JobNames>()            // default table: effect_mq_jobs
+export const jobAttempts = mqJobAttempts(jobs)    // default: effect_mq_job_attempts
+export const jobSchedules = mqSchedules()         // default: effect_mq_schedules
+export const jobQueues = mqQueueControl()         // default: effect_mq_queue_control
+export const jobDedupe = mqDedupe()               // default: effect_mq_dedupe
+export const jobFlowChildren = mqFlowChildren()   // default: effect_mq_flow_children
 ```
 
 Need more indexes (the built-ins cover claiming, listing, metadata
@@ -428,7 +436,7 @@ table; at enqueue the store fills each extended column from the job's
 `metadata: (payload) => ...` is your creation-time hook), NULL when absent:
 
 ```ts
-class SyncBenefits extends Job.make("sync-benefits", {
+class SyncPayments extends Job.make("sync-payments", {
   payload: { companyId: Schema.String, objectId: Schema.String },
   metadata: ({ companyId, objectId }) => ({ companyId, objectId })
 }) {}
@@ -465,14 +473,15 @@ When a future effect-mq version changes the layout, the factory changes and
 import { DrizzleJobStore } from "effect-mq/drizzle-postgres"
 import { PgClient } from "@effect/sql-pg"
 import { Layer, Redacted } from "effect"
-import { jobAttempts, jobDedupe, jobQueues, jobs, jobSchedules } from "./db/schema.ts"
+import { jobAttempts, jobDedupe, jobFlowChildren, jobQueues, jobs, jobSchedules } from "./db/schema.ts"
 
 const JobStoreLive = DrizzleJobStore.layer({
   jobs,
   attempts: jobAttempts,
   schedules: jobSchedules,
   queues: jobQueues,
-  dedupe: jobDedupe
+  dedupe: jobDedupe,
+  flowChildren: jobFlowChildren
 }).pipe(
   Layer.provide(PgClient.layer({ url: Redacted.make(process.env.DATABASE_URL!) }))
 )

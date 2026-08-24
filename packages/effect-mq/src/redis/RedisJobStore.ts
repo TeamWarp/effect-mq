@@ -134,22 +134,27 @@ const JOB_STATES: ReadonlyArray<JobStore.JobState> = [
   "cancelled"
 ]
 
-/** Fold one flow dependency-row hash into a `FlowChildRecord`. */
+/**
+ * Fold one positional dependency-row tuple into a `FlowChildRecord`. The
+ * order must stay in lockstep with the HMGET field list in the
+ * `listChildResults` script:
+ * childKey, storeKey, childJobId, name, status, exit, failedReason, cascaded.
+ */
 const toChildRecord = (
   flowId: JobStore.JobId,
-  hash: ReadonlyMap<string, string>
+  row: ReadonlyArray<string>
 ): JobStore.FlowChildRecord => ({
   flowId,
-  childKey: hash.get("childKey") ?? "",
-  name: hash.get("name") ?? "",
-  storeKey: hash.get("storeKey") ?? "",
-  childJobId: JobStore.JobId(hash.get("childJobId") ?? ""),
+  childKey: row[0] ?? "",
+  storeKey: row[1] ?? "",
+  childJobId: JobStore.JobId(row[2] ?? ""),
+  name: row[3] ?? "",
   // SAFETY: the status field is only ever written with FlowChildRecord
   // status members ("pending" at insert, a report/settle outcome after).
-  status: (hash.get("status") ?? "pending") as JobStore.FlowChildRecord["status"],
-  exit: optionalJson(hash.get("exit")),
-  failedReason: optionalString(hash.get("failedReason")),
-  cascaded: hash.get("cascaded") === "1"
+  status: (row[4] ?? "pending") as JobStore.FlowChildRecord["status"],
+  exit: optionalJson(row[5]),
+  failedReason: optionalString(row[6]),
+  cascaded: row[7] === "1"
 })
 
 /**
@@ -953,7 +958,7 @@ export const make = (
             .parse(
               yield* evalListChildResults(prefix, flowId, listOptions?.cursor ?? "", limit)
             )
-          const items = asArray(reply.items).map((flat) => toChildRecord(flowId, foldPairs(flat)))
+          const items = asArray(reply.items).map((row) => toChildRecord(flowId, row))
           const last = items[items.length - 1]
           return {
             items,
