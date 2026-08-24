@@ -562,9 +562,12 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
             // fan-out converges on the persisted children); the state
             // transition follows the persisted pending count either way.
             if (job.cancelRequested) {
-              // A cancel raced the fan-out: cancellation wins. The rows exist
-              // and get marked, so the sweeper cascades (mostly no-op cancels
-              // for never-enqueued children).
+              // A cancel raced the fan-out: cancellation wins. Mark the rows
+              // here — the job is still `active`, so markCancelled's own
+              // waiting-children marking does not apply — and the sweeper
+              // cascades (mostly no-op cancels for never-enqueued children).
+              markPendingRowsCancelled(job.id)
+              job.flow = { ...job.flow, pending: 0 }
               markCancelled(job, now)
               break
             }

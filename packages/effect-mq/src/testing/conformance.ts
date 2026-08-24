@@ -1176,6 +1176,15 @@ export const jobStoreConformance = (
             assert(Option.isSome(job))
             expect(project(job.value)).toEqual(expected)
           }
+
+          // `list` must return the same complete records as `getJob` —
+          // drivers with hand-written SELECT lists can silently drop fields
+          // there while every getJob-path test stays green.
+          const listed = yield* store.list({ name: "TestJob" })
+          expect(listed.items).toHaveLength(3)
+          for (const job of listed.items) {
+            expect(project(job)).toEqual(expected)
+          }
         })
       ))
 
@@ -2001,6 +2010,35 @@ export const jobStoreConformance = (
 
           expect(yield* store.recordChildResult(report(flowId, "b", "completed")))
             .toEqual({ applied: false, parentSettled: false })
+        })
+      ))
+
+    it.effect("a cancel that races the fan-out wins and marks the rows", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const { id } = yield* store.enqueue(baseRequest())
+          const claim = yield* store.claim(claimOptions({ token: "t-parent" }))
+          assert(claim._tag === "Claimed")
+          // Cancel the ACTIVE parent (sets cancelRequested), then the worker
+          // acks its fan-out: cancellation wins over parking.
+          yield* store.cancel(id)
+          yield* store.ack(id, "t-parent", {
+            _tag: "FanOut",
+            failFast: false,
+            children: [childSpec(id, "a"), childSpec(id, "b")]
+          })
+
+          const parent = yield* store.getJob(id)
+          assert(Option.isSome(parent))
+          expect(parent.value.state).toBe("cancelled")
+
+          // The manifest landed and every row was marked for cascade, so
+          // the sweeper delivers (mostly no-op) cancels to the child store.
+          const rows = yield* store.listChildResults(id)
+          expect(rows.items.map((row) => row.status)).toEqual(["cancelled", "cancelled"])
+          expect(rows.items.every((row) => !row.cascaded)).toBe(true)
+          const work = yield* store.flowSweepWork({ pendingAgeMs: 0 })
+          expect(work.cascade[0]?.children.map((child) => child.childKey)).toEqual(["a", "b"])
         })
       ))
 

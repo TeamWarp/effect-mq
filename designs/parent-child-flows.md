@@ -1,7 +1,33 @@
 # Design: parent-child flows (cross-store fan-out)
 
-Status: proposed, revision 2 — rewritten after an adversarial design review
-(3 lenses, 22 confirmed findings folded in below). Target: 0.5.0.
+Status: implemented (v1) for 0.6.0 — revision 2, rewritten after an
+adversarial design review (3 lenses, 22 confirmed findings folded in below).
+
+As-built deviations from this document:
+
+- **Phase marker**: persisted as `JobRecord.flow` (`{ failFast, pending }`);
+  its *presence* is the collect-phase marker, instead of a separate
+  `flowPhase` enum field. The fail-fast policy is persisted inside it.
+- **Fail-fast settle**: the store settles the parent as `failed` with
+  `failedReason: 'effect-mq: flow child "<key>" failed'` and no exit — the
+  same shape as stall exhaustion — rather than synthesizing an encoded
+  `FlowChildFailedError` exit (stores never encode exits). The failed
+  child's own exit stays inspectable via `childResults`; `awaitResult` on
+  the parent dies. The report deliverer (child worker or sweeper) logs the
+  settle at error level.
+- **Store ops**: the cascade flag write is its own op,
+  `markChildrenCascaded(flowId, childKeys)`, and the sweep threshold is a
+  caller argument (`flowSweepWork({ pendingAgeMs, limit })`). Applied
+  reports set `cascaded` immediately (the outcome came from the child's
+  store; no cancel owed).
+- **Double fan-out**: instead of rejecting, a FanOut ack that finds an
+  existing manifest converges on it (ignores the new children, transitions
+  per the persisted pending count) — safer for the only way it can occur
+  (a bug or a lost-lock re-run).
+- **Missing child at reconcile**: always re-enqueued from the stored spec
+  (at-least-once); there is no "child lost" failure synthesis. The
+  retention guidance (child terminal `keep` > sweep interval) is what
+  prevents pruned-terminal-but-unreported re-runs.
 
 ## Goal
 

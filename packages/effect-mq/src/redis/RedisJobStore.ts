@@ -85,6 +85,15 @@ const toRecord = (hash: ReadonlyMap<string, string>): JobStore.JobRecord => ({
   cancelRequested: hash.get("cancelRequested") === "1",
   dedupeKey: optionalString(hash.get("dedupeKey")),
   trace: optionalJson<JobStore.TraceContext>(hash.get("trace")),
+  parent: optionalJson<JobStore.ParentEnvelope>(hash.get("parent")),
+  // Manifest presence IS the phase marker: hashes written before flows (or
+  // parents that never fanned out) simply lack the flow fields.
+  flow: optionalString(hash.get("flowPending")) === undefined
+    ? undefined
+    : {
+      failFast: hash.get("flowFailFast") === "1",
+      pending: Number(hash.get("flowPending"))
+    },
   runAt: Number(hash.get("runAt") ?? 0),
   enqueuedAt: Number(hash.get("enqueuedAt") ?? 0),
   processedAt: optionalNumber(hash.get("processedAt")),
@@ -119,10 +128,29 @@ const JOB_STATES: ReadonlyArray<JobStore.JobState> = [
   "waiting",
   "delayed",
   "active",
+  "waiting-children",
   "completed",
   "failed",
   "cancelled"
 ]
+
+/** Fold one flow dependency-row hash into a `FlowChildRecord`. */
+const toChildRecord = (
+  flowId: JobStore.JobId,
+  hash: ReadonlyMap<string, string>
+): JobStore.FlowChildRecord => ({
+  flowId,
+  childKey: hash.get("childKey") ?? "",
+  name: hash.get("name") ?? "",
+  storeKey: hash.get("storeKey") ?? "",
+  childJobId: JobStore.JobId(hash.get("childJobId") ?? ""),
+  // SAFETY: the status field is only ever written with FlowChildRecord
+  // status members ("pending" at insert, a report/settle outcome after).
+  status: (hash.get("status") ?? "pending") as JobStore.FlowChildRecord["status"],
+  exit: optionalJson(hash.get("exit")),
+  failedReason: optionalString(hash.get("failedReason")),
+  cascaded: hash.get("cascaded") === "1"
+})
 
 /**
  * Build a `RedisJobStore` service. Needs the `Redis` service and a `Scope`
@@ -160,6 +188,11 @@ export const make = (
     const evalEnqueueMany = redis.eval(scripts.enqueueMany)
     const evalSweepState = redis.eval(scripts.sweepState)
     const evalSweepDedupes = redis.eval(scripts.sweepDedupes)
+    const evalFanOut = redis.eval(scripts.fanOut)
+    const evalRecordChildResult = redis.eval(scripts.recordChildResult)
+    const evalListChildResults = redis.eval(scripts.listChildResults)
+    const evalFlowSweepWork = redis.eval(scripts.flowSweepWork)
+    const evalMarkChildrenCascaded = redis.eval(scripts.markChildrenCascaded)
 
     // Wake protocol: a queue-filtered waiter registry (same-process wake-ups
     // never depend on the pub/sub round trip), with the channel carrying
@@ -282,8 +315,70 @@ export const make = (
         request.dedupe?.ttlMs === undefined ? "" : String(request.dedupe.ttlMs),
         request.dedupe?.extend === true ? "1" : "0",
         request.dedupe?.replace === true ? "1" : "0",
-        request.trace === undefined ? "" : JSON.stringify(request.trace)
+        request.trace === undefined ? "" : JSON.stringify(request.trace),
+        request.parent === undefined ? "" : JSON.stringify(request.parent)
       )
+
+    // The FanOut ack. Large manifests chunk their dependency rows across
+    // several lock-token-guarded script calls (ARGV strides, like
+    // enqueueMany); only the FINAL chunk writes the manifest and flips the
+    // state, so a crash mid-staging leaves the job active and recoverable —
+    // the next attempt's first chunk clears the orphaned staged rows.
+    const fanOutAck = (
+      id: JobStore.JobId,
+      token: string,
+      failFast: boolean,
+      children: ReadonlyArray<JobStore.FlowChildSpec>
+    ) =>
+      Effect.gen(function*() {
+        if (children.some((child) => child.request.id === undefined)) {
+          // Validate BEFORE any script call, so a bad spec cannot leave the
+          // job half-acked (rows staged, ledger written, still active).
+          return yield* new JobStore.JobStoreError({
+            message: "FanOut child specs require an explicit request.id"
+          })
+        }
+        const now = yield* Clock.currentTimeMillis
+        const chunks: Array<ReadonlyArray<JobStore.FlowChildSpec>> = []
+        for (let start = 0; start < children.length; start += 500) {
+          chunks.push(children.slice(start, start + 500))
+        }
+        // An empty manifest still needs the final (state-flipping) call.
+        if (chunks.length === 0) chunks.push([])
+        for (let i = 0; i < chunks.length; i++) {
+          const chunk = chunks[i]
+          if (chunk === undefined) continue
+          const items: Array<string> = []
+          for (const child of chunk) {
+            items.push(
+              child.childKey,
+              child.storeKey,
+              child.request.id ?? "",
+              child.request.name,
+              JSON.stringify(child.request)
+            )
+          }
+          const reply: { error?: string; wake?: boolean; queue?: string } = JSON.parse(
+            yield* evalFanOut(
+              prefix,
+              id,
+              token,
+              i === chunks.length - 1 ? "1" : "0",
+              i === 0 ? "1" : "0",
+              failFast ? "1" : "0",
+              children.length,
+              now,
+              chunk.length,
+              items
+            ).pipe(Effect.mapError(storeError("ack failed")))
+          )
+          if (reply.error === "notfound") return yield* new JobStore.JobNotFoundError({ jobId: id })
+          if (reply.error === "locklost") return yield* new JobStore.LockLostError({ jobId: id })
+          if (reply.wake === true) {
+            yield* wakeUp(reply.queue !== undefined ? JobStore.QueueName(reply.queue) : undefined)
+          }
+        }
+      })
 
     // Shared by cancel and cancelByDedupe.
     const cancelJob = (id: JobStore.JobId) =>
@@ -380,6 +475,7 @@ export const make = (
                 request.keep === undefined ? "" : JSON.stringify(request.keep),
                 request.timeoutMs === undefined ? "" : String(request.timeoutMs),
                 request.trace === undefined ? "" : JSON.stringify(request.trace),
+                request.parent === undefined ? "" : JSON.stringify(request.parent),
                 String(Math.max(0, request.delayMs))
               )
             }
@@ -504,15 +600,20 @@ export const make = (
           })
         }).pipe(Effect.mapError(storeError("claim failed"))),
 
-      ack: (id, token, outcome) =>
-        Effect.gen(function*() {
+      ack: (id, token, outcome) => {
+        if (outcome._tag === "FanOut") {
+          return fanOutAck(id, token, outcome.failFast, outcome.children)
+        }
+        // Narrowed binding: the closure below must see the FanOut-free union.
+        const settled = outcome
+        return Effect.gen(function*() {
           const now = yield* Clock.currentTimeMillis
-          const exitJson = outcome._tag === "Cancelled" || outcome.exit === undefined
+          const exitJson = settled._tag === "Cancelled" || settled.exit === undefined
             ? ""
-            : JSON.stringify(outcome.exit)
-          const delayMs = outcome._tag === "Retry" ? Math.max(0, outcome.delayMs) : 0
+            : JSON.stringify(settled.exit)
+          const delayMs = settled._tag === "Retry" ? Math.max(0, settled.delayMs) : 0
           const reply: { error?: string; wake?: boolean; queue?: string } = JSON.parse(
-            yield* evalAck(prefix, id, token, outcome._tag, exitJson, delayMs, now).pipe(
+            yield* evalAck(prefix, id, token, settled._tag, exitJson, delayMs, now).pipe(
               Effect.mapError(storeError("ack failed"))
             )
           )
@@ -521,7 +622,8 @@ export const make = (
           if (reply.wake === true) {
             yield* wakeUp(reply.queue !== undefined ? JobStore.QueueName(reply.queue) : undefined)
           }
-        }),
+        })
+      },
 
       release: (id, token) =>
         Effect.gen(function*() {
@@ -800,6 +902,7 @@ export const make = (
             request.keep === undefined ? "" : JSON.stringify(request.keep),
             request.timeoutMs === undefined ? "" : String(request.timeoutMs),
             request.trace === undefined ? "" : JSON.stringify(request.trace),
+            request.parent === undefined ? "" : JSON.stringify(request.parent),
             Math.max(0, request.delayMs),
             now
           )) === "1"
@@ -816,6 +919,92 @@ export const make = (
       advanceSchedule: (key, expectedRunAt, nextRunAt) =>
         evalAdvanceSchedule(prefix, key, expectedRunAt, nextRunAt).pipe(
           Effect.mapError(storeError("advanceSchedule failed")),
+          Effect.asVoid
+        ),
+
+      recordChildResult: (report) =>
+        Effect.gen(function*() {
+          const now = yield* Clock.currentTimeMillis
+          const reply: { applied: boolean; parentSettled: boolean; wake?: boolean; queue?: string } = JSON.parse(
+            yield* evalRecordChildResult(
+              prefix,
+              report.flowId,
+              report.childKey,
+              report.outcome,
+              report.exit === undefined ? "" : JSON.stringify(report.exit),
+              report.failedReason ?? "",
+              // Pre-built store-side reason for a fail-fast settle (the
+              // script uses it only on the first failed report).
+              `effect-mq: flow child "${report.childKey}" failed`,
+              now
+            )
+          )
+          if (reply.wake === true && reply.queue !== undefined) {
+            // The parent settled to runnable collect: wake its queue.
+            yield* wakeUp(JobStore.QueueName(reply.queue))
+          }
+          return { applied: reply.applied, parentSettled: reply.parentSettled }
+        }).pipe(Effect.mapError(storeError("recordChildResult failed"))),
+
+      listChildResults: (flowId, listOptions) =>
+        Effect.gen(function*() {
+          const limit = Math.max(1, listOptions?.limit ?? 1000)
+          const reply: { items: ReadonlyArray<ReadonlyArray<string>> | Record<string, never>; more: boolean } = JSON
+            .parse(
+              yield* evalListChildResults(prefix, flowId, listOptions?.cursor ?? "", limit)
+            )
+          const items = asArray(reply.items).map((flat) => toChildRecord(flowId, foldPairs(flat)))
+          const last = items[items.length - 1]
+          return {
+            items,
+            cursor: reply.more && last !== undefined ? last.childKey : undefined
+          }
+        }).pipe(Effect.mapError(storeError("listChildResults failed"))),
+
+      flowSweepWork: (sweepOptions) =>
+        Effect.gen(function*() {
+          const now = yield* Clock.currentTimeMillis
+          const limit = Math.max(1, sweepOptions.limit ?? 1000)
+          const reply: {
+            reconcile:
+              | ReadonlyArray<{
+                flowId: string
+                children: ReadonlyArray<{ childKey: string; storeKey: string; spec: string }>
+              }>
+              | Record<string, never>
+            cascade:
+              | ReadonlyArray<{
+                flowId: string
+                children: ReadonlyArray<{ childKey: string; storeKey: string; childJobId: string }>
+              }>
+              | Record<string, never>
+          } = JSON.parse(yield* evalFlowSweepWork(prefix, sweepOptions.pendingAgeMs, limit, now))
+          const work: JobStore.FlowSweepWork = {
+            reconcile: asArray(reply.reconcile).map((group) => ({
+              flowId: JobStore.JobId(group.flowId),
+              children: group.children.map((child) => {
+                // The stored spec is the verbatim JSON this driver wrote at
+                // fan-out time (never routed through cjson), so it re-parses
+                // to the original EnqueueRequest.
+                const request: JobStore.EnqueueRequest = JSON.parse(child.spec)
+                return { childKey: child.childKey, storeKey: child.storeKey, request }
+              })
+            })),
+            cascade: asArray(reply.cascade).map((group) => ({
+              flowId: JobStore.JobId(group.flowId),
+              children: group.children.map((child) => ({
+                childKey: child.childKey,
+                storeKey: child.storeKey,
+                childJobId: JobStore.JobId(child.childJobId)
+              }))
+            }))
+          }
+          return work
+        }).pipe(Effect.mapError(storeError("flowSweepWork failed"))),
+
+      markChildrenCascaded: (flowId, childKeys) =>
+        evalMarkChildrenCascaded(prefix, flowId, JSON.stringify(childKeys)).pipe(
+          Effect.mapError(storeError("markChildrenCascaded failed")),
           Effect.asVoid
         )
     }

@@ -65,6 +65,7 @@ export default defineConfig({
         text: "Run",
         items: [
           { text: "Workers & handlers", link: "/guide/workers" },
+          { text: "Parent-child flows", link: "/guide/flows" },
           { text: "Retries & timeouts", link: "/guide/retries-and-timeouts" },
           { text: "Cancellation & admin", link: "/guide/cancellation-and-admin" }
         ]

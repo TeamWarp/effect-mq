@@ -69,6 +69,18 @@ Declarative schedule reconciliation; see [Repeatable jobs](/guide/repeatable-job
 | `removeAfter` | none | Grace window before pruning (requires `removal: "group"`) |
 | `stores` | none | Extra store keys to reconcile when no entry references them |
 
+## `Flow.make(name, options)`
+
+Cross-store parent-child flows; see [Parent-child flows](/guide/flows).
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `parent` | required | The parent job; its store owns the flow, and the flow's producer verbs delegate to it |
+| `children` | required | The closed set of child definitions `fanOut` may produce |
+| `onChildFailure` | `"continue"` | `"continue"` hands failures to `collect`; `"fail"` settles the parent as `failed` on the first one and cancels the rest |
+
+`Flow.children(job, items)` builds one fan-out group; each item takes `key` (unique within the flow; the idempotency mechanism), `payload`, and per-child `options` (`priority`, `attempts`, `backoff`, `keep`, `timeout`, `metadata` — no `delay`, children run immediately). `DigestFlow.toLayer({ fanOut, collect }, options?)` registers the two phases and accepts the same `concurrency`/`queue` options as `toLayer`.
+
 ## `Worker.layer(options)`
 
 All optional. See [Workers & handlers](/guide/workers) for how these interact at runtime.
@@ -88,6 +100,8 @@ All optional. See [Workers & handlers](/guide/workers) for how these interact at
 | `handlerSpanName` | `` `${name}.run` `` | `(context) => string`: names the span wrapping each handler run |
 | `traceLinking` | `"auto"` | Parent for immediate jobs, causal link for delayed ones; `"parent"` / `"link"` force a mode, `"none"` disables the cross-trace edge |
 | `onJobFailure` | none | Callback after each failed run is acked (`{ jobId, name, queue, attempt, attemptsMax, willRetry, cause }`); runs isolated |
+| `flows` | none | Flows whose children this worker runs; gives it the parent store to report results into |
+| `flowSweepInterval` | `30 seconds` | Flow sweeper cadence (reconcile + cascade); also the age a pending child reaches before reconciliation checks it |
 | `id` | random | Identifier used in lock tokens |
 
 `MyJob.toLayer(handler, options)` also accepts `concurrency` (taker fibers for this job's queue; the first registration for a queue decides) and `queue` (consume a different queue than the definition's).

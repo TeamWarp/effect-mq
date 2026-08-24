@@ -144,6 +144,44 @@ occurrences, missed slots collapse into one run (the next sweep enqueues the
 overdue slot once, then advances past `now`). Options mirror `enqueue`:
 `metadata`, `priority`, `attempts`, `backoff`, `keep`, `timeout`.
 
+## Parent-child flows
+
+A flow fans a parent job out into N children, parks the parent until every
+child settles, then resumes it with their typed results. Children can live
+on a **different store** than the parent — a cron parent in Postgres fanning
+out 10k idempotent sends into Redis and collecting the outcomes back:
+
+```ts
+import { Flow } from "effect-mq"
+
+const DigestFlow = Flow.make("daily-digest", {
+  parent: SendDigest,            // Postgres
+  children: [SendEmail],         // Redis
+  onChildFailure: "continue"     // or "fail": first failure settles the flow
+})
+
+// The parent worker runs two phases (requires parent AND child stores):
+const DigestWorker = DigestFlow.toLayer({
+  fanOut: (payload) =>
+    Effect.map(Users.active, (users) =>
+      Flow.children(SendEmail, users.map((user) => ({
+        key: user.id,                       // unique in the flow = idempotency
+        payload: { userId: user.id }
+      })))),
+  collect: (payload, results) =>
+    Effect.succeed({ sent: results.completed.length, failed: results.failed.length })
+})
+
+// Workers that run the children declare the flow so they can report back:
+Worker.layer({ store: EmailStore, flows: [DigestFlow] })
+```
+
+The parent's store owns the flow (manifest, per-child results, pending
+counter), so "settle exactly once" is single-store atomic; cross-store needs
+only idempotent at-least-once reports plus a reconciliation sweeper that
+repairs crashes, stall-exhausted children, and misconfigured workers from
+storage alone. Docs: [Parent-child flows](https://www.effect-mq.com/guide/flows).
+
 ## Timeouts, cancellation, and unrecoverable errors
 
 Because handlers are Effect fibers, the runtime can *actually stop them* —

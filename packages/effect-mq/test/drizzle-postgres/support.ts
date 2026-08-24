@@ -2,7 +2,15 @@ import * as JobStore from "../../src/JobStore.ts"
 import { PgClient } from "@effect/sql-pg"
 import { Effect, Layer, Redacted } from "effect"
 import * as net from "node:net"
-import { DrizzleJobStore, mqDedupe, mqJobAttempts, mqJobs, mqQueueControl, mqSchedules } from "../../src/drizzle-postgres/index.ts"
+import {
+  DrizzleJobStore,
+  mqDedupe,
+  mqFlowChildren,
+  mqJobAttempts,
+  mqJobs,
+  mqQueueControl,
+  mqSchedules
+} from "../../src/drizzle-postgres/index.ts"
 
 export const pgUrl = process.env.EFFECT_MQ_PG_URL ??
   "postgres://postgres:postgres@localhost:5433/effect_mq_test"
@@ -27,18 +35,21 @@ export const pgAvailable = (): Promise<boolean> => {
 export const pgClientLive = (): Layer.Layer<PgClient.PgClient> =>
   PgClient.layer({ url: Redacted.make(pgUrl), maxConnections: 4 }).pipe(Layer.orDie)
 
+export interface TableNames {
+  readonly jobs: string
+  readonly attempts: string
+  readonly schedules: string
+  readonly queues: string
+  readonly dedupe: string
+  readonly flowChildren: string
+}
+
 /**
  * DDL matching the schema factories exactly (the drift test keeps them
  * honest). Real applications get this from drizzle-kit migrations instead.
  */
-export const createTablesSql = (
-  jobs: string,
-  attempts: string,
-  schedules: string,
-  queues: string,
-  dedupe: string
-): ReadonlyArray<string> => [
-  `CREATE TABLE "${jobs}" (
+export const createTablesSql = (names: TableNames): ReadonlyArray<string> => [
+  `CREATE TABLE "${names.jobs}" (
     id text PRIMARY KEY,
     name text NOT NULL,
     queue text NOT NULL,
@@ -56,6 +67,9 @@ export const createTablesSql = (
     cancel_requested boolean NOT NULL DEFAULT false,
     dedupe_key text,
     trace jsonb,
+    parent jsonb,
+    flow_fail_fast boolean,
+    flow_pending integer,
     run_at timestamptz NOT NULL,
     enqueued_at timestamptz NOT NULL,
     processed_at timestamptz,
@@ -65,14 +79,14 @@ export const createTablesSql = (
     lock_token text,
     lock_expires_at timestamptz
   )`,
-  `CREATE INDEX "${jobs}_ready_idx" ON "${jobs}" (queue, priority DESC, seq ASC) WHERE state = 'waiting'`,
-  `CREATE INDEX "${jobs}_delayed_idx" ON "${jobs}" (queue, run_at) WHERE state = 'delayed'`,
-  `CREATE INDEX "${jobs}_active_idx" ON "${jobs}" (lock_expires_at) WHERE state = 'active'`,
-  `CREATE INDEX "${jobs}_history_idx" ON "${jobs}" (name, state, finished_at)`,
-  `CREATE INDEX "${jobs}_listing_idx" ON "${jobs}" (enqueued_at DESC, id DESC)`,
-  `CREATE INDEX "${jobs}_metadata_idx" ON "${jobs}" USING gin (metadata jsonb_path_ops)`,
-  `CREATE TABLE "${attempts}" (
-    job_id text NOT NULL REFERENCES "${jobs}" (id) ON DELETE CASCADE,
+  `CREATE INDEX "${names.jobs}_ready_idx" ON "${names.jobs}" (queue, priority DESC, seq ASC) WHERE state = 'waiting'`,
+  `CREATE INDEX "${names.jobs}_delayed_idx" ON "${names.jobs}" (queue, run_at) WHERE state = 'delayed'`,
+  `CREATE INDEX "${names.jobs}_active_idx" ON "${names.jobs}" (lock_expires_at) WHERE state = 'active'`,
+  `CREATE INDEX "${names.jobs}_history_idx" ON "${names.jobs}" (name, state, finished_at)`,
+  `CREATE INDEX "${names.jobs}_listing_idx" ON "${names.jobs}" (enqueued_at DESC, id DESC)`,
+  `CREATE INDEX "${names.jobs}_metadata_idx" ON "${names.jobs}" USING gin (metadata jsonb_path_ops)`,
+  `CREATE TABLE "${names.attempts}" (
+    job_id text NOT NULL REFERENCES "${names.jobs}" (id) ON DELETE CASCADE,
     attempt integer NOT NULL,
     outcome text NOT NULL,
     started_at timestamptz,
@@ -80,7 +94,7 @@ export const createTablesSql = (
     exit jsonb,
     PRIMARY KEY (job_id, attempt)
   )`,
-  `CREATE TABLE "${schedules}" (
+  `CREATE TABLE "${names.schedules}" (
     key text PRIMARY KEY,
     job_name text NOT NULL,
     queue text NOT NULL,
@@ -97,29 +111,48 @@ export const createTablesSql = (
     group_name text,
     next_run_at timestamptz NOT NULL
   )`,
-  `CREATE INDEX "${schedules}_due_idx" ON "${schedules}" (next_run_at)`,
-  `CREATE TABLE "${queues}" (
+  `CREATE INDEX "${names.schedules}_due_idx" ON "${names.schedules}" (next_run_at)`,
+  `CREATE TABLE "${names.queues}" (
     queue text PRIMARY KEY,
     paused boolean NOT NULL DEFAULT false
   )`,
-  `CREATE TABLE "${dedupe}" (
+  `CREATE TABLE "${names.dedupe}" (
     name text NOT NULL,
     key text NOT NULL,
     job_id text NOT NULL,
     window_expires_at timestamptz,
     PRIMARY KEY (name, key)
-  )`
+  )`,
+  `CREATE TABLE "${names.flowChildren}" (
+    flow_id text NOT NULL,
+    child_key text NOT NULL,
+    name text NOT NULL,
+    store_key text NOT NULL,
+    spec jsonb NOT NULL,
+    status text NOT NULL,
+    exit jsonb,
+    failed_reason text,
+    cascaded boolean NOT NULL,
+    pending_since timestamptz NOT NULL,
+    PRIMARY KEY (flow_id, child_key)
+  )`,
+  `CREATE INDEX "${names.flowChildren}_pending_idx" ON "${names.flowChildren}" (pending_since) WHERE status = 'pending'`,
+  `CREATE INDEX "${names.flowChildren}_cascade_idx" ON "${names.flowChildren}" (flow_id) WHERE status = 'cancelled' AND NOT cascaded`
 ]
 
+export const dropTablesSql = (names: TableNames): string =>
+  `DROP TABLE IF EXISTS "${names.attempts}", "${names.jobs}", "${names.schedules}", "${names.queues}", "${names.dedupe}", "${names.flowChildren}" CASCADE`
+
 let tableCounter = 0
-export const freshTableNames = () => {
+export const freshTableNames = (): TableNames => {
   const suffix = `${Date.now().toString(36)}_${++tableCounter}_${Math.random().toString(36).slice(2, 6)}`
   return {
     jobs: `mq_jobs_${suffix}`,
     attempts: `mq_att_${suffix}`,
     schedules: `mq_sched_${suffix}`,
     queues: `mq_q_${suffix}`,
-    dedupe: `mq_dd_${suffix}`
+    dedupe: `mq_dd_${suffix}`,
+    flowChildren: `mq_fc_${suffix}`
   }
 }
 
@@ -135,18 +168,13 @@ export const freshStoreEffect = Effect.gen(function*() {
   const schedules = mqSchedules(names.schedules)
   const queues = mqQueueControl(names.queues)
   const dedupe = mqDedupe(names.dedupe)
-  for (
-    const statement of createTablesSql(names.jobs, names.attempts, names.schedules, names.queues, names.dedupe)
-  ) {
+  const flowChildren = mqFlowChildren(names.flowChildren)
+  for (const statement of createTablesSql(names)) {
     yield* client.unsafe(statement)
   }
-  yield* Effect.addFinalizer(() =>
-    client.unsafe(
-      `DROP TABLE IF EXISTS "${names.attempts}", "${names.jobs}", "${names.schedules}", "${names.queues}", "${names.dedupe}" CASCADE`
-    ).pipe(Effect.ignore)
-  )
-  const store = yield* DrizzleJobStore.make({ jobs, attempts, schedules, queues, dedupe })
-  return { store, jobs, attempts, schedules, queues, dedupe, names }
+  yield* Effect.addFinalizer(() => client.unsafe(dropTablesSql(names)).pipe(Effect.ignore))
+  const store = yield* DrizzleJobStore.make({ jobs, attempts, schedules, queues, dedupe, flowChildren })
+  return { store, jobs, attempts, schedules, queues, dedupe, flowChildren, names }
 }).pipe(Effect.orDie)
 
 export const freshStoreLayer = (): Layer.Layer<JobStore.JobStore> =>
