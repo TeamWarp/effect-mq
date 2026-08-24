@@ -4,6 +4,7 @@
   "description": "Effect-native background jobs: schema-first definitions, storage-agnostic queue core, worker runtime, and a Postgres store through drizzle.",
   "license": "MIT",
   "author": "Adam Rankin",
+  "homepage": "https://www.effect-mq.com",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/TeamWarp/effect-mq.git",

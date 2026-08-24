@@ -5,6 +5,8 @@ queue core, a worker runtime, and a Postgres store that lives inside your
 drizzle schema — inspired by BullMQ's semantics and `effect/workflow`'s DX.
 Built on Effect v4.
 
+**Documentation: [effect-mq.com](https://www.effect-mq.com)**
+
 ```
 bun add effect-mq effect            # or npm / pnpm / yarn
 ```

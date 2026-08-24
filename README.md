@@ -5,8 +5,9 @@ queue core, a worker runtime, and a Postgres store that lives inside your
 drizzle schema. Built on Effect v4; inspired by BullMQ's semantics and
 `effect/workflow`'s DX.
 
-**→ Full usage documentation lives in the package README:
-[`packages/effect-mq`](./packages/effect-mq/README.md)** (also shown on npm).
+**→ Documentation: [effect-mq.com](https://www.effect-mq.com)** — the package
+README ([`packages/effect-mq`](./packages/effect-mq/README.md), also shown on
+npm) covers the same ground in one page.
 
 ```ts
 import { Job } from "effect-mq"
