@@ -4,7 +4,7 @@ All notable changes to `effect-mq`. Versions follow 0.x semver: **minor
 bumps may break** (the `JobStore` driver contract in particular); patch
 bumps are additive.
 
-## 0.5.0 (unreleased)
+## 0.5.0 — 2026-08-24
 
 - **Declarative schedule reconciliation** — `JobSchedules.layer({ group,
   schedules, removal, removeAfter, stores })` declares a service's full

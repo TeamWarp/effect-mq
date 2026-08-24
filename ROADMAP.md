@@ -56,9 +56,31 @@ during the initial build (BullMQ v6's Redis/Postgres backends,
   active per queue" checked in `claim` (today concurrency is per-worker), and
   a `{ max, duration }` limiter with `claim` returning the retry-after so
   idle workers sleep precisely.
-- [ ] **Redis store hardening** — indexed `list` filters (secondary
-  index sets instead of the Lua scan), Redis Cluster support (hash-tagged
-  keys so scripts stay single-slot), and a `waiting`-set benchmark.
+- [ ] **Redis store hardening** — indexed `list` filters, Redis Cluster
+  support (hash-tagged keys so scripts stay single-slot), and a
+  `waiting`-set benchmark. Indexed-list design notes (settled in
+  discussion, deliberately deferred until the reference dashboard or a
+  real slow-list report creates a consumer):
+  - Driver-internal only — the `list` contract and its conformance-pinned
+    behavior do not change, Postgres is untouched (its factory indexes
+    already serve `list` as SQL), and shipping it is a patch, not a
+    driver-contract break.
+  - `name`/`queue` are immutable per job, so the two missing indexes
+    (`<prefix>:byname:<name>`, `<prefix>:byqueue:<queue>` zsets) only need
+    maintaining in `insertJobRow` and `deleteJob` — the single insert and
+    delete choke points every path already flows through. `finished:<state>`,
+    `terminal:<name>:<state>`, `active`, and the per-queue pending zsets
+    already exist and cover the rest.
+  - The list script picks the narrowest applicable index for the filter
+    combination and post-filters residual predicates per row (no
+    ZINTERSTORE); `metadata` filtering stays a scan by design — an
+    inverted index per key/value is a cardinality bomb, and metadata
+    querying is documented as Postgres territory.
+  - The real work is migration: old rows have no index entries, so an
+    indexed scan would silently MISS them (wrong results, not slow ones).
+    Needs a lazy backfill with a readiness flag — fall back to the full
+    `all`-zset scan until a sweep finishes backfilling — like the 0.3.0
+    finished-zset migration.
 - [ ] **Archive-table split** — move terminal rows to an append-only
   archive so the hot claim index stays small with indefinite history; the
   drizzle factories grow an archive table and `list` reads the union.

@@ -158,7 +158,7 @@ Never mutate job rows yourself. Mutations must go through the store (`MyJob.retr
 
 ## Upgrading
 
-Ship layout changes through your normal migration flow: bump effect-mq, run `drizzle-kit generate`, review the diff. 0.4.0 added the `trace` jsonb column to the jobs table (cross-process [trace propagation](/guide/observability)); `drizzle-kit generate` picks it up as one small migration.
+Ship layout changes through your normal migration flow: bump effect-mq, run `drizzle-kit generate`, review the diff. 0.4.0 added the `trace` jsonb column to the jobs table (cross-process [trace propagation](/guide/observability)); 0.5.0 added the nullable `group_name` column to the schedules table ([schedule reconciliation](/guide/repeatable-jobs#declaring-the-full-set-reconciliation)). `drizzle-kit generate` picks each up as one small migration; migrate before deploying the new version.
 
 ## Where to next
 
