@@ -41,14 +41,6 @@ during the initial build (BullMQ v6's Redis/Postgres backends,
 
 ## P2 — scale & topology
 
-- [ ] **Flows v2** — v1 (cross-store parent-child fan-out) shipped in 0.6.0;
-  the deliberately deferred second phase, per
-  [designs/parent-child-flows.md](./designs/parent-child-flows.md): a
-  child-store outbox + relay so reports batch and children complete through
-  parent-store outages without stalling (including stall-sweep outbox
-  appends), batched pending-counter decrements (lifts the per-flow report
-  ceiling), a paginated/folding `collect` accessor instead of the one-array
-  v1 shape, and a reconsidered take on nested flows.
 - [ ] **Global queue concurrency + rate limiting** — store-enforced "≤ N
   active per queue" checked in `claim` (today concurrency is per-worker), and
   a `{ max, duration }` limiter with `claim` returning the retry-after so

@@ -35,6 +35,9 @@
  *                               pendingSince (flow-sweeper reconcile work)
  * - `p:flowcascade`             ZSET, score 0, member `<flowId>\0<childKey>`
  *                               (cancels still owed to child stores)
+ * - `p:flowoutbox`              ZSET, score = seq from `p:flowoutbox:seq`,
+ *                               member `<seq>\0<report json>` — undelivered
+ *                               child-result reports (see OutboxEntry)
  *
  * `waiting-children` parents live only in the job hash, `p:all`, and
  * `p:counts` — never in a pending zset, so `claim` can never return them.
@@ -81,6 +84,25 @@ local function appendAttempt(id, outcome, startedAt, finishedAt, exitJson)
     '{"attempt":' .. n .. ',"startedAt":' .. started .. ',"finishedAt":' .. finishedAt ..
     ',"outcome":"' .. outcome .. '"' .. ex .. '}')
 end
+-- The outbox invariant: every operation that moves a job carrying a parent
+-- envelope INTO a terminal state appends its child-result report here, in
+-- the same script. MUST run after the terminal fields (exit, failedReason)
+-- are written — the report is built from the hash. The parent envelope and
+-- exit are spliced as raw JSON (never cjson-decoded: precision, surrogates);
+-- exit/failedReason keys are OMITTED when absent, like the attempts ledger.
+local function appendOutbox(id, outcome)
+  local jk = jobKey(id)
+  local parentJson = redis.call("HGET", jk, "parent")
+  if parentJson == false or parentJson == "" then return end
+  local exitJson = redis.call("HGET", jk, "exit")
+  local failedReason = redis.call("HGET", jk, "failedReason")
+  local ex = (exitJson == false or exitJson == "") and "" or (',"exit":' .. exitJson)
+  local fr = (failedReason == false or failedReason == "") and ""
+    or (',"failedReason":' .. cjson.encode(failedReason))
+  local seq = redis.call("INCR", prefix .. ":flowoutbox:seq")
+  redis.call("ZADD", prefix .. ":flowoutbox", seq, fmt(seq) .. "\0" ..
+    '{"parent":' .. parentJson .. ',"outcome":"' .. outcome .. '"' .. ex .. fr .. '}')
+end
 -- Flow dependency rows live in the parent store, one hash per child plus a
 -- per-flow member index (childKey order via ZRANGEBYLEX). Row keys and the
 -- sweep-index members join flowId and childKey with NUL — ids and keys may
@@ -91,16 +113,30 @@ local function flowIndexKey(flowId) return prefix .. ":flowchildren:" .. flowId 
 local function flowMember(flowId, childKey) return flowId .. "\0" .. childKey end
 -- Settle-time marking: remaining pending rows flip to cancelled (NOT
 -- cascaded — the sweeper still owes the child stores real cancels), moving
--- from the pending sweep index to the cascade sweep index.
+-- from the pending sweep index to the cascade sweep index. Returns the
+-- number of rows flipped, for the flow counters.
 local function markPendingRowsCancelled(flowId)
   local keys = redis.call("ZRANGE", flowIndexKey(flowId), 0, -1)
+  local marked = 0
   for i = 1, #keys do
     local rk = flowChildKey(flowId, keys[i])
     if redis.call("HGET", rk, "status") == "pending" then
       redis.call("HSET", rk, "status", "cancelled", "cascaded", "0")
       redis.call("ZREM", prefix .. ":flowpending", flowMember(flowId, keys[i]))
       redis.call("ZADD", prefix .. ":flowcascade", 0, flowMember(flowId, keys[i]))
+      marked = marked + 1
     end
+  end
+  return marked
+end
+-- Settle-time marking plus the manifest counters: pending -> 0, cancelled +=
+-- the rows flipped (the four counters always sum to the manifest size).
+local function settleMarkRows(flowId)
+  local marked = markPendingRowsCancelled(flowId)
+  local jk = jobKey(flowId)
+  if redis.call("HEXISTS", jk, "flowPending") == 1 then
+    redis.call("HSET", jk, "flowPending", "0")
+    if marked > 0 then redis.call("HINCRBY", jk, "flowCancelled", marked) end
   end
 end
 -- A settled flow parent whose rows still owe cascade cancels is exempt from
@@ -218,6 +254,7 @@ local function finishCancelled(id, queue, name, startedAt, now, nowStr)
   redis.call("ZADD", prefix .. ":finished:cancelled", now, id)
   redis.call("ZADD", terminalKey(name, "cancelled"), now, id)
   appendAttempt(id, "cancelled", startedAt, nowStr, "")
+  appendOutbox(id, "cancelled")
   releaseDedupe(name, redis.call("HGET", jk, "dedupeKey"), id, now)
   applyKeep(name, "cancelled", redis.call("HGET", jk, "keep"), now)
 end
@@ -512,6 +549,7 @@ local function finish(newState, storeExit, outcome, ledgerExit)
   redis.call("ZADD", prefix .. ":finished:" .. newState, now, id)
   redis.call("ZADD", terminalKey(name, newState), now, id)
   appendAttempt(id, outcome, startedAt, nowStr, ledgerExit)
+  appendOutbox(id, newState)
   releaseDedupe(name, redis.call("HGET", jk, "dedupeKey"), id, now)
   applyKeep(name, newState, redis.call("HGET", jk, "keep"), now)
 end
@@ -643,6 +681,7 @@ for _, id in ipairs(expired) do
         countsAdd(queue, "failed", 1)
         redis.call("ZADD", prefix .. ":finished:failed", now, id)
         redis.call("ZADD", terminalKey(name, "failed"), now, id)
+        appendOutbox(id, "failed")
         releaseDedupe(name, redis.call("HGET", jk, "dedupeKey"), id, now)
         recovered[#recovered + 1] = { id = id, failed = true }
       else
@@ -840,8 +879,7 @@ local now = tonumber(nowStr)
 local queue = redis.call("HGET", jk, "queue")
 local name = redis.call("HGET", jk, "name")
 if state == "waiting-children" then
-  markPendingRowsCancelled(id)
-  redis.call("HSET", jk, "flowPending", "0")
+  settleMarkRows(id)
 end
 remWaiting(queue, id)
 redis.call("ZREM", delayedKey(queue), id)
@@ -851,6 +889,7 @@ countsAdd(queue, "cancelled", 1)
 redis.call("ZADD", prefix .. ":finished:cancelled", now, id)
 redis.call("ZADD", terminalKey(name, "cancelled"), now, id)
 appendAttempt(id, "cancelled", redis.call("HGET", jk, "processedAt"), nowStr, "")
+appendOutbox(id, "cancelled")
 releaseDedupe(name, redis.call("HGET", jk, "dedupeKey"), id, now)
 applyKeep(name, "cancelled", redis.call("HGET", jk, "keep"), now)
 return '{"ok":true}'
@@ -1351,15 +1390,15 @@ local pending
 if hasManifest then
   pending = tonumber(pendingStr) or 0
 else
-  redis.call("HSET", jk, "flowFailFast", failFast, "flowPending", fmt(total))
+  redis.call("HSET", jk, "flowFailFast", failFast, "flowPending", fmt(total),
+    "flowCompleted", "0", "flowFailed", "0", "flowCancelled", "0")
   pending = total
 end
 if redis.call("HGET", jk, "cancelRequested") == "1" then
   -- A cancel raced the fan-out: cancellation wins. The rows exist and get
   -- marked, so the sweeper cascades (mostly no-op cancels for
   -- never-enqueued children).
-  markPendingRowsCancelled(id)
-  redis.call("HSET", jk, "flowPending", "0")
+  settleMarkRows(id)
   finishCancelled(id, queue, name, startedAt, now, nowStr)
   return '{"ok":true}'
 end
@@ -1383,79 +1422,120 @@ return '{"ok":true,"wake":true,"queue":' .. cjson.encode(queue) .. '}'
 ).withReturnType<string>()
 
 /**
- * recordChildResult(prefix, flowId, childKey, outcome, exitJson,
- *   failedReason, failFastReason, now) -> {applied, parentSettled, wake?,
- *   queue?}. Idempotent: applies only while the row is still pending. Lock
- * order (contract): dependency row first, parent second. An applied report
- * marks the row cascaded (the outcome came FROM the child's store) and
- * decrements the parent's counter; the parent settles on the counter hitting
- * zero (waiting, phase collect) or on the FIRST failed report under
- * fail-fast (terminal store-side failure; remaining rows flip to cancelled).
+ * recordChildResults(prefix, now, count, ...items) -> {results, wakes}.
+ * Items are 5-ARGV strides: flowId, childKey, outcome, exitJson,
+ * failedReason; results are positional {applied, parentSettled}; wakes names
+ * the queues of parents that resumed runnable. One atomic batch; reports may
+ * span flows.
+ *
+ * Lock order (contract): dependency rows first, parents second. Phase 1
+ * applies EVERY row update — idempotent, only while the row is still
+ * pending; an applied report moves the child from the parent's `pending`
+ * counter to its outcome counter and marks the row cascaded (the outcome
+ * came FROM the child's store). Phase 2 settles each touched flow at most
+ * once: the FIRST applied failed report in batch order under fail-fast
+ * (terminal store-side failure; remaining rows flip to cancelled; wins the
+ * tie over pending==0 — and this settle IS a nested parent's terminal
+ * transition, so its own report goes to the outbox here), else pending==0
+ * resumes the parent runnable at the flow's LAST applied report's index.
  */
-export const recordChildResult = Redis.script(
-  (
-    prefix: string,
-    flowId: string,
-    childKey: string,
-    outcome: string,
-    exitJson: string,
-    failedReason: string,
-    failFastReason: string,
-    now: number
-  ) => [prefix, flowId, childKey, outcome, exitJson, failedReason, failFastReason, now],
+export const recordChildResults = Redis.script(
+  (prefix: string, now: number, count: number, items: ReadonlyArray<string>) => [prefix, now, count, ...items],
   {
     numberOfKeys: 0,
     lua: `${HELPERS}
-local flowId = ARGV[2]
-local childKey = ARGV[3]
-local outcome = ARGV[4]
-local nowStr = ARGV[8]
+local nowStr = ARGV[2]
 local now = tonumber(nowStr)
-local rk = flowChildKey(flowId, childKey)
-if redis.call("EXISTS", rk) == 0 or redis.call("HGET", rk, "status") ~= "pending" then
-  return '{"applied":false,"parentSettled":false}'
+local count = tonumber(ARGV[3])
+local applied = {}
+local settled = {}
+-- Phase 1: every row update lands before any settle decision, so a
+-- completed batch-mate keeps its real outcome even when an earlier
+-- batch-mate settles the flow fail-fast.
+local touched = {}
+local touchedOrder = {}
+for i = 1, count do
+  local base = 3 + (i - 1) * 5
+  local flowId = ARGV[base + 1]
+  local childKey = ARGV[base + 2]
+  local outcome = ARGV[base + 3]
+  applied[i] = false
+  local rk = flowChildKey(flowId, childKey)
+  if redis.call("HGET", rk, "status") == "pending" then
+    redis.call("HSET", rk, "status", outcome, "exit", ARGV[base + 4],
+      "failedReason", ARGV[base + 5], "cascaded", "1")
+    redis.call("ZREM", prefix .. ":flowpending", flowMember(flowId, childKey))
+    applied[i] = true
+    local jk = jobKey(flowId)
+    local pendingStr = redis.call("HGET", jk, "flowPending")
+    if pendingStr ~= false and pendingStr ~= "" then
+      redis.call("HSET", jk, "flowPending", fmt(math.max(0, (tonumber(pendingStr) or 0) - 1)))
+      local bucket = outcome == "completed" and "flowCompleted"
+        or outcome == "failed" and "flowFailed" or "flowCancelled"
+      redis.call("HINCRBY", jk, bucket, 1)
+    end
+    local touch = touched[flowId]
+    if touch == nil then
+      touch = { last = i }
+      touched[flowId] = touch
+      touchedOrder[#touchedOrder + 1] = flowId
+    end
+    touch.last = i
+    if outcome == "failed" and touch.firstFailed == nil then
+      touch.firstFailed = i
+      touch.failedKey = childKey
+    end
+  end
 end
-redis.call("HSET", rk, "status", outcome, "exit", ARGV[5], "failedReason", ARGV[6], "cascaded", "1")
-redis.call("ZREM", prefix .. ":flowpending", flowMember(flowId, childKey))
-local jk = jobKey(flowId)
-local pendingStr = redis.call("HGET", jk, "flowPending")
-if pendingStr == false or pendingStr == "" then
-  return '{"applied":true,"parentSettled":false}'
+-- Phase 2: at most one settle per touched flow; fail-fast wins ties.
+local wakes = {}
+for _, flowId in ipairs(touchedOrder) do
+  local touch = touched[flowId]
+  local jk = jobKey(flowId)
+  local pendingStr = redis.call("HGET", jk, "flowPending")
+  if pendingStr ~= false and pendingStr ~= ""
+    and redis.call("HGET", jk, "state") == "waiting-children" then
+    local queue = redis.call("HGET", jk, "queue")
+    if redis.call("HGET", jk, "flowFailFast") == "1" and touch.firstFailed ~= nil then
+      -- First applied failure settles the parent terminally, store-side
+      -- (failedReason, no exit — like stall exhaustion) and marks the
+      -- remaining rows in the same op.
+      local name = redis.call("HGET", jk, "name")
+      local startedAt = redis.call("HGET", jk, "processedAt")
+      settleMarkRows(flowId)
+      redis.call("HSET", jk, "state", "failed", "finishedAt", nowStr, "cancelRequested", "0",
+        "failedReason", 'effect-mq: flow child "' .. touch.failedKey .. '" failed')
+      countsAdd(queue, "waiting-children", -1)
+      countsAdd(queue, "failed", 1)
+      redis.call("ZADD", prefix .. ":finished:failed", now, flowId)
+      redis.call("ZADD", terminalKey(name, "failed"), now, flowId)
+      appendAttempt(flowId, "failed", startedAt, nowStr, "")
+      -- A nested parent reports upward: this settle IS its terminal
+      -- transition, with no worker ack to hook.
+      appendOutbox(flowId, "failed")
+      releaseDedupe(name, redis.call("HGET", jk, "dedupeKey"), flowId, now)
+      applyKeep(name, "failed", redis.call("HGET", jk, "keep"), now)
+      settled[touch.firstFailed] = true
+    elseif tonumber(pendingStr) == 0 then
+      -- All children settled: the parent resumes runnable, phase collect.
+      local seq = redis.call("INCR", prefix .. ":seq")
+      redis.call("HSET", jk, "state", "waiting", "runAt", nowStr, "seq", fmt(seq))
+      local priority = tonumber(redis.call("HGET", jk, "priority")) or 0
+      addWaiting(queue, priority, seq, flowId)
+      countsAdd(queue, "waiting-children", -1)
+      countsAdd(queue, "waiting", 1)
+      wakes[#wakes + 1] = queue
+      settled[touch.last] = true
+    end
+  end
 end
-local pending = math.max(0, (tonumber(pendingStr) or 0) - 1)
-redis.call("HSET", jk, "flowPending", fmt(pending))
-if redis.call("HGET", jk, "state") ~= "waiting-children" then
-  return '{"applied":true,"parentSettled":false}'
+local out = {}
+for i = 1, count do
+  out[i] = '{"applied":' .. (applied[i] and "true" or "false")
+    .. ',"parentSettled":' .. (settled[i] and "true" or "false") .. '}'
 end
-local queue = redis.call("HGET", jk, "queue")
-local name = redis.call("HGET", jk, "name")
-local startedAt = redis.call("HGET", jk, "processedAt")
-if redis.call("HGET", jk, "flowFailFast") == "1" and outcome == "failed" then
-  -- First failure settles the parent terminally, store-side (failedReason,
-  -- no exit — like stall exhaustion) and marks the remaining rows.
-  markPendingRowsCancelled(flowId)
-  redis.call("HSET", jk, "flowPending", "0", "state", "failed", "finishedAt", nowStr,
-    "cancelRequested", "0", "failedReason", ARGV[7])
-  countsAdd(queue, "waiting-children", -1)
-  countsAdd(queue, "failed", 1)
-  redis.call("ZADD", prefix .. ":finished:failed", now, flowId)
-  redis.call("ZADD", terminalKey(name, "failed"), now, flowId)
-  appendAttempt(flowId, "failed", startedAt, nowStr, "")
-  releaseDedupe(name, redis.call("HGET", jk, "dedupeKey"), flowId, now)
-  applyKeep(name, "failed", redis.call("HGET", jk, "keep"), now)
-  return '{"applied":true,"parentSettled":true}'
-end
-if pending == 0 then
-  -- All children settled: the parent resumes runnable, phase collect.
-  local seq = redis.call("INCR", prefix .. ":seq")
-  redis.call("HSET", jk, "state", "waiting", "runAt", nowStr, "seq", fmt(seq))
-  local priority = tonumber(redis.call("HGET", jk, "priority")) or 0
-  addWaiting(queue, priority, seq, flowId)
-  countsAdd(queue, "waiting-children", -1)
-  countsAdd(queue, "waiting", 1)
-  return '{"applied":true,"parentSettled":true,"wake":true,"queue":' .. cjson.encode(queue) .. '}'
-end
-return '{"applied":true,"parentSettled":false}'
+local wakesJson = #wakes == 0 and "[]" or cjson.encode(wakes)
+return '{"results":[' .. table.concat(out, ",") .. '],"wakes":' .. wakesJson .. '}'
 `
   }
 ).withReturnType<string>()

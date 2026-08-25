@@ -238,7 +238,13 @@ if (!available) {
         const parent = yield* store.getJob(id)
         assert(Option.isSome(parent))
         expect(parent.value.state).toBe("waiting-children")
-        expect(parent.value.flow).toEqual({ failFast: false, pending: 750 })
+        expect(parent.value.flow).toEqual({
+          failFast: false,
+          pending: 750,
+          completed: 0,
+          failed: 0,
+          cancelled: 0
+        })
 
         // The full manifest paginates in childKey order.
         const seen: Array<string> = []
@@ -253,34 +259,45 @@ if (!available) {
         } while (cursor !== undefined)
         expect(seen).toEqual(children.map((child) => child.childKey))
 
-        // Reports decrement the persisted counter; duplicates drop.
-        const first = yield* store.recordChildResult({
-          flowId: id,
-          childKey: "c0000",
-          outcome: "completed",
-          exit: { ok: true },
-          failedReason: undefined
-        })
-        expect(first).toEqual({ applied: true, parentSettled: false })
-        const dup = yield* store.recordChildResult({
-          flowId: id,
-          childKey: "c0000",
-          outcome: "failed",
-          exit: undefined,
-          failedReason: undefined
-        })
-        expect(dup).toEqual({ applied: false, parentSettled: false })
-        yield* store.recordChildResult({
-          flowId: id,
-          childKey: "c0001",
-          outcome: "completed",
-          exit: { ok: true },
-          failedReason: undefined
-        })
+        // A report batch moves the counters; the in-batch duplicate drops.
+        const results = yield* store.recordChildResults([
+          {
+            flowId: id,
+            childKey: "c0000",
+            outcome: "completed",
+            exit: { ok: true },
+            failedReason: undefined
+          },
+          {
+            flowId: id,
+            childKey: "c0000",
+            outcome: "failed",
+            exit: undefined,
+            failedReason: undefined
+          },
+          {
+            flowId: id,
+            childKey: "c0001",
+            outcome: "completed",
+            exit: { ok: true },
+            failedReason: undefined
+          }
+        ])
+        expect(results).toEqual([
+          { applied: true, parentSettled: false },
+          { applied: false, parentSettled: false },
+          { applied: true, parentSettled: false }
+        ])
         const after = yield* store.getJob(id)
         assert(Option.isSome(after))
         expect(after.value.state).toBe("waiting-children")
-        expect(after.value.flow).toEqual({ failFast: false, pending: 748 })
+        expect(after.value.flow).toEqual({
+          failFast: false,
+          pending: 748,
+          completed: 2,
+          failed: 0,
+          cancelled: 0
+        })
       }).pipe(Effect.scoped, Effect.provide(redisLive())))
 
     it.live("historyTtl sweeps terminal jobs; live jobs survive", () =>

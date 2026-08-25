@@ -169,18 +169,23 @@ const DigestWorker = DigestFlow.toLayer({
         payload: { userId: user.id }
       })))),
   collect: (payload, results) =>
-    Effect.succeed({ sent: results.completed.length, failed: results.failed.length })
+    Effect.succeed({ sent: results.counts.completed, failed: results.counts.failed })
 })
 
-// Workers that run the children declare the flow so they can report back:
+// Workers that run the children declare the flow so their relay can push
+// results to the parent store the moment each child acks:
 Worker.layer({ store: EmailStore, flows: [DigestFlow] })
 ```
 
-The parent's store owns the flow (manifest, per-child results, pending
-counter), so "settle exactly once" is single-store atomic; cross-store needs
-only idempotent at-least-once reports plus a reconciliation sweeper that
-repairs crashes, stall-exhausted children, and misconfigured workers from
-storage alone. Docs: [Parent-child flows](https://www.effect-mq.com/guide/flows).
+The parent's store owns the flow (manifest, per-child results, outcome
+counters), so "settle exactly once" is single-store atomic. Cross-store,
+every terminal child transition atomically appends its report to the child
+store's **outbox**; worker relays push those in batches (children keep
+completing through parent-store outages) and a reconciliation sweeper
+repairs anything the push path misses, from storage alone. Flows nest —
+a child can be another flow's parent — and `collect` reads results as
+plain `counts`, materialized buckets, or a paged `Stream`. Docs:
+[Parent-child flows](https://www.effect-mq.com/guide/flows).
 
 ## Timeouts, cancellation, and unrecoverable errors
 

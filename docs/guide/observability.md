@@ -68,7 +68,7 @@ The *durable* analogues stay in the store: `store.counts()` for live depth and t
 | `flowFanOuts` | `effect_mq_flow_fanouts` | counter | `flow` |
 | `flowChildReports` | `effect_mq_flow_child_reports` | counter | `flow`, `outcome`, `source` (report \| reconcile) |
 | `flowCascades` | `effect_mq_flow_cascades` | counter | none |
-| `flowUnreportableChildren` | `effect_mq_flow_unreportable_children` | counter | `flow` |
+| `flowOutboxSkipped` | `effect_mq_flow_outbox_skipped` | counter | none |
 
 All tags are low-cardinality attributes: job name, queue, outcome. Ids and keys never appear as tags.
 

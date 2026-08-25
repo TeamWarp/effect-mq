@@ -36,6 +36,7 @@ import { sql } from "drizzle-orm"
 import {
   type AnyPgColumnBuilder,
   bigint,
+  bigserial,
   boolean,
   index,
   integer,
@@ -59,6 +60,7 @@ type TraceContext = JobStore.TraceContext
 type ParentEnvelope = JobStore.ParentEnvelope
 type EnqueueRequest = JobStore.EnqueueRequest
 type FlowChildStatus = JobStore.FlowChildRecord["status"]
+type FlowChildReport = JobStore.FlowChildReport
 
 /**
  * Table-factory options: `extraConfig` receives the table's columns (exactly
@@ -97,6 +99,9 @@ const jobsColumns = <JobName extends string, Queue extends string>() => ({
   /** Flow bookkeeping: NULL together until a FanOut ack lands the manifest. */
   flowFailFast: boolean("flow_fail_fast"),
   flowPending: integer("flow_pending"),
+  flowCompleted: integer("flow_completed"),
+  flowFailed: integer("flow_failed"),
+  flowCancelled: integer("flow_cancelled"),
   runAt: timestamp("run_at", { withTimezone: true, mode: "date" }).notNull(),
   enqueuedAt: timestamp("enqueued_at", { withTimezone: true, mode: "date" }).notNull(),
   processedAt: timestamp("processed_at", { withTimezone: true, mode: "date" }),
@@ -296,6 +301,32 @@ export const mqFlowChildren = (
     ...options?.extraConfig?.(table) ?? []
   ])
 
+const flowOutboxColumns = () => ({
+  /** Store-assigned, oldest-first; exposed to callers as an opaque string. */
+  id: bigserial("id", { mode: "number" }).primaryKey(),
+  /** The flow definition's name, for relay routing. */
+  flowName: text("flow_name").notNull(),
+  /** The PARENT store's context-key string, for relay routing. */
+  parentStoreKey: text("parent_store_key").notNull(),
+  /** The full `FlowChildReport` to deliver into the parent store. */
+  report: jsonb("report").notNull().$type<FlowChildReport>()
+})
+
+/**
+ * Undelivered child-result reports (one per terminal transition of an
+ * envelope-carrying job; see `JobStore.OutboxEntry`). Lives next to the
+ * CHILD store's jobs table.
+ *
+ * @since 0.6.0
+ */
+export const mqFlowOutbox = (
+  tableName = "effect_mq_flow_outbox",
+  options?: MqTableOptions<ReturnType<typeof flowOutboxColumns>>
+) =>
+  pgTable(tableName, flowOutboxColumns(), (table) => [
+    ...options?.extraConfig?.(table) ?? []
+  ])
+
 const queueControlColumns = <Queue extends string>() => ({
   queue: text("queue").primaryKey().$type<Queue>(),
   paused: boolean("paused").notNull().default(false)
@@ -343,3 +374,8 @@ export type MqDedupeTable = ReturnType<typeof mqDedupe<any>>
  * @since 0.6.0
  */
 export type MqFlowChildrenTable = ReturnType<typeof mqFlowChildren>
+
+/**
+ * @since 0.6.0
+ */
+export type MqFlowOutboxTable = ReturnType<typeof mqFlowOutbox>

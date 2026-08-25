@@ -100,8 +100,8 @@ All optional. See [Workers & handlers](/guide/workers) for how these interact at
 | `handlerSpanName` | `` `${name}.run` `` | `(context) => string`: names the span wrapping each handler run |
 | `traceLinking` | `"auto"` | Parent for immediate jobs, causal link for delayed ones; `"parent"` / `"link"` force a mode, `"none"` disables the cross-trace edge |
 | `onJobFailure` | none | Callback after each failed run is acked (`{ jobId, name, queue, attempt, attemptsMax, willRetry, cause }`); runs isolated |
-| `flows` | none | Flows whose children this worker runs; gives it the parent store to report results into |
-| `flowSweepInterval` | `30 seconds` | Flow sweeper cadence (reconcile + cascade); also the age a pending child reaches before reconciliation checks it |
+| `flows` | none | Flows whose children this worker runs; gives its relay the parent stores so child results push the moment they ack |
+| `flowSweepInterval` | `30 seconds` | Flow sweeper cadence (reconcile + cascade), the pending age before reconciliation checks a child, and the relay's fallback drain cadence |
 | `id` | random | Identifier used in lock tokens |
 
 `MyJob.toLayer(handler, options)` also accepts `concurrency` (taker fibers for this job's queue; the first registration for a queue decides) and `queue` (consume a different queue than the definition's).
@@ -117,7 +117,7 @@ Every driver accepts `idGenerator` (generator for store-assigned ids; default a 
 | Option | Memory | Postgres (drizzle) | Redis |
 | --- | --- | --- | --- |
 | `idGenerator` / `historyTtl` / `historySweepInterval` | yes | yes | yes |
-| Table instances (`jobs`, `attempts`, `schedules`, `queues`, `dedupe`, `flowChildren`) | no | required | no |
+| Table instances (`jobs`, `attempts`, `schedules`, `queues`, `dedupe`, `flowChildren`, `flowOutbox`) | no | required | no |
 | `extraValues`: fill `extend`ed columns at enqueue | no | yes | no |
 | `store`: bind to a named store key | via `layerFor` | option | via `layerFor` |
 | `validate`: probe tables at startup (default `true`) | no | yes | no |
@@ -130,7 +130,7 @@ MemoryJobStore.layer                        // no options
 MemoryJobStore.layerWith({ historyTtl: "7 days" })
 MemoryJobStore.layerFor(Durable, options)   // named store
 
-DrizzleJobStore.layer({ jobs, attempts, schedules, queues, dedupe, flowChildren, ...options })
+DrizzleJobStore.layer({ jobs, attempts, schedules, queues, dedupe, flowChildren, flowOutbox, ...options })
 
 RedisJobStore.layer({ prefix: "myapp-jobs" })
 RedisJobStore.layerFor(Ephemeral, options)  // named store

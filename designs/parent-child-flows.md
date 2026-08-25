@@ -1,7 +1,29 @@
 # Design: parent-child flows (cross-store fan-out)
 
-Status: implemented (v1) for 0.6.0 — revision 2, rewritten after an
-adversarial design review (3 lenses, 22 confirmed findings folded in below).
+Status: implemented for 0.6.0, INCLUDING the v2 phase — revision 2,
+rewritten after an adversarial design review (3 lenses, 22 confirmed
+findings folded in below).
+
+The "v2" section at the bottom shipped with these shapes:
+
+- **Outbox**: the append happens inside every terminal-transition store op
+  (ack, cancel, stall exhaustion, nested-parent settles) rather than only
+  the ack; the relay is lease-free (peek → deliver → delete; dependency
+  rows dedup redelivery) and pulse-driven off each ack with the sweep
+  interval as fallback. Because the outbox made any worker's ack safe, the
+  misconfigured-worker fail-unrecoverably policy was REMOVED —
+  `Worker.layer({ flows })` is now a latency knob, not a correctness one.
+- **Batched decrements**: `recordChildResults` (which replaced the
+  singular op) applies all row updates before at most one settle decision
+  per flow; fail-fast wins ties on the first applied failure in batch
+  order.
+- **Paginated collect**: `ChildResults` became `{ counts, all, stream }`,
+  with per-outcome counters persisted on `FlowState` so tallies cost no
+  row reads.
+- **Nested flows**: allowed (they fell out of the machinery — a settling
+  inner parent reports upward like any child, via the outbox); depth
+  capped at 8 as the cycle guard, since definitions cannot be
+  cycle-checked statically.
 
 As-built deviations from this document:
 

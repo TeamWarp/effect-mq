@@ -46,8 +46,8 @@ const DigestWorker = DigestFlow.toLayer({
 
   collect: (payload, results) =>
     Effect.succeed({
-      sent: results.completed.length,
-      failed: results.failed.length
+      sent: results.counts.completed,
+      failed: results.counts.failed
     })
 })
 ```
@@ -60,9 +60,9 @@ Both phases draw on the parent's attempt budget. A failing `fanOut` retries unti
 
 `Flow.toLayer` requires the parent's store **and every child's store** in context. That requirement is the design: the worker running the parent phases is the one process guaranteed able to repair and cancel work across the whole flow (see [reconciliation](#how-it-stays-correct) below).
 
-## Child workers report back
+## Results flow back through the outbox
 
-Any worker that runs a flow's children declares the flow:
+Every terminal child transition — a completed or failed ack, a cancel, even stall exhaustion — appends the child's report to its own store's **outbox**, atomically with the transition itself. Workers then run a relay that drains the outbox into the parent stores in batches. Declaring the flow is what gives a worker those parent stores:
 
 ```ts
 const EmailWorker = SendEmail.toLayer(handleEmail).pipe(
@@ -70,7 +70,9 @@ const EmailWorker = SendEmail.toLayer(handleEmail).pipe(
 )
 ```
 
-`flows` gives the worker the parent store, and the worker writes each child's terminal result into it right after the child's ack lands — only the run that actually won the ack reports, so a worker whose lock was lost mid-run can never record a stale result. A worker that claims a flow child without the registration fails it with a clear message instead of silently looping; the flow sweeper converts that failure into a failed report, so the parent learns about the misconfiguration instead of hanging. Workers that run the parent phases via `Flow.toLayer` get reporting rights on their own store for free, so same-store flows need no `flows` entry.
+The relay drains the moment a child result is acked, so results reach the parent with no added latency; under load they batch into single parent-store writes. Because the report is written in the same atomic operation as the ack, nothing can be lost between them — and children keep completing even while the parent store is down, with their reports queuing up for the relay.
+
+`flows` is a latency knob, not a correctness one. A worker without the registration still runs children and still records their reports; they just wait for a relay on another worker or for the parent-side sweeper to read the child's state directly. Workers running the parent phases via `Flow.toLayer` relay on their own store automatically, so same-store flows need no `flows` entry.
 
 ## Children and idempotency
 
@@ -82,44 +84,63 @@ Child handlers need no flow awareness. They are plain jobs with a `parent` envel
 
 ## Typed results
 
-`collect` receives the settled children bucketed by outcome, decoded through each child's schemas. The `name` field discriminates child types in multi-child flows:
+`collect` receives three views of the settled children, each decoded through the members' schemas (`name` discriminates child types in multi-child flows):
 
 ```ts
 collect: (payload, results) =>
   Effect.gen(function*() {
-    for (const child of results.completed) {
-      // child.value: the child's decoded success value
+    // counts: plain numbers off the parent record — zero reads.
+    if (results.counts.failed === 0) {
+      return { sent: results.counts.completed, failed: 0 }
     }
-    for (const child of results.failed) {
+
+    // all: the materialized buckets — fine into the tens of thousands.
+    const settled = yield* results.all
+    for (const child of settled.failed) {
       // child.cause: Cause of the child's typed error. Store-side failures
-      // (stall exhaustion, unreportable workers) surface as defects with
-      // the store's failedReason.
+      // (stall exhaustion) surface as defects with the store's failedReason.
     }
-    return { sent: results.completed.length, failed: results.failed.length }
+
+    // stream: one page at a time, for flows too large to materialize.
+    yield* Stream.runForEach(results.stream, (child) =>
+      child.outcome === "completed" ? recordDelivery(child.value) : Effect.void
+    )
+    return { sent: results.counts.completed, failed: results.counts.failed }
   })
 ```
 
-Outside the handler, `DigestFlow.childResults(flowId)` returns the same buckets for dashboards and debugging, in any parent state; children that have not settled yet are absent from all three buckets.
+Outside the handler, `DigestFlow.childResults(flowId)` returns the same accessors for dashboards and debugging, in any parent state; children still pending count in `counts.pending` and are absent from `all`/`stream`.
 
 ## Failure policy
 
 `onChildFailure` decides what a failed child does to the flow:
 
-- **`"continue"`** (default): every child settles, and `collect` sees the failures in `results.failed`. The flow completes with whatever `collect` returns.
+- **`"continue"`** (default): every child settles, and `collect` sees the failures in its results. The flow completes with whatever `collect` returns.
 - **`"fail"`**: the first failed child settles the parent as `failed` immediately. The `failedReason` names the child; there is no parent exit, so `awaitResult` dies (the same shape as stall exhaustion), and the failed child's own exit stays inspectable through `childResults`. The remaining children are cancelled: still-pending rows are marked in the same atomic settle, and the flow sweeper delivers real cancels into the child stores, interrupting running handlers. `collect` does not run.
 
 An admin `retry` of a failed flow parent keeps the manifest and re-enters `collect` with the recorded (mixed) results. A parent whose `fanOut` never landed retries `fanOut` as usual.
 
 Cancelling a flow parent while it waits (`DigestFlow.cancel(flowId)`) settles it the same way: remaining children are cancelled and cascaded, and late child reports drop.
 
+## Nesting
+
+A child may itself be another flow's parent. Fan out groups of work, let each group fan out its items, and collect upward level by level — an inner flow that settles reports to its outer parent through the same outbox machinery, and cancelling the outer flow cascades down through each level:
+
+```ts
+const InnerFlow = Flow.make("send-group", { parent: SendBatch, children: [SendEmail] })
+const OuterFlow = Flow.make("daily-digest", { parent: SendDigest, children: [SendBatch] })
+```
+
+Definitions cannot be cycle-checked statically (a job does not know which flows parent it), so depth is capped at 8: a cyclic definition fails its fan-out with a clear error instead of recursing forever.
+
 ## How it stays correct
 
-The parent's store owns the flow: the manifest, per-child results, and the pending counter live there, so "the flow settles exactly once" is a single-store atomic decision even when children live elsewhere. Cross-store coordination then needs only two at-least-once, idempotent mechanisms:
+The parent's store owns the flow: the manifest, per-child results, and the outcome counters live there, so "the flow settles exactly once" is a single-store atomic decision even when children live elsewhere. Cross-store coordination then needs only two at-least-once, idempotent mechanisms:
 
-1. **Reports** (fast path): the child's worker acks the child, then writes the result into the parent store. A report that fails to deliver (the parent store is down, the process crashes in between) loses nothing — the child's own record holds the result, and the sweeper picks it up.
-2. **Reconciliation** (repair path): every parent worker runs a flow sweeper (default every 30 seconds, `Worker.layer({ flowSweepInterval })`). For each child still pending past the sweep age it checks the child's store directly: a missing child is (re-)enqueued from the persisted spec, covering crashes between the fan-out ack and the enqueue; a terminal child gets its report synthesized from the child store's own record, covering dropped reports, stall-exhausted children, direct cancels, and misconfigured workers. In-flight children are left alone, and each sweep page rotates, so a large flow's healthy children never starve another flow's repair work.
+1. **The outbox** (push path): the child's terminal transition and its report are one atomic write in the child's store; relays deliver the reports in batches and delete what landed. A relay crash means redelivery, and redelivery is free — the dependency row dedups it.
+2. **Reconciliation** (repair path): every parent worker runs a flow sweeper (default every 30 seconds, `Worker.layer({ flowSweepInterval })`). For each child still pending past the sweep age it checks the child's store directly: a missing child is (re-)enqueued from the persisted spec, covering crashes between the fan-out ack and the enqueue; a terminal child gets its report synthesized from the child store's own record, covering outbox entries no relay can reach. In-flight children are left alone, and each sweep page rotates, so a large flow's healthy children never starve another flow's repair work.
 
-Every step dedups: enqueues on the deterministic id, reports on the dependency row, cancels on child state. A crash anywhere leaves work the next sweep finishes.
+Every step dedups: enqueues on the deterministic id, reports on the dependency row, cancels on child state, outbox deletes on entry ids. A crash anywhere leaves work the next relay pass or sweep finishes.
 
 ::: warning Child retention
 Results are copied into the parent store, so child stores can prune terminal children aggressively, with one floor: keep terminal children longer than the flow sweep interval (with margin), or the sweeper can find a pruned, never-reported child missing and re-run it. `keep: { completed: { age: "1 hour" } }` is comfortable against the default 30-second sweep.
@@ -127,11 +148,13 @@ Results are copied into the parent store, so child stores can prune terminal chi
 
 ## Scale and observability
 
-Fan-out inserts dependency rows and enqueues children in chunks, so ten-thousand-child flows work out of the box. Each child completion writes one report into the parent store; the dependency rows update in parallel, while the pending-counter decrement serializes on the parent row. On Postgres that lock spans the report transaction (a few client round trips), so expect a per-flow report throughput on the order of hundreds per second per millisecond of database RTT — a per-flow ceiling, not a store-wide one. Redis reports are single scripts and go faster, with one caveat: a fail-fast settle or parent cancel marks every remaining child inside one atomic script, which briefly holds the whole (single-threaded) server at very large fan-outs. If you routinely fan out far past ten thousand children, put the parent on Postgres.
+Fan-out inserts dependency rows and enqueues children in chunks, so ten-thousand-child flows work out of the box. Reports batch: a relay under load delivers hundreds of child results in one parent-store write, so the parent-row serialization that bounds per-flow throughput amortizes across the batch instead of costing one transaction per child. `collect` chooses its own memory profile — `counts` for tallies, `all` to materialize, `stream` to fold page by page.
+
+One Redis caveat: a fail-fast settle or parent cancel marks every remaining child inside one atomic script, which briefly holds the whole (single-threaded) server at very large fan-outs. If you routinely fan out far past ten thousand children, put the parent on Postgres.
 
 Child spans attach to the fan-out run's span context. For large fan-outs, one trace with ten thousand children renders badly; consider `traceLinking: "link"` on the child workers.
 
-Metrics: `flow_fanouts`, `flow_child_reports` (tagged by `outcome` and `source: report | reconcile`), `flow_cascades`, and `flow_unreportable_children`. A nonzero `reconcile` share is normal during deploys; a sustained one means child workers cannot reach the parent store.
+Metrics: `flow_fanouts`, `flow_child_reports` (tagged by `outcome` and `source: report | reconcile`), `flow_cascades`, and `flow_outbox_skipped`. A nonzero `reconcile` share is normal during deploys; a sustained one — or a growing `flow_outbox_skipped` — means no worker with the right `flows` registration is reaching those child stores.
 
 ## Where to next
 

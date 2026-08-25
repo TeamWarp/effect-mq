@@ -92,7 +92,10 @@ const toRecord = (hash: ReadonlyMap<string, string>): JobStore.JobRecord => ({
     ? undefined
     : {
       failFast: hash.get("flowFailFast") === "1",
-      pending: Number(hash.get("flowPending"))
+      pending: Number(hash.get("flowPending")),
+      completed: Number(hash.get("flowCompleted") ?? 0),
+      failed: Number(hash.get("flowFailed") ?? 0),
+      cancelled: Number(hash.get("flowCancelled") ?? 0)
     },
   runAt: Number(hash.get("runAt") ?? 0),
   enqueuedAt: Number(hash.get("enqueuedAt") ?? 0),
@@ -123,6 +126,35 @@ const toSchedule = (hash: ReadonlyMap<string, string>): JobStore.ScheduleRecord 
 // cjson encodes an empty Lua table as {}, not [] — normalize.
 const asArray = <A>(value: ReadonlyArray<A> | Record<string, never>): ReadonlyArray<A> =>
   Array.isArray(value) ? value : []
+
+/**
+ * Decode one outbox zset member: `<seq>\0<json>` where the json carries the
+ * verbatim parent envelope plus the terminal outcome. The full member string
+ * is the opaque entry id (deleteOutbox is then a plain ZREM).
+ */
+const toOutboxEntry = (member: string): JobStore.OutboxEntry => {
+  const sep = member.indexOf("\u0000")
+  const body: {
+    parent: JobStore.ParentEnvelope
+    outcome: JobStore.FlowChildReport["outcome"]
+    exit?: unknown
+    failedReason?: string
+  } = JSON.parse(member.slice(sep + 1))
+  return {
+    id: member,
+    flowName: body.parent.flowName,
+    parentStoreKey: body.parent.parentStoreKey,
+    report: {
+      flowId: body.parent.flowId,
+      childKey: body.parent.childKey,
+      outcome: body.outcome,
+      // The exit key is omitted entirely when absent (ledger convention),
+      // so a legitimate encoded null exit survives the round trip.
+      exit: Object.hasOwn(body, "exit") ? body.exit : undefined,
+      failedReason: body.failedReason
+    }
+  }
+}
 
 const JOB_STATES: ReadonlyArray<JobStore.JobState> = [
   "waiting",
@@ -194,7 +226,7 @@ export const make = (
     const evalSweepState = redis.eval(scripts.sweepState)
     const evalSweepDedupes = redis.eval(scripts.sweepDedupes)
     const evalFanOut = redis.eval(scripts.fanOut)
-    const evalRecordChildResult = redis.eval(scripts.recordChildResult)
+    const evalRecordChildResults = redis.eval(scripts.recordChildResults)
     const evalListChildResults = redis.eval(scripts.listChildResults)
     const evalFlowSweepWork = redis.eval(scripts.flowSweepWork)
     const evalMarkChildrenCascaded = redis.eval(scripts.markChildrenCascaded)
@@ -927,29 +959,64 @@ export const make = (
           Effect.asVoid
         ),
 
-      recordChildResult: (report) =>
+      recordChildResults: (reports) =>
         Effect.gen(function*() {
-          const now = yield* Clock.currentTimeMillis
-          const reply: { applied: boolean; parentSettled: boolean; wake?: boolean; queue?: string } = JSON.parse(
-            yield* evalRecordChildResult(
-              prefix,
-              report.flowId,
-              report.childKey,
-              report.outcome,
-              report.exit === undefined ? "" : JSON.stringify(report.exit),
-              report.failedReason ?? "",
-              // Pre-built store-side reason for a fail-fast settle (the
-              // script uses it only on the first failed report).
-              `effect-mq: flow child "${report.childKey}" failed`,
-              now
-            )
-          )
-          if (reply.wake === true && reply.queue !== undefined) {
-            // The parent settled to runnable collect: wake its queue.
-            yield* wakeUp(JobStore.QueueName(reply.queue))
+          if (reports.length === 0) {
+            const none: ReadonlyArray<{ applied: boolean; parentSettled: boolean }> = []
+            return none
           }
-          return { applied: reply.applied, parentSettled: reply.parentSettled }
-        }).pipe(Effect.mapError(storeError("recordChildResult failed"))),
+          const now = yield* Clock.currentTimeMillis
+          const all: Array<{ applied: boolean; parentSettled: boolean }> = []
+          // One atomic batch per chunk of ~500 (ARGV headroom); the
+          // contract's per-batch settle semantics then apply per chunk.
+          for (let start = 0; start < reports.length; start += 500) {
+            const chunk = reports.slice(start, start + 500)
+            const items: Array<string> = []
+            for (const report of chunk) {
+              items.push(
+                report.flowId,
+                report.childKey,
+                report.outcome,
+                report.exit === undefined ? "" : JSON.stringify(report.exit),
+                report.failedReason ?? ""
+              )
+            }
+            const reply: {
+              results: ReadonlyArray<{ applied: boolean; parentSettled: boolean }>
+              wakes: ReadonlyArray<string> | Record<string, never>
+            } = JSON.parse(yield* evalRecordChildResults(prefix, now, chunk.length, items))
+            for (const queue of asArray(reply.wakes)) {
+              // A parent settled to runnable collect: wake its queue.
+              yield* wakeUp(JobStore.QueueName(queue))
+            }
+            for (const result of reply.results) {
+              all.push(result)
+            }
+          }
+          return all
+        }).pipe(Effect.mapError(storeError("recordChildResults failed"))),
+
+      peekOutbox: (peekOptions) =>
+        Effect.gen(function*() {
+          const limit = Math.floor(peekOptions.limit)
+          if (limit <= 0) {
+            const none: ReadonlyArray<JobStore.OutboxEntry> = []
+            return none
+          }
+          const raw = yield* redis.send("ZRANGE", `${prefix}:flowoutbox`, "0", String(limit - 1))
+          // SAFETY: ZRANGE always replies with an array of bulk strings.
+          const members = raw as ReadonlyArray<string>
+          return members.map(toOutboxEntry)
+        }).pipe(Effect.mapError(storeError("peekOutbox failed"))),
+
+      deleteOutbox: (ids) =>
+        Effect.gen(function*() {
+          // Chunked ZREMs keep the variadic argument count bounded; each
+          // chunk is idempotent, so a partial failure just redelivers.
+          for (let start = 0; start < ids.length; start += 500) {
+            yield* redis.send("ZREM", `${prefix}:flowoutbox`, ...ids.slice(start, start + 500))
+          }
+        }).pipe(Effect.mapError(storeError("deleteOutbox failed"))),
 
       listChildResults: (flowId, listOptions) =>
         Effect.gen(function*() {

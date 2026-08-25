@@ -6,6 +6,7 @@ import {
   DrizzleJobStore,
   mqDedupe,
   mqFlowChildren,
+  mqFlowOutbox,
   mqJobAttempts,
   mqJobs,
   mqQueueControl,
@@ -42,6 +43,7 @@ export interface TableNames {
   readonly queues: string
   readonly dedupe: string
   readonly flowChildren: string
+  readonly flowOutbox: string
 }
 
 /**
@@ -70,6 +72,9 @@ export const createTablesSql = (names: TableNames): ReadonlyArray<string> => [
     parent jsonb,
     flow_fail_fast boolean,
     flow_pending integer,
+    flow_completed integer,
+    flow_failed integer,
+    flow_cancelled integer,
     run_at timestamptz NOT NULL,
     enqueued_at timestamptz NOT NULL,
     processed_at timestamptz,
@@ -137,11 +142,17 @@ export const createTablesSql = (names: TableNames): ReadonlyArray<string> => [
     PRIMARY KEY (flow_id, child_key)
   )`,
   `CREATE INDEX "${names.flowChildren}_pending_idx" ON "${names.flowChildren}" (pending_since) WHERE status = 'pending'`,
-  `CREATE INDEX "${names.flowChildren}_cascade_idx" ON "${names.flowChildren}" (flow_id) WHERE status = 'cancelled' AND NOT cascaded`
+  `CREATE INDEX "${names.flowChildren}_cascade_idx" ON "${names.flowChildren}" (flow_id) WHERE status = 'cancelled' AND NOT cascaded`,
+  `CREATE TABLE "${names.flowOutbox}" (
+    id bigserial PRIMARY KEY,
+    flow_name text NOT NULL,
+    parent_store_key text NOT NULL,
+    report jsonb NOT NULL
+  )`
 ]
 
 export const dropTablesSql = (names: TableNames): string =>
-  `DROP TABLE IF EXISTS "${names.attempts}", "${names.jobs}", "${names.schedules}", "${names.queues}", "${names.dedupe}", "${names.flowChildren}" CASCADE`
+  `DROP TABLE IF EXISTS "${names.attempts}", "${names.jobs}", "${names.schedules}", "${names.queues}", "${names.dedupe}", "${names.flowChildren}", "${names.flowOutbox}" CASCADE`
 
 let tableCounter = 0
 export const freshTableNames = (): TableNames => {
@@ -152,7 +163,8 @@ export const freshTableNames = (): TableNames => {
     schedules: `mq_sched_${suffix}`,
     queues: `mq_q_${suffix}`,
     dedupe: `mq_dd_${suffix}`,
-    flowChildren: `mq_fc_${suffix}`
+    flowChildren: `mq_fc_${suffix}`,
+    flowOutbox: `mq_ob_${suffix}`
   }
 }
 
@@ -169,12 +181,13 @@ export const freshStoreEffect = Effect.gen(function*() {
   const queues = mqQueueControl(names.queues)
   const dedupe = mqDedupe(names.dedupe)
   const flowChildren = mqFlowChildren(names.flowChildren)
+  const flowOutbox = mqFlowOutbox(names.flowOutbox)
   for (const statement of createTablesSql(names)) {
     yield* client.unsafe(statement)
   }
   yield* Effect.addFinalizer(() => client.unsafe(dropTablesSql(names)).pipe(Effect.ignore))
-  const store = yield* DrizzleJobStore.make({ jobs, attempts, schedules, queues, dedupe, flowChildren })
-  return { store, jobs, attempts, schedules, queues, dedupe, flowChildren, names }
+  const store = yield* DrizzleJobStore.make({ jobs, attempts, schedules, queues, dedupe, flowChildren, flowOutbox })
+  return { store, jobs, attempts, schedules, queues, dedupe, flowChildren, flowOutbox, names }
 }).pipe(Effect.orDie)
 
 export const freshStoreLayer = (): Layer.Layer<JobStore.JobStore> =>

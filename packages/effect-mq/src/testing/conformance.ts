@@ -2456,6 +2456,64 @@ export const jobStoreConformance = (
         })
       ))
 
+    it.effect("cancels honoured off the ack path still land in the outbox", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const envelope: JobStore.ParentEnvelope = {
+            flowName: "test-flow",
+            flowId: JobId("remote-flow-2"),
+            childKey: "released",
+            parentStoreKey: "main"
+          }
+          // A cancel that arrives while the child runs, honoured when the
+          // worker RELEASES the job (shutdown) instead of acking it.
+          const { id } = yield* store.enqueue(baseRequest({ parent: envelope }))
+          const claim = yield* store.claim(claimOptions({ token: "t-run" }))
+          assert(claim._tag === "Claimed")
+          yield* store.cancel(id)
+          yield* store.release(id, "t-run")
+
+          const job = yield* store.getJob(id)
+          assert(Option.isSome(job))
+          expect(job.value.state).toBe("cancelled")
+          const entries = yield* store.peekOutbox({ limit: 10 })
+          expect(entries.map((entry) => entry.report.outcome)).toEqual(["cancelled"])
+          expect(entries[0]?.report.childKey).toBe("released")
+        })
+      ))
+
+    it.effect("a cancel that races a nested parent's fan-out reports upward through the outbox", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          // The parent being fanned out is itself a flow child; the raced
+          // cancel settles it terminally inside the FanOut ack.
+          const inner = yield* store.enqueue(baseRequest({
+            parent: {
+              flowName: "outer-flow",
+              flowId: JobId("outer-2"),
+              childKey: "inner-raced",
+              parentStoreKey: "outer-store"
+            }
+          }))
+          const claim = yield* store.claim(claimOptions({ token: "t-race" }))
+          assert(claim._tag === "Claimed")
+          yield* store.cancel(inner.id)
+          yield* store.ack(inner.id, "t-race", {
+            _tag: "FanOut",
+            failFast: false,
+            children: [childSpec(inner.id, "a")]
+          })
+
+          const parent = yield* store.getJob(inner.id)
+          assert(Option.isSome(parent))
+          expect(parent.value.state).toBe("cancelled")
+          const entries = yield* store.peekOutbox({ limit: 10 })
+          expect(entries.map((entry) => entry.report.outcome)).toEqual(["cancelled"])
+          expect(entries[0]?.report.childKey).toBe("inner-raced")
+          expect(entries[0]?.flowName).toBe("outer-flow")
+        })
+      ))
+
     it.effect("a fail-fast settle of a nested parent reports upward through the outbox", () =>
       withStore((store) =>
         Effect.gen(function*() {

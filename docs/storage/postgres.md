@@ -22,6 +22,7 @@ The factories are the single source of truth for the table layout. Re-export the
 import {
   mqDedupe,
   mqFlowChildren,
+  mqFlowOutbox,
   mqJobAttempts,
   mqJobs,
   mqQueueControl,
@@ -37,6 +38,7 @@ export const jobSchedules = mqSchedules()           // default: effect_mq_schedu
 export const jobQueues = mqQueueControl()           // default: effect_mq_queue_control
 export const jobDedupe = mqDedupe()                 // default: effect_mq_dedupe
 export const jobFlowChildren = mqFlowChildren()     // default: effect_mq_flow_children
+export const jobFlowOutbox = mqFlowOutbox()         // default: effect_mq_flow_outbox
 ```
 
 Then generate and run the migration like any other schema change:
@@ -62,7 +64,15 @@ export const jobs = mqJobs<JobNames>("effect_mq_jobs", {
 import { DrizzleJobStore } from "effect-mq/drizzle-postgres"
 import { PgClient } from "@effect/sql-pg"
 import { Layer, Redacted } from "effect"
-import { jobAttempts, jobDedupe, jobFlowChildren, jobQueues, jobs, jobSchedules } from "./db/schema.ts"
+import {
+  jobAttempts,
+  jobDedupe,
+  jobFlowChildren,
+  jobFlowOutbox,
+  jobQueues,
+  jobs,
+  jobSchedules
+} from "./db/schema.ts"
 
 const JobStoreLive = DrizzleJobStore.layer({
   jobs,
@@ -70,7 +80,8 @@ const JobStoreLive = DrizzleJobStore.layer({
   schedules: jobSchedules,
   queues: jobQueues,
   dedupe: jobDedupe,
-  flowChildren: jobFlowChildren
+  flowChildren: jobFlowChildren,
+  flowOutbox: jobFlowOutbox
 }).pipe(
   Layer.provide(PgClient.layer({ url: Redacted.make(process.env.DATABASE_URL!) }))
 )
@@ -80,7 +91,7 @@ const JobStoreLive = DrizzleJobStore.layer({
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `jobs`, `attempts`, `schedules`, `queues`, `dedupe`, `flowChildren` | required | the table instances from the factories above |
+| `jobs`, `attempts`, `schedules`, `queues`, `dedupe`, `flowChildren`, `flowOutbox` | required | the table instances from the factories above |
 | `store` | default `JobStore` | bind to a [named store](/storage/stores) key |
 | `historyTtl` | off | store-level retention ceiling: one duration or a per-state split (see [Retention](/guide/retention)) |
 | `historySweepInterval` | 1 minute | history sweep cadence |
@@ -171,11 +182,11 @@ Ship layout changes through your normal migration flow: bump effect-mq, run `dri
 
 0.6.0 ([parent-child flows](/guide/flows)) is a bigger step, and it applies even if you never define a flow:
 
-1. The jobs table gains three nullable columns: `parent` jsonb, `flow_fail_fast` boolean, `flow_pending` integer.
-2. There is a new table, `effect_mq_flow_children` — export `mqFlowChildren()` from your schema as shown above.
-3. `DrizzleJobStore.layer` now **requires** the `flowChildren` table option; upgrading without it is a compile error, which is the intended nudge to run the migration first.
+1. The jobs table gains nullable columns: `parent` jsonb plus the flow bookkeeping (`flow_fail_fast` boolean and the `flow_pending`/`flow_completed`/`flow_failed`/`flow_cancelled` integers).
+2. There are two new tables — export `mqFlowChildren()` and `mqFlowOutbox()` from your schema as shown above.
+3. `DrizzleJobStore.layer` now **requires** the `flowChildren` and `flowOutbox` table options; upgrading without them is a compile error, which is the intended nudge to run the migration first.
 
-`drizzle-kit generate` emits both changes as one migration once the factory exports are in your schema; migrate before deploying 0.6.0.
+`drizzle-kit generate` emits all of it as one migration once the factory exports are in your schema; migrate before deploying 0.6.0.
 
 ## Where to next
 
