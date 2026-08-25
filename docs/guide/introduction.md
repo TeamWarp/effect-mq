@@ -40,7 +40,7 @@ Both sides use the same job definition, and the type system keeps them apart:
 
 ## Storage is a seam, not a backend
 
-Everything the library does goes through one interface, `JobStore`, and each of its operations is atomic: claim with locks, token-guarded acks, dedup, schedule ticks. Three drivers ship in the box (Postgres via your drizzle schema, Redis via atomic Lua scripts, in-memory), and a public conformance suite of ~60 behavioral tests keeps any driver honest, including [yours](/storage/writing-a-driver).
+Everything the library does goes through one interface, `JobStore`, and each of its operations is atomic: claim with locks, token-guarded acks, dedup, schedule ticks. Three drivers ship in the box (Postgres via your drizzle schema, Redis via atomic Lua scripts, in-memory), and a public conformance suite of a hundred-odd behavioral tests keeps any driver honest, including [yours](/storage/writing-a-driver).
 
 Delivery is **at-least-once**: a claimed job holds a lock that its worker heartbeats; if the worker dies, the stalled sweeper recovers the job for another attempt. Design handlers to be idempotent; the [idempotency key](/guide/defining-jobs#idempotency) and [dedup](/guide/deduplication) primitives make that easy.
 

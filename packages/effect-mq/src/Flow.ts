@@ -73,7 +73,7 @@ import {
   type Service as StoreService,
   unrecoverable
 } from "./JobStore.ts"
-import { type FlowDescriptor, type JobContext, type RegisterOptions, Worker } from "./Worker.ts"
+import { type CurrentJob, type FlowDescriptor, type JobContext, type RegisterOptions, Worker } from "./Worker.ts"
 
 /**
  * The structural view of a `Job.make` class a flow needs from its members.
@@ -331,13 +331,11 @@ export interface FlowHandlers<
   R2
 > {
   readonly fanOut: (
-    payload: PayloadType<Parent>,
-    context: JobContext
+    payload: PayloadType<Parent>
   ) => Effect.Effect<ChildrenInput<Children[number]>, ErrorValue<Parent>, R1>
   readonly collect: (
     payload: PayloadType<Parent>,
-    results: ChildResults<Children[number]>,
-    context: JobContext
+    results: ChildResults<Children[number]>
   ) => Effect.Effect<SuccessValue<Parent>, ErrorValue<Parent>, R2>
 }
 
@@ -407,8 +405,9 @@ export interface Flow<
     never,
     never,
     | Worker
-    | R1
-    | R2
+    // The worker provides CurrentJob around both phases.
+    | Exclude<R1, CurrentJob>
+    | Exclude<R2, CurrentJob>
     | MemberStores<Parent>
     | MemberStores<Children[number]>
     | PayloadDecodingServices<Parent>
@@ -722,7 +721,7 @@ export const make = <
       fanOut: (payload, context, parentDepth) =>
         // SAFETY: the worker decodes through the parent's payload schema
         // before calling this, so `payload` is the parent's payload type.
-        handlers.fanOut(payload as never, context).pipe(
+        handlers.fanOut(payload as never).pipe(
           Effect.flatMap((produced) => buildSpecs(produced, context, parentDepth))
         ),
       collect: (payload, flowState, context) =>
@@ -732,7 +731,7 @@ export const make = <
           const results = makeResults(store, flowState, context.jobId, services)
           // SAFETY: same as fanOut for `payload`; the accessors decode
           // through each member's schemas, matching ChildResults.
-          return yield* handlers.collect(payload as never, results as never, context)
+          return yield* handlers.collect(payload as never, results as never)
         })
     }
     return Layer.effectDiscard(

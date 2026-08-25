@@ -51,7 +51,7 @@ const producer = Effect.gen(function*() {
 // 3. Run. Workers are layers — deploy them in the same process or across
 //    machines against shared storage.
 const RunnerLive = SendEmail.toLayer(
-  (payload, ctx) => Effect.succeed(`message-${ctx.jobId}`),
+  (payload) => Effect.map(Worker.CurrentJob, ({ jobId }) => `message-${jobId}`),
   { concurrency: 5 }
 ).pipe(
   Layer.provideMerge(Worker.layer()),

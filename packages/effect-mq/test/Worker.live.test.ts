@@ -16,13 +16,14 @@ describe("Worker (live clock)", () => {
         defaults: { attempts: 2, backoff: { type: "fixed", delay: "30 millis" } }
       })
       let flakyAttempts = 0
-      const handlers = Live.toLayer(({ n }, context) =>
-        Effect.suspend(() => {
+      const handlers = Live.toLayer(({ n }) =>
+        Effect.gen(function*() {
           if (n === 2) {
             flakyAttempts++
-            if (context.attempt === 1) return Effect.die("first attempt fails")
+            const { attempt } = yield* Worker.CurrentJob
+            if (attempt === 1) return yield* Effect.die("first attempt fails")
           }
-          return Effect.succeed(n * 10)
+          return n * 10
         })
       )
 

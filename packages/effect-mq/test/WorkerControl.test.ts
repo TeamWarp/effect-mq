@@ -692,8 +692,11 @@ describe("repeatable schedules", () => {
       const storeLayer = Layer.succeed(JobStore.JobStore, store)
       class Tick extends Job.make("Tick", { payload: { label: Schema.String } }) {}
       const seen: Array<string> = []
-      const handlers = Tick.toLayer((payload, ctx) =>
-        Effect.sync(() => void seen.push(`${payload.label}:${ctx.jobId}`))
+      const handlers = Tick.toLayer((payload) =>
+        Effect.gen(function*() {
+          const { jobId } = yield* Worker.CurrentJob
+          seen.push(`${payload.label}:${jobId}`)
+        })
       )
 
       yield* Effect.gen(function*() {

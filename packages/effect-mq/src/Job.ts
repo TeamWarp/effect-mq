@@ -63,7 +63,7 @@ export {
    */
   unrecoverable
 }
-import { type JobContext, type RegisterOptions, Worker } from "./Worker.ts"
+import { type CurrentJob, type RegisterOptions, Worker } from "./Worker.ts"
 
 const TypeId = "~effect-mq/Job" as const
 
@@ -563,19 +563,20 @@ export interface Job<
 
   /**
    * Attach the handler that processes this job, as a layer to provide on top
-   * of `Worker.layer` (bound to the same store).
+   * of `Worker.layer` (bound to the same store). The handler reads the
+   * running attempt from the `Worker.CurrentJob` service — the worker
+   * provides it per run, so it never appears in the layer's requirements.
    */
   readonly toLayer: <R>(
     handler: (
-      payload: Payload["Type"],
-      context: JobContext
+      payload: Payload["Type"]
     ) => Effect.Effect<Success["Type"], Error["Type"], R>,
     options?: RegisterOptions | undefined
   ) => Layer.Layer<
     never,
     never,
     | Worker
-    | R
+    | Exclude<R, CurrentJob>
     | Payload["DecodingServices"]
     | Success["EncodingServices"]
     | Error["EncodingServices"]
@@ -1033,7 +1034,7 @@ const Proto = {
 
   toLayer(
     this: AnyWithProps,
-    handler: (payload: any, context: JobContext) => Effect.Effect<any, any, any>,
+    handler: (payload: any) => Effect.Effect<any, any, any>,
     options?: RegisterOptions
   ) {
     return Layer.effectDiscard(

@@ -61,7 +61,7 @@ import { Worker, MemoryJobStore } from "effect-mq"
 import { Effect, Layer } from "effect"
 
 const RunnerLive = SendEmail.toLayer(
-  (payload, ctx) => Effect.succeed(`message-${ctx.jobId}`),
+  (payload) => Effect.map(Worker.CurrentJob, ({ jobId }) => `message-${jobId}`),
   { concurrency: 5 }
 ).pipe(
   Layer.provideMerge(Worker.layer()),
