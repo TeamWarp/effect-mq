@@ -594,9 +594,18 @@ export type AckOutcome =
   }
 
 /**
- * Filters and pagination for `list`. Results are ordered newest-first
- * (`enqueuedAt` desc, then id desc); pass the returned `cursor` back to get
- * the next page.
+ * Filters, ordering, and pagination for `list`. The default order is
+ * newest-first (`enqueuedAt` desc, then id desc); pass the returned
+ * `cursor` back — with the SAME options that produced it — to get the next
+ * page.
+ *
+ * Ordering is not free on every storage layout, so the contract defines a
+ * REQUIRED (filter, orderBy) surface every driver serves
+ * (conformance-pinned): `enqueuedAt` with any filters; `runAt` for
+ * `states: ["delayed"]` within a `queue`; `finishedAt` for terminal
+ * `states`, with or without `name`/`queue`. Beyond that surface a driver
+ * either serves the query or dies with `ListOrderUnsupportedError` — never
+ * a silent full scan. Memory and Postgres serve every combination.
  *
  * @since 0.1.0
  */
@@ -606,10 +615,36 @@ export interface ListOptions {
   readonly states?: ReadonlyArray<JobState> | undefined
   /** Every entry must match the record's metadata exactly (AND semantics). */
   readonly metadata?: Readonly<Record<string, string>> | undefined
+  /**
+   * The field to order by (default `enqueuedAt`). Jobs missing the field
+   * (`finishedAt` on non-terminal rows) sort as 0.
+   *
+   * @since 0.7.0
+   */
+  readonly orderBy?: "enqueuedAt" | "runAt" | "finishedAt" | undefined
+  /**
+   * Direction (default `desc`). The id tiebreak follows the direction.
+   *
+   * @since 0.7.0
+   */
+  readonly order?: "asc" | "desc" | undefined
   readonly cursor?: string | undefined
   /** Page size; default 50. */
   readonly limit?: number | undefined
 }
+
+/**
+ * A driver received a (filter, `orderBy`) combination outside the surface
+ * it can serve without a full scan (see `ListOptions`). Delivered as a
+ * defect: the query contradicts the driver's documented matrix, which is a
+ * programming mistake, not a runtime condition to recover from.
+ *
+ * @since 0.7.0
+ */
+export class ListOrderUnsupportedError extends Data.TaggedError("ListOrderUnsupportedError")<{
+  readonly orderBy: string
+  readonly message: string
+}> {}
 
 /**
  * @since 0.1.0

@@ -546,6 +546,90 @@ export const jobStoreConformance = (
         })
       ))
 
+    it.effect("list orders by enqueuedAt ascending on request, cursor included", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const ids: Array<JobStore.JobId> = []
+          for (let i = 0; i < 3; i++) {
+            const { id } = yield* store.enqueue(baseRequest({ payload: { n: i } }))
+            ids.push(id)
+            yield* TestClock.adjust(1_000)
+          }
+          const first = yield* store.list({ orderBy: "enqueuedAt", order: "asc", limit: 2 })
+          expect(first.items.map((job) => job.id)).toEqual([ids[0], ids[1]])
+          assert(first.cursor !== undefined)
+          const second = yield* store.list({
+            orderBy: "enqueuedAt",
+            order: "asc",
+            limit: 2,
+            cursor: first.cursor
+          })
+          expect(second.items.map((job) => job.id)).toEqual([ids[2]])
+          expect(second.cursor).toBeUndefined()
+        })
+      ))
+
+    it.effect("list orders delayed jobs by runAt within a queue", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const late = yield* store.enqueue(baseRequest({ payload: { n: 1 }, delayMs: 30_000 }))
+          const soon = yield* store.enqueue(baseRequest({ payload: { n: 2 }, delayMs: 5_000 }))
+          const middle = yield* store.enqueue(baseRequest({ payload: { n: 3 }, delayMs: 10_000 }))
+          // An immediate job in the same queue must not appear.
+          yield* store.enqueue(baseRequest({ payload: { n: 4 } }))
+
+          const upcoming = yield* store.list({
+            queue: QueueName("default"),
+            states: ["delayed"],
+            orderBy: "runAt",
+            order: "asc"
+          })
+          expect(upcoming.items.map((job) => job.id)).toEqual([soon.id, middle.id, late.id])
+        })
+      ))
+
+    it.effect("list orders terminal jobs by finishedAt, with and without a name", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const finishAs = (
+            name: string,
+            outcome: "Complete" | "Fail",
+            token: string
+          ) =>
+            Effect.gen(function*() {
+              const { id } = yield* store.enqueue(baseRequest({ name }))
+              const claim = yield* store.claim(claimOptions({
+                names: ["TestJob", "OtherJob"],
+                token
+              }))
+              assert(claim._tag === "Claimed")
+              yield* store.ack(id, token, { _tag: outcome, exit: undefined })
+              yield* TestClock.adjust(1_000)
+              return id
+            })
+          const oldest = yield* finishAs("TestJob", "Complete", "t-1")
+          const middle = yield* finishAs("OtherJob", "Fail", "t-2")
+          const newest = yield* finishAs("TestJob", "Complete", "t-3")
+
+          // Across terminal states, newest finished first.
+          const recent = yield* store.list({
+            states: ["completed", "failed"],
+            orderBy: "finishedAt",
+            order: "desc"
+          })
+          expect(recent.items.map((job) => job.id)).toEqual([newest, middle, oldest])
+
+          // The same ordering scoped to one name and state.
+          const byName = yield* store.list({
+            name: "TestJob",
+            states: ["completed"],
+            orderBy: "finishedAt",
+            order: "desc"
+          })
+          expect(byName.items.map((job) => job.id)).toEqual([newest, oldest])
+        })
+      ))
+
     it.effect("keep count ties on finishedAt keep the most recently acked records", () =>
       withStore((store) =>
         Effect.gen(function*() {

@@ -795,7 +795,14 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
       Effect.sync(() => {
         const limit = Math.max(1, options.limit ?? 50)
         const states = options.states === undefined ? undefined : new Set(options.states)
-        // Newest first, stable across retries: (enqueuedAt desc, id desc).
+        const orderBy = options.orderBy ?? "enqueuedAt"
+        const descending = (options.order ?? "desc") === "desc"
+        // Jobs missing the field (finishedAt on non-terminal rows) sort as 0.
+        const orderValue = (job: MemJob): number =>
+          orderBy === "enqueuedAt" ? job.enqueuedAt : orderBy === "runAt" ? job.runAt : job.finishedAt ?? 0
+        const compareIds = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0)
+        // Stable across retries: the id tiebreak follows the direction, and
+        // the cursor excludes everything at or before its (value, id).
         let cursor: { readonly at: number; readonly id: string } | undefined
         if (options.cursor !== undefined) {
           const split = options.cursor.indexOf(":")
@@ -811,26 +818,27 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
             (states === undefined || states.has(job.state)) &&
             (options.metadata === undefined || metadataMatches(job.metadata, options.metadata))
           )
-          .toSorted((a, b) =>
-            b.enqueuedAt !== a.enqueuedAt
-              ? b.enqueuedAt - a.enqueuedAt
-              : b.id < a.id
-              ? -1
-              : b.id > a.id
-              ? 1
-              : 0
-          )
-          .filter((job) =>
-            cursor === undefined ||
-            job.enqueuedAt < cursor.at ||
-            (job.enqueuedAt === cursor.at && job.id < cursor.id)
-          )
+          .toSorted((a, b) => {
+            const byValue = descending
+              ? orderValue(b) - orderValue(a)
+              : orderValue(a) - orderValue(b)
+            if (byValue !== 0) return byValue
+            return descending ? compareIds(b.id, a.id) : compareIds(a.id, b.id)
+          })
+          .filter((job) => {
+            if (cursor === undefined) return true
+            const value = orderValue(job)
+            if (descending) {
+              return value < cursor.at || (value === cursor.at && job.id < cursor.id)
+            }
+            return value > cursor.at || (value === cursor.at && job.id > cursor.id)
+          })
         const items = matches.slice(0, limit).map(snapshot)
-        const last = items[items.length - 1]
+        const lastJob = matches[Math.min(limit, matches.length) - 1]
         const result: ListResult = {
           items,
-          cursor: matches.length > limit && last !== undefined
-            ? `${last.enqueuedAt}:${last.id}`
+          cursor: matches.length > limit && lastJob !== undefined
+            ? `${orderValue(lastJob)}:${lastJob.id}`
             : undefined
         }
         return result
