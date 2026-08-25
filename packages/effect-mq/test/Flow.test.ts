@@ -1,5 +1,5 @@
 import { assert, describe, expect, it } from "@effect/vitest"
-import { Cause, type Duration, Effect, Exit, Fiber, Layer, Option, Schema } from "effect"
+import { Cause, type Duration, Effect, Exit, Fiber, Layer, Option, Schema, Stream } from "effect"
 import { TestClock } from "effect/testing"
 import { Flow, Job, JobStore, MemoryJobStore, Worker } from "../src/index.ts"
 
@@ -20,6 +20,15 @@ class SendEmail extends Job.make("SendEmail", {
 class SendDigest extends Job.make("SendDigest", {
   payload: { tenant: Schema.String },
   success: Schema.Struct({ sent: Schema.Number, failed: Schema.Number })
+}) {}
+
+// An inner flow parent for the nesting tests: a flow child of SendDigest
+// flows AND the parent of its own SendEmail fan-out, all on the child store.
+class SendBatch extends Job.make("SendBatch", {
+  payload: { group: Schema.String },
+  success: Schema.Number,
+  store: ChildStore,
+  queue: "batches"
 }) {}
 
 /** Let all currently runnable fibers make progress. */
@@ -48,7 +57,8 @@ describe("Flow", () => {
         parent: SendDigest,
         children: [SendEmail]
       })
-      let captured: Flow.ChildResults<typeof SendEmail> | undefined
+      let captured: Flow.SettledChildren<typeof SendEmail> | undefined
+      let streamed: Array<Flow.SettledChild<typeof SendEmail>> | undefined
       const parentSide = DigestFlow.toLayer({
         fanOut: (payload) =>
           Effect.succeed(Flow.children(SendEmail, [
@@ -57,9 +67,10 @@ describe("Flow", () => {
             { key: "u3", payload: { userId: `${payload.tenant}-u3` } }
           ])),
         collect: (_payload, results) =>
-          Effect.sync(() => {
-            captured = results
-            return { sent: results.completed.length, failed: results.failed.length }
+          Effect.gen(function*() {
+            captured = yield* results.all
+            streamed = yield* Stream.runCollect(results.stream)
+            return { sent: results.counts.completed, failed: results.counts.failed }
           })
       }).pipe(Layer.provide(Worker.layer()))
       const childSide = SendEmail.toLayer((payload) =>
@@ -80,6 +91,13 @@ describe("Flow", () => {
           "sent:acme-u3"
         ])
         expect(captured.cancelled).toEqual([])
+        // The stream sees the same settled set, tagged by outcome.
+        assert(streamed !== undefined)
+        expect(streamed.map((child) => child.outcome).toSorted()).toEqual([
+          "completed",
+          "completed",
+          "failed"
+        ])
         const failure = captured.failed[0]
         assert(failure !== undefined)
         expect(failure.key).toBe("u2")
@@ -121,7 +139,7 @@ describe("Flow", () => {
       const parentSide = DigestFlow.toLayer({
         fanOut: () => Effect.succeed(Flow.children(SendEmail, [{ key: "only", payload: { userId: "u" } }])),
         collect: (_payload, results) =>
-          Effect.succeed({ sent: results.completed.length, failed: results.failed.length })
+          Effect.succeed({ sent: results.counts.completed, failed: results.counts.failed })
       }).pipe(Layer.provide(Worker.layer()))
       const childSide = SendEmail.toLayer(() => Effect.succeed("ok")).pipe(
         Layer.provide(Worker.layer({ store: ChildStore, flows: [DigestFlow] }))
@@ -131,7 +149,9 @@ describe("Flow", () => {
         const flowId = yield* DigestFlow.enqueue({ tenant: "acme" })
         yield* drain(3)
         const results = yield* DigestFlow.childResults(flowId)
-        expect(results.completed).toEqual([{ key: "only", name: "SendEmail", value: "ok" }])
+        expect(results.counts).toEqual({ pending: 0, completed: 1, failed: 0, cancelled: 0 })
+        const all = yield* results.all
+        expect(all.completed).toEqual([{ outcome: "completed", key: "only", name: "SendEmail", value: "ok" }])
       }).pipe(Effect.provide(
         Layer.mergeAll(parentSide, childSide).pipe(Layer.provideMerge(stores))
       ))
@@ -194,22 +214,19 @@ describe("Flow", () => {
       ))
     }))
 
-  it.effect("a worker without the flow registration fails children visibly and the sweeper reports them", () =>
+  it.effect("children complete on workers without the flow registration; the sweeper delivers the results", () =>
     Effect.gen(function*() {
       const DigestFlow = Flow.make("digest", {
         parent: SendDigest,
         children: [SendEmail]
       })
-      let collected: Flow.ChildResults<typeof SendEmail> | undefined
       const parentSide = DigestFlow.toLayer({
         fanOut: () => Effect.succeed(Flow.children(SendEmail, [{ key: "u1", payload: { userId: "u1" } }])),
         collect: (_payload, results) =>
-          Effect.sync(() => {
-            collected = results
-            return { sent: results.completed.length, failed: results.failed.length }
-          })
+          Effect.succeed({ sent: results.counts.completed, failed: results.counts.failed })
       }).pipe(Layer.provide(Worker.layer()))
-      // Misconfigured: runs SendEmail but has no `flows` registration.
+      // No `flows` registration: the child still runs and its ack still
+      // appends the outbox entry — this worker just cannot relay it.
       const childSide = SendEmail.toLayer(() => Effect.succeed("ok")).pipe(
         Layer.provide(Worker.layer({ store: ChildStore }))
       )
@@ -218,23 +235,106 @@ describe("Flow", () => {
         const fiber = yield* Effect.forkChild(DigestFlow.execute({ tenant: "acme" }))
         yield* drain(2)
 
-        // The child was failed unrecoverably, visibly, in its own store.
+        // The child completed normally in its own store; its report sits in
+        // the child store's outbox with no relay to push it.
         const childStore = yield* ChildStore
         const children = yield* childStore.list({ name: "SendEmail" })
-        expect(children.items[0]?.state).toBe("failed")
+        expect(children.items[0]?.state).toBe("completed")
+        expect((yield* childStore.peekOutbox({ limit: 10 })).length).toBe(1)
 
-        // The parent-side flow sweeper converts the store-side failure into
-        // a failed report and the flow completes under "continue".
+        // The parent-side flow sweeper reads the child's terminal state
+        // directly and the flow completes with the real result.
         yield* drain(3, "30 seconds")
         const result = yield* Fiber.join(fiber)
-        expect(result).toEqual({ sent: 0, failed: 1 })
-        assert(collected !== undefined)
-        const cause = collected.failed[0]?.cause
-        assert(cause !== undefined)
-        expect(Cause.pretty(cause)).toContain("cannot report to flow")
+        expect(result).toEqual({ sent: 1, failed: 0 })
       }).pipe(Effect.provide(
         Layer.mergeAll(parentSide, childSide).pipe(Layer.provideMerge(stores))
       ))
+    }))
+
+  it.effect("flows nest: an inner flow settles and reports upward through the outbox relay", () =>
+    Effect.gen(function*() {
+      const InnerFlow = Flow.make("inner-sends", {
+        parent: SendBatch,
+        children: [SendEmail]
+      })
+      const OuterFlow = Flow.make("digest", {
+        parent: SendDigest,
+        children: [SendBatch]
+      })
+      const outerSide = OuterFlow.toLayer({
+        fanOut: () =>
+          Effect.succeed(Flow.children(SendBatch, [
+            { key: "g1", payload: { group: "g1" } },
+            { key: "g2", payload: { group: "g2" } }
+          ])),
+        collect: (_payload, results) =>
+          Effect.gen(function*() {
+            const all = yield* results.all
+            const sent = all.completed.reduce((sum, child) => sum + child.value, 0)
+            return { sent, failed: results.counts.failed }
+          })
+      }).pipe(Layer.provide(Worker.layer()))
+      // One worker on the child store runs BOTH the inner parents and the
+      // leaves; `flows: [OuterFlow]` lets its relay push inner results to
+      // the main store.
+      const innerSide = Layer.mergeAll(
+        InnerFlow.toLayer({
+          fanOut: (payload) =>
+            Effect.succeed(Flow.children(SendEmail, [
+              { key: `${payload.group}-a`, payload: { userId: `${payload.group}-a` } },
+              { key: `${payload.group}-b`, payload: { userId: `${payload.group}-b` } }
+            ])),
+          collect: (_payload, results) => Effect.succeed(results.counts.completed)
+        }),
+        SendEmail.toLayer(() => Effect.succeed("ok"))
+      ).pipe(Layer.provide(Worker.layer({ store: ChildStore, flows: [OuterFlow] })))
+
+      yield* Effect.gen(function*() {
+        const fiber = yield* Effect.forkChild(OuterFlow.execute({ tenant: "acme" }))
+        yield* drain(8)
+        const result = yield* Fiber.join(fiber)
+        // 2 inner flows × 2 leaves each, every level's results decoded.
+        expect(result).toEqual({ sent: 4, failed: 0 })
+
+        // The inner parents are real flow children with their own manifests.
+        const childStore = yield* ChildStore
+        const inner = yield* childStore.list({ name: "SendBatch" })
+        expect(inner.items.map((job) => job.state)).toEqual(["completed", "completed"])
+        for (const job of inner.items) {
+          expect(job.parent?.flowName).toBe("digest")
+          expect(job.flow?.pending).toBe(0)
+        }
+      }).pipe(Effect.provide(
+        Layer.mergeAll(outerSide, innerSide).pipe(Layer.provideMerge(stores))
+      ))
+    }))
+
+  it.effect("the nesting depth cap fails runaway flows unrecoverably", () =>
+    Effect.gen(function*() {
+      const DigestFlow = Flow.make("digest", {
+        parent: SendDigest,
+        children: [SendEmail]
+      })
+      const parentSide = DigestFlow.toLayer({
+        fanOut: () => Effect.succeed(Flow.children(SendEmail, [{ key: "u1", payload: { userId: "u1" } }])),
+        collect: () => Effect.succeed({ sent: 0, failed: 0 })
+      }).pipe(Layer.provide(Worker.layer()))
+
+      yield* Effect.gen(function*() {
+        // A parent whose id already carries eight ancestor segments — what a
+        // cyclic definition would produce by level eight.
+        const flowId = yield* DigestFlow.enqueue({ tenant: "acme" }, {
+          jobId: "flow/x/".repeat(8) + "runaway",
+          attempts: 3
+        })
+        yield* drain(3)
+        const parentStore = yield* JobStore.JobStore
+        const parent = yield* parentStore.getJob(flowId)
+        assert(Option.isSome(parent))
+        expect(parent.value.state).toBe("failed")
+        expect(parent.value.attemptsMade).toBe(1)
+      }).pipe(Effect.provide(parentSide.pipe(Layer.provideMerge(stores))))
     }))
 
   it.effect("a scheduled parent fans out with no flow awareness in the schedule row", () =>
@@ -246,7 +346,7 @@ describe("Flow", () => {
       const parentSide = DigestFlow.toLayer({
         fanOut: () => Effect.succeed(Flow.children(SendEmail, [{ key: "u1", payload: { userId: "u1" } }])),
         collect: (_payload, results) =>
-          Effect.succeed({ sent: results.completed.length, failed: results.failed.length })
+          Effect.succeed({ sent: results.counts.completed, failed: results.counts.failed })
       }).pipe(Layer.provide(Worker.layer()))
       const childSide = SendEmail.toLayer(() => Effect.succeed("ok")).pipe(
         Layer.provide(Worker.layer({ store: ChildStore, flows: [DigestFlow] }))
@@ -266,7 +366,7 @@ describe("Flow", () => {
         assert(tick !== undefined)
         expect(tick.id.startsWith("sched/SendDigest/hourly/")).toBe(true)
         expect(tick.state).toBe("completed")
-        expect(tick.flow).toEqual({ failFast: false, pending: 0 })
+        expect(tick.flow).toEqual({ failFast: false, pending: 0, completed: 1, failed: 0, cancelled: 0 })
       }).pipe(Effect.provide(
         Layer.mergeAll(parentSide, childSide).pipe(Layer.provideMerge(stores))
       ))

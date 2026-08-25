@@ -337,6 +337,12 @@ export interface ParentEnvelope {
  * yet (a claim dispatches `fanOut`); present means the manifest landed (a
  * claim dispatches `collect`, and a re-run can never fan out twice).
  *
+ * The four counters always sum to the manifest size: applied reports move
+ * one child from `pending` to its outcome bucket, and settle-time marking
+ * (fail-fast, parent cancel) moves every remaining `pending` child to
+ * `cancelled` in the same atomic op. `collect` reads its tallies from here
+ * without touching a single dependency row.
+ *
  * @since 0.6.0
  */
 export interface FlowState {
@@ -344,6 +350,9 @@ export interface FlowState {
   readonly failFast: boolean
   /** Children whose result has not been recorded yet. */
   readonly pending: number
+  readonly completed: number
+  readonly failed: number
+  readonly cancelled: number
 }
 
 /**
@@ -385,10 +394,10 @@ export interface FlowChildRecord {
 }
 
 /**
- * An idempotent child-result report delivered into the parent store — by the
- * child's worker (the push path) or synthesized by the flow sweeper from
- * child-store state (the reconcile path). Both may deliver the same report;
- * the dependency row's state dedups them.
+ * An idempotent child-result report delivered into the parent store — by a
+ * worker's outbox relay (the push path) or synthesized by the flow sweeper
+ * from child-store state (the reconcile path). Both may deliver the same
+ * report; the dependency row's state dedups them.
  *
  * @since 0.6.0
  */
@@ -400,6 +409,34 @@ export interface FlowChildReport {
   readonly exit: unknown
   /** Present when the child was failed store-side (no exit exists). */
   readonly failedReason: string | undefined
+}
+
+/**
+ * One undelivered child-result report in a CHILD store's outbox.
+ *
+ * The outbox invariant every driver must uphold: whenever a store operation
+ * moves a job carrying a `parent` envelope INTO a terminal state — a
+ * `Complete`/`Fail`/`Cancelled` ack, stall exhaustion, a direct `cancel` of
+ * a waiting/delayed child, a cancel honoured during release or stall
+ * recovery, or a fail-fast settle of a NESTED flow parent (its terminal
+ * transition happens store-side, with no ack) — the same atomic operation
+ * appends the corresponding report here. The worker's relay then drains the outbox into the parent store in
+ * batches and deletes what it delivered. Because dependency rows dedup
+ * redelivery, the relay needs no leases: crash anywhere and the entries are
+ * simply delivered again.
+ *
+ * `remove` appends nothing (an operator override), and a `FanOut` ack
+ * appends nothing (`waiting-children` is not terminal).
+ *
+ * @since 0.6.0
+ */
+export interface OutboxEntry {
+  /** Store-assigned, opaque; pass back to `deleteOutbox` verbatim. */
+  readonly id: string
+  readonly flowName: string
+  /** The parent store's context-key string, for relay routing. */
+  readonly parentStoreKey: string
+  readonly report: FlowChildReport
 }
 
 /**
@@ -807,7 +844,8 @@ export interface Service {
    * Acknowledge a claimed job. Verifies the lock token, releases the lock,
    * increments `attemptsMade`, appends to the attempts ledger, then applies
    * the outcome (`Complete`/`Fail` are terminal and apply the record's `keep`
-   * policy; `Retry` re-queues after `delayMs`).
+   * policy; `Retry` re-queues after `delayMs`). Terminal outcomes for jobs
+   * carrying a `parent` envelope also append an `OutboxEntry` atomically.
    */
   readonly ack: (
     id: JobId,
@@ -837,7 +875,8 @@ export interface Service {
    * Sweep active jobs whose lock has expired. Each recovered job gets
    * `stalledCount + 1` and a `stalled` ledger entry; jobs exceeding
    * `maxStalledCount` are failed (`failed: true` in the result), the rest
-   * return to `waiting`.
+   * return to `waiting`. Stall-exhausting a job that carries a `parent`
+   * envelope appends its failed report to the outbox atomically.
    */
   readonly recoverStalled: (options: {
     readonly maxStalledCount: number
@@ -893,8 +932,9 @@ export interface Service {
    * flow parent settles to `cancelled` AND flips its remaining `pending`
    * dependency rows to `cancelled` (not `cascaded`) in the same atomic op —
    * the flow sweeper then delivers real cancels into the child stores, and
-   * late child reports find their row terminal and drop. Terminal jobs fail
-   * with `JobNotCancellableError`.
+   * late child reports find their row terminal and drop. Cancelling a job
+   * that itself carries a `parent` envelope appends its cancelled report to
+   * the outbox atomically. Terminal jobs fail with `JobNotCancellableError`.
    */
   readonly cancel: (
     id: JobId
@@ -990,31 +1030,58 @@ export interface Service {
   ) => Effect.Effect<void, JobStoreError>
 
   /**
-   * Record one child's terminal outcome on its dependency row — idempotent
-   * and atomic. Applies only when the row is still `pending` (`applied:
-   * false` for duplicate, late, or unknown reports); an applied report
-   * decrements the parent's `pending` counter and marks the row `cascaded`
-   * (the outcome came from the child's store — no cancel needs delivering).
+   * Record a batch of child outcomes on their dependency rows — idempotent
+   * and atomic, results positional. Each report applies only when its row
+   * is still `pending` (`applied: false` for duplicate, late, or unknown
+   * reports); an applied report moves the child from the parent's `pending`
+   * counter to its outcome counter and marks the row `cascaded` (the
+   * outcome came from the child's store — no cancel needs delivering). A
+   * batch may span flows.
    *
-   * Settles the parent (`parentSettled: true`) when the counter hits zero
-   * (`waiting-children` → `waiting`, runnable now, phase `collect`) — or on
-   * the FIRST failed report under the fail-fast policy, which instead
-   * settles it terminally `failed` (store-side, `failedReason` set, no
-   * exit — like stall exhaustion) and flips every remaining `pending` row
-   * to `cancelled`/not-`cascaded` in the same atomic op.
+   * Per flow, all row updates apply BEFORE the settle decision, and the
+   * parent settles at most once per batch (`parentSettled: true` on the
+   * report that decided it): when `pending` hits zero, `waiting-children` →
+   * `waiting` (runnable now, phase `collect`) — or on the first applied
+   * `failed` report in batch order under the fail-fast policy, which
+   * instead settles the parent terminally `failed` (store-side,
+   * `failedReason` set, no exit — like stall exhaustion) and flips every
+   * remaining `pending` row to `cancelled`/not-`cascaded` in the same
+   * atomic op. Fail-fast wins the tie when one report triggers both rules.
    *
-   * Lock ordering (drivers MUST follow it): the dependency row first, the
+   * Lock ordering (drivers MUST follow it): dependency rows first, the
    * parent row second — reports, fail-fast marking, and cancel marking all
    * take locks in this order, so report-vs-settle cannot deadlock.
    *
    * @since 0.6.0
    */
-  readonly recordChildResult: (
-    report: FlowChildReport
+  readonly recordChildResults: (
+    reports: ReadonlyArray<FlowChildReport>
   ) => Effect.Effect<
-    { readonly applied: boolean; readonly parentSettled: boolean },
+    ReadonlyArray<{ readonly applied: boolean; readonly parentSettled: boolean }>,
     JobStoreError
   >
+
+  /**
+   * The oldest undelivered outbox entries, up to `limit` (see
+   * `OutboxEntry` for the append invariant). The relay peeks, delivers via
+   * `recordChildResults` on the parent store, then deletes — redelivery
+   * after a crash is safe because dependency rows dedup.
+   *
+   * @since 0.6.0
+   */
+  readonly peekOutbox: (options: {
+    readonly limit: number
+  }) => Effect.Effect<ReadonlyArray<OutboxEntry>, JobStoreError>
+
+  /**
+   * Delete delivered outbox entries by id. Idempotent; unknown ids are
+   * ignored.
+   *
+   * @since 0.6.0
+   */
+  readonly deleteOutbox: (
+    ids: ReadonlyArray<string>
+  ) => Effect.Effect<void, JobStoreError>
 
   /**
    * A flow's dependency rows, ordered by child key; feeds `collect` and

@@ -19,8 +19,8 @@ import {
   type AckOutcome,
   type BackoffPolicy,
   type EnqueueRequest,
-  type FlowChildRecord,
   type FlowChildSpec,
+  type FlowState,
   isJobStoreError,
   isMarkedUnrecoverable,
   JobId,
@@ -124,7 +124,7 @@ export interface FlowDescriptor extends FlowAny {
   ) => Effect.Effect<ReadonlyArray<FlowChildSpec>, unknown, unknown>
   readonly collect: (
     payload: JobRecord["payload"],
-    rows: ReadonlyArray<FlowChildRecord>,
+    flow: FlowState,
     context: JobContext
   ) => Effect.Effect<unknown, unknown, unknown>
 }
@@ -204,24 +204,26 @@ export interface WorkerOptions<StoreId = JobStore> {
    */
   readonly onJobFailure?: ((failure: JobFailure) => Effect.Effect<void>) | undefined
   /**
-   * Flows whose CHILD jobs this worker runs. A worker claiming a flow child
-   * must deliver the child's terminal result into the flow's parent store
-   * before acking — this list is what gives it that store (each flow's
-   * parent StoreId lands in the layer's requirements). A worker that claims
-   * a flow child with no matching registration fails it unrecoverably
-   * (visible failure over a silent release loop; the flow sweeper converts
-   * it into a failed report). Workers running a flow's PARENT phases get
-   * their registration implicitly from `Flow.toLayer`.
+   * Flows whose CHILD jobs this worker runs. Child results are written to
+   * the child store's outbox atomically with each terminal transition; this
+   * list gives the worker the flows' parent stores (each parent StoreId
+   * lands in the layer's requirements), so its relay can push those results
+   * immediately. Without it the results wait for a relay elsewhere or for
+   * the parent-side sweeper's reconciliation — correct either way, just
+   * slower. Workers running a flow's PARENT phases get their registration
+   * implicitly from `Flow.toLayer`.
    */
   readonly flows?: ReadonlyArray<FlowAny> | undefined
   /**
    * Cadence of the flow sweeper (default 30s), which repairs whatever the
-   * fast paths missed: (re-)enqueues fanned-out children that never landed
+   * push path missed: (re-)enqueues fanned-out children that never landed
    * in their store, synthesizes reports for children that reached a
-   * terminal state store-side (stall exhaustion, direct cancels, workers
-   * unable to report), and cascades cancels after a flow settles. Also the
-   * age a dependency row must reach before it is reconciled. Runs only on
-   * workers that registered a flow via `Flow.toLayer`.
+   * terminal state without a delivered report, and cascades cancels after
+   * a flow settles. Also the age a dependency row must reach before it is
+   * reconciled, and the outbox relay's fallback drain cadence (the relay
+   * normally drains the moment a child result is acked). The sweeper runs
+   * only on workers that registered a flow via `Flow.toLayer`; the relay
+   * runs on any worker with flow registrations of either kind.
    */
   readonly flowSweepInterval?: Duration.Input | undefined
   /** Identifier used in lock tokens (default: random). */
@@ -286,10 +288,11 @@ export class Worker extends Context.Service<Worker, {
 }>()("effect-mq/Worker") {}
 
 interface HandlerEntry {
-  /** For flow parents this is the `collect` phase (fetches its own rows). */
+  /** For flow parents this is the `collect` phase (`flow` carries its tallies). */
   readonly run: (
     payload: JobRecord["payload"],
-    context: JobContext
+    context: JobContext,
+    flow: FlowState | undefined
   ) => Effect.Effect<unknown, unknown>
   readonly encodeExit: (
     exit: Exit.Exit<unknown, unknown>
@@ -424,20 +427,21 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
     // interrupt-only exits ack as Cancelled instead of shutdown-release.
     const cancelling = new Set<JobId>()
 
-    // Flow plumbing. `reportTargets` maps a flow name to the parent store a
-    // child's terminal result must be reported into — fed by the `flows`
-    // option (child-side) and by every `registerFlow` (a worker that runs
-    // the parent phases can always report on its own store).
-    // `childStoreServices` maps child store-key strings to their resolved
-    // services, for the sweeper and the post-fan-out enqueue.
-    const reportTargets = new Map<string, { readonly store: StoreService; readonly failFast: boolean }>()
-    const childStoreServices = new Map<string, StoreService>()
+    // Flow plumbing. `storesByKey` maps store-key strings to resolved
+    // services — this worker's own store, every `flows` entry's parent
+    // store, and each registered flow's parent + child stores. The relay
+    // routes outbox entries by `parentStoreKey` through it, and the sweeper
+    // and post-fan-out enqueue resolve child stores through it.
+    // `flowPolicies` carries each known flow's fail-fast bit for settle
+    // logging.
+    const storesByKey = new Map<string, StoreService>()
+    const flowPolicies = new Map<string, { readonly failFast: boolean }>()
     let flowSweeperStarted = false
+    let relayStarted = false
+    storesByKey.set(storeKey.key, store)
     for (const flow of options?.flows ?? []) {
-      reportTargets.set(flow.name, {
-        store: yield* flow.parent.store,
-        failFast: flow.failFast
-      })
+      storesByKey.set(flow.parent.store.key, yield* flow.parent.store)
+      flowPolicies.set(flow.name, { failFast: flow.failFast })
     }
 
     let tokenCounter = 0
@@ -539,53 +543,105 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
         }
       })
 
-    // Flow-child reporting runs AFTER a successful child ack — only the run
-    // that actually owns the lock reports (a lock-lost worker's stale result
-    // must never poison the flow: its ack is rejected, the new owner's ack
-    // wins, and the new owner reports). The report itself is best-effort: if
-    // it fails past the bounded retries, the child is already terminal in
-    // its own store and the flow sweeper synthesizes the report from that
-    // record on its next pass. At-least-once holds end to end.
-    const reportToFlow = (
-      record: JobRecord,
-      outcome: "completed" | "failed" | "cancelled",
-      exitValue: JobRecord["exit"]
-    ) =>
-      Effect.gen(function*() {
-        const envelope = record.parent
-        if (envelope === undefined) return
-        const target = reportTargets.get(envelope.flowName)
-        // Unreportable children are failed before their handler ever runs;
-        // this guard is defensive.
-        if (target === undefined) return
-        const result = yield* retryStore(target.store.recordChildResult({
-          flowId: envelope.flowId,
-          childKey: envelope.childKey,
-          outcome,
-          exit: exitValue,
-          failedReason: undefined
-        }))
-        if (result.applied) {
-          yield* Metric.update(
-            Metrics.flowChildReports.pipe(
-              Metric.withAttributes({ flow: envelope.flowName, outcome, source: "report" })
-            ),
-            1
-          )
-        }
-        if (result.parentSettled && outcome === "failed" && target.failFast) {
-          yield* Effect.logError(
-            `effect-mq: flow "${envelope.flowName}" (${envelope.flowId}) settled failed-fast on child "${envelope.childKey}"`
-          )
-        }
-      }).pipe(
-        Effect.catchCause((cause) =>
-          Effect.logWarning(
-            "effect-mq: flow child report dropped; the flow sweeper will reconcile it",
-            cause
-          )
-        )
+    // The outbox relay. Child results land in this store's outbox
+    // atomically with each terminal transition; the relay drains them into
+    // their parent stores in batches and deletes what it delivered.
+    // Redelivery after a crash is safe (dependency rows dedup), so there
+    // are no leases — peek, deliver, delete. A terminal ack nudges the
+    // relay for v1-fast-path latency; the periodic pass is the fallback.
+    let relayPulseVersion = 0
+    let relayPulse = Deferred.makeUnsafe<void>()
+    const fireRelayPulse = Effect.suspend(() => {
+      relayPulseVersion += 1
+      const current = relayPulse
+      relayPulse = Deferred.makeUnsafe<void>()
+      return Deferred.succeed(current, void 0)
+    })
+    const awaitRelayPulse = (observed: number) =>
+      Effect.suspend(() =>
+        relayPulseVersion > observed ? Effect.void : Deferred.await(relayPulse)
       )
+
+    const relayDrain = Effect.gen(function*() {
+      const pageSize = 500
+      while (true) {
+        const entries = yield* retryStore(store.peekOutbox({ limit: pageSize }))
+        if (entries.length === 0) return
+        // Route each entry to its parent store; entries this worker cannot
+        // route stay in the outbox for a worker that can (reconciliation
+        // keeps the flow correct regardless).
+        const byStore = new Map<string, Array<(typeof entries)[number]>>()
+        let skipped = 0
+        for (const entry of entries) {
+          const target = storesByKey.get(entry.parentStoreKey)
+          if (target === undefined) {
+            skipped += 1
+            continue
+          }
+          let group = byStore.get(entry.parentStoreKey)
+          if (group === undefined) {
+            group = []
+            byStore.set(entry.parentStoreKey, group)
+          }
+          group.push(entry)
+        }
+        if (skipped > 0) {
+          yield* Metric.update(Metrics.flowOutboxSkipped, skipped)
+        }
+        let delivered = 0
+        for (const [key, group] of byStore) {
+          const target = storesByKey.get(key)
+          if (target === undefined) continue
+          const results = yield* retryStore(
+            target.recordChildResults(group.map((entry) => entry.report))
+          )
+          for (const [index, result] of results.entries()) {
+            const entry = group[index]
+            if (entry === undefined) continue
+            if (result.applied) {
+              yield* Metric.update(
+                Metrics.flowChildReports.pipe(
+                  Metric.withAttributes({
+                    flow: entry.flowName,
+                    outcome: entry.report.outcome,
+                    source: "report"
+                  })
+                ),
+                1
+              )
+            }
+            if (
+              result.parentSettled && entry.report.outcome === "failed" &&
+              flowPolicies.get(entry.flowName)?.failFast === true
+            ) {
+              yield* Effect.logError(
+                `effect-mq: flow "${entry.flowName}" (${entry.report.flowId}) settled failed-fast on child "${entry.report.childKey}"`
+              )
+            }
+          }
+          yield* retryStore(store.deleteOutbox(group.map((entry) => entry.id)))
+          delivered += group.length
+        }
+        // Only continue when this page was fully consumed — a partially
+        // routable page would return the same head forever.
+        if (entries.length < pageSize || delivered < entries.length) return
+      }
+    })
+
+    const relayLoop = Effect.gen(function*() {
+      const observed = relayPulseVersion
+      yield* relayDrain
+      yield* Effect.race(awaitRelayPulse(observed), Effect.sleep(flowSweepMs))
+    }).pipe(
+      Effect.catchCause((cause) => Effect.logError("effect-mq: outbox relay failed", cause)),
+      Effect.forever
+    )
+
+    const ensureRelay = Effect.suspend(() => {
+      if (relayStarted) return Effect.void
+      relayStarted = true
+      return FiberSet.run(fibers, relayLoop.pipe(Effect.updateContext(() => workerContext)))
+    })
 
     const routeFailure = (record: JobRecord, exit: JobRecord["exit"]): AckOutcome => {
       const attempt = record.attemptsMade + 1
@@ -655,44 +711,6 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
             yield* recordRun("failed")
           })
         }
-        const envelope = record.parent
-        if (envelope !== undefined && !reportTargets.has(envelope.flowName)) {
-          // Misconfigured worker: it can RUN this flow child but cannot
-          // report the result to the child's flow. Fail it unrecoverably —
-          // visible, and converted into a failed report by the flow sweeper —
-          // instead of releasing it into a claim/release loop that starves
-          // the whole queue.
-          return Effect.gen(function*() {
-            const cause = Cause.die(new Error(
-              `effect-mq: worker cannot report to flow "${envelope.flowName}"; ` +
-                `register it in Worker.layer({ flows })`
-            ))
-            const encoded = yield* Effect.exit(entry.encodeExit(Exit.failCause(cause)))
-            yield* ackSafely(
-              store.ack(record.id, token, {
-                _tag: "Fail",
-                exit: Exit.isSuccess(encoded) ? encoded.value : undefined
-              }),
-              "ack"
-            )
-            yield* Metric.update(
-              Metrics.flowUnreportableChildren.pipe(
-                Metric.withAttributes({ flow: envelope.flowName })
-              ),
-              1
-            )
-            yield* reportFailure({
-              jobId: record.id,
-              name: record.name,
-              queue: record.queue,
-              attempt: context.attempt,
-              attemptsMax: record.attemptsMax,
-              willRetry: false,
-              cause
-            }, undefined)
-            yield* recordRun("failed")
-          })
-        }
         return Effect.gen(function*() {
           // The per-run time limit interrupts the handler internally; surface
           // it as a defect so it flows through normal retry accounting.
@@ -722,7 +740,7 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
           const isFanOut = flow !== undefined && record.flow === undefined
           const runEffect = flow !== undefined && record.flow === undefined
             ? flow.fanOut(record.payload, context)
-            : entry.run(record.payload, context)
+            : entry.run(record.payload, context, record.flow)
           const withRunSpan = runEffect.pipe(
             Effect.withSpan(
               options?.handlerSpanName?.(context) ?? `${record.name}.run`,
@@ -771,8 +789,10 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
           // shutdown races it — cancellation wins, the job must not revive).
           if (wasCancelled && Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)) {
             const landed = yield* ackLanded(store.ack(record.id, token, { _tag: "Cancelled" }), "ack")
-            if (landed) {
-              yield* reportToFlow(record, "cancelled", undefined)
+            if (landed && record.parent !== undefined) {
+              // The ack appended this child's report to the outbox; drain now
+              // instead of waiting for the periodic pass.
+              yield* fireRelayPulse
             }
             return yield* recordRun("cancelled")
           }
@@ -876,12 +896,13 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
             ? { _tag: "Fail", exit: exitValue }
             : routeFailure(record, exitValue)
           const landed = yield* ackLanded(store.ack(record.id, token, outcome), "ack")
-          if (landed) {
-            if (outcome._tag === "Complete") {
-              yield* reportToFlow(record, "completed", exitValue)
-            } else if (outcome._tag === "Fail") {
-              yield* reportToFlow(record, "failed", exitValue)
-            }
+          if (
+            landed && record.parent !== undefined &&
+            (outcome._tag === "Complete" || outcome._tag === "Fail")
+          ) {
+            // The ack appended this child's report to the outbox; drain now
+            // instead of waiting for the periodic pass.
+            yield* fireRelayPulse
           }
           if (outcome._tag === "Fail" || outcome._tag === "Retry") {
             const cause = Exit.isFailure(effective)
@@ -1142,7 +1163,7 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
     // anywhere in the sweep are safe.
     const reconcileChild = (flowId: JobId, child: FlowChildSpec) =>
       Effect.gen(function*() {
-        const childStore = childStoreServices.get(child.storeKey)
+        const childStore = storesByKey.get(child.storeKey)
         if (childStore === undefined) {
           // A flow registered on another worker shares this parent store;
           // that worker's sweeper holds the child store layer.
@@ -1178,17 +1199,18 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
           // Still in flight: never blindly re-drive a live child.
           return
         }
-        // Terminal without a delivered report (stall exhaustion, a direct
-        // cancel, an unreportable worker): synthesize the report from the
-        // child store's own record.
-        const result = yield* retryStore(store.recordChildResult({
+        // Terminal without a delivered report (a dropped outbox entry, or a
+        // child whose store has no relaying worker): synthesize the report
+        // from the child store's own record.
+        const results = yield* retryStore(store.recordChildResults([{
           flowId,
           childKey: child.childKey,
           outcome: state,
           exit: existing.value.exit,
           failedReason: existing.value.failedReason
-        }))
-        if (result.applied) {
+        }]))
+        const result = results[0]
+        if (result?.applied === true) {
           yield* Metric.update(
             Metrics.flowChildReports.pipe(
               Metric.withAttributes({
@@ -1199,7 +1221,7 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
             ),
             1
           )
-          if (result.parentSettled && state === "failed") {
+          if (result?.parentSettled === true && state === "failed") {
             yield* Effect.logError(
               `effect-mq: flow ${flowId} settled on reconciled child failure "${child.childKey}"`
             )
@@ -1218,7 +1240,7 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
       Effect.gen(function*() {
         const done: Array<string> = []
         for (const child of children) {
-          const childStore = childStoreServices.get(child.storeKey)
+          const childStore = storesByKey.get(child.storeKey)
           if (childStore === undefined) continue
           // Idempotent: a vanished or already-terminal child is "cancelled
           // enough".
@@ -1274,6 +1296,9 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
     yield* FiberSet.run(fibers, renewalLoop)
     yield* FiberSet.run(fibers, stalledLoop)
     yield* FiberSet.run(fibers, scheduleLoop)
+    if (flowPolicies.size > 0) {
+      yield* ensureRelay
+    }
 
     if (options?.queueMetricsInterval !== undefined) {
       const sampleMs = Duration.toMillis(options.queueMetricsInterval)
@@ -1397,11 +1422,12 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
                 )
               )
             }
-            childStoreServices.set(key.key, service.value)
+            storesByKey.set(key.key, service.value)
           }
-          // Running the parent phases implies reporting rights on this store
-          // (same-store children need no explicit `flows` entry).
-          reportTargets.set(flow.name, { store, failFast: flow.failFast })
+          // Running the parent phases makes this worker a relay target for
+          // its own store (nested parents report upward through it too).
+          storesByKey.set(flow.parent.store.key, store)
+          flowPolicies.set(flow.name, { failFast: flow.failFast })
           const decodePayload = Schema.decodeUnknownEffect(flow.parent.payloadJsonSchema)
           const encodeExit = Schema.encodeEffect(flow.parent.exitSchema)
           // SAFETY: same contract as `register` — the captured context holds
@@ -1412,27 +1438,22 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
                 Context.merge(input, services) as Context.Context<unknown>
               )
             ) as Effect.Effect<A, E>
-          // The full dependency-row set, drained past pagination, for collect.
-          const fetchRows = (flowId: JobId) =>
-            Effect.gen(function*() {
-              const rows: Array<FlowChildRecord> = []
-              let cursor: string | undefined
-              do {
-                const page = yield* retryStore(store.listChildResults(flowId, { cursor }))
-                for (const item of page.items) rows.push(item)
-                cursor = page.cursor
-              } while (cursor !== undefined)
-              return rows
-            })
+          const emptyFlow: FlowState = {
+            failFast: flow.failFast,
+            pending: 0,
+            completed: 0,
+            failed: 0,
+            cancelled: 0
+          }
           const entry: HandlerEntry = {
-            run: (payload, context) =>
+            run: (payload, context, flowState) =>
               provideCaptured(
                 decodePayload(payload).pipe(
                   Effect.orDie,
                   Effect.flatMap((decoded) =>
-                    fetchRows(context.jobId).pipe(
-                      Effect.flatMap((rows) => flow.collect(decoded, rows, context))
-                    )
+                    // collect dispatch requires a persisted manifest, so the
+                    // fallback is defensive only.
+                    flow.collect(decoded, flowState ?? emptyFlow, context)
                   )
                 )
               ),
@@ -1462,7 +1483,7 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
                     group.push(child.request)
                   }
                   for (const [key, requests] of byStore) {
-                    const childStore = childStoreServices.get(key)
+                    const childStore = storesByKey.get(key)
                     if (childStore === undefined) continue
                     yield* retryStore(childStore.enqueueMany(requests)).pipe(
                       Effect.catchCause((cause) =>
@@ -1494,6 +1515,7 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
           )
           yield* ensureQueueLoop(queue, registerOptions?.concurrency)
           yield* ensureFlowSweeper
+          yield* ensureRelay
           yield* firePulse
           // SAFETY: like `register`, the implementation erases requirements
           // that Flow.toLayer's public signature declares and the captured

@@ -166,11 +166,13 @@ export const flowCascades = Metric.counter("effect_mq_flow_cascades", {
 })
 
 /**
- * Flow children failed because the claiming worker had no registration for
- * their flow (`Worker.layer({ flows })` missing). Tags: `flow`.
+ * Undelivered outbox entries a relay drain had to leave behind (their
+ * parent store is not reachable from this worker — no matching `flows`
+ * registration). Tags: none. Sustained growth means no process anywhere
+ * can relay these flows; reconciliation keeps the flows correct meanwhile.
  *
  * @since 0.6.0
  */
-export const flowUnreportableChildren = Metric.counter("effect_mq_flow_unreportable_children", {
-  description: "Flow children failed unrecoverably by workers unable to report to their flow"
+export const flowOutboxSkipped = Metric.counter("effect_mq_flow_outbox_skipped", {
+  description: "Outbox entries left undelivered by a relay drain (parent store unknown here)"
 })

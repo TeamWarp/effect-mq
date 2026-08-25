@@ -25,21 +25,29 @@
  *       })))
  *     }),
  *   collect: (payload, results) =>
- *     Effect.succeed({ sent: results.completed.length, failed: results.failed.length })
+ *     Effect.succeed({ sent: results.counts.completed, failed: results.counts.failed })
+ *     // or: yield* results.all (materialized buckets), results.stream (paged)
  * })
  *
- * // any worker that runs the CHILDREN must be able to report back:
+ * // workers that run the CHILDREN list the flow so results push instantly:
  * // Worker.layer({ store: EmailStore, flows: [DigestFlow] })
  * ```
  *
  * Architecture (see `designs/parent-child-flows.md`): the parent's store
- * owns the flow — child manifest, per-child results, pending counter — so
+ * owns the flow — child manifest, per-child results, outcome counters — so
  * "the flow settles exactly once" is single-store atomic. Cross-store needs
- * only two at-least-once idempotent mechanisms: child workers *report*
- * results into the parent store before acking (fast path), and the parent
+ * only two at-least-once idempotent mechanisms: every terminal child
+ * transition atomically appends its report to the CHILD store's outbox,
+ * which worker relays *push* into the parent store in batches (children
+ * keep completing even while the parent store is down); and the parent
  * worker's flow sweeper *reconciles* from child-store state (repairs
- * everything the push path can miss: crashes mid-enqueue, stall-exhausted
- * or directly-cancelled children, misconfigured workers).
+ * everything the push path can miss: crashes mid-enqueue, dropped outbox
+ * entries, children terminal on stores no relay reaches).
+ *
+ * Flows nest: a child may itself be another flow's parent, reporting upward
+ * through the same machinery when it settles. Depth is capped (8) so a
+ * cyclic definition surfaces as an unrecoverable failure instead of an
+ * unbounded chain.
  *
  * Flow children bypass the child definition's `idempotencyKey`/`dedupe` —
  * the child `key` (unique within the flow) IS the idempotency mechanism,
@@ -48,7 +56,7 @@
  *
  * @since 0.6.0
  */
-import { Cause, type Context, Duration, Effect, Exit, Layer, Schema } from "effect"
+import { Cause, Context, Duration, Effect, Exit, Layer, Option, Schema, Stream } from "effect"
 import {
   type AnyStructSchema,
   type JobOptions,
@@ -59,6 +67,7 @@ import {
 import {
   type EnqueueRequest,
   type FlowChildRecord,
+  type FlowState,
   JobId,
   type QueueName,
   type Service as StoreService,
@@ -247,15 +256,51 @@ type FailedOf<J> = J extends MemberJob ? FailedChild<NameOf<J>, ErrorValue<J>> :
 type CancelledOf<J> = J extends MemberJob ? CancelledChild<NameOf<J>> : never
 
 /**
- * The settled children handed to `collect`, bucketed by outcome and decoded
- * through each member's schemas (`name` discriminates member types).
+ * Per-outcome tallies, read straight off the parent's persisted `FlowState`
+ * — no dependency-row reads. When `collect` runs, `pending` is 0.
+ *
+ * @since 0.6.0
+ */
+export interface ChildCounts {
+  readonly pending: number
+  readonly completed: number
+  readonly failed: number
+  readonly cancelled: number
+}
+
+/**
+ * One settled child, discriminated by `outcome` (and by `name` across
+ * member types), decoded through its member's schemas.
+ *
+ * @since 0.6.0
+ */
+export type SettledChild<J extends MemberJob> =
+  | ({ readonly outcome: "completed" } & CompletedOf<J>)
+  | ({ readonly outcome: "failed" } & FailedOf<J>)
+  | ({ readonly outcome: "cancelled" } & CancelledOf<J>)
+
+/**
+ * Every settled child, materialized into outcome buckets.
+ *
+ * @since 0.6.0
+ */
+export interface SettledChildren<J extends MemberJob> {
+  readonly completed: ReadonlyArray<Extract<SettledChild<J>, { readonly outcome: "completed" }>>
+  readonly failed: ReadonlyArray<Extract<SettledChild<J>, { readonly outcome: "failed" }>>
+  readonly cancelled: ReadonlyArray<Extract<SettledChild<J>, { readonly outcome: "cancelled" }>>
+}
+
+/**
+ * What `collect` (and `Flow.childResults`) receives: `counts` for free,
+ * `all` to materialize the v1-style buckets (one array — fine into the
+ * tens of thousands), and `stream` to fold huge flows one page at a time.
  *
  * @since 0.6.0
  */
 export interface ChildResults<J extends MemberJob> {
-  readonly completed: ReadonlyArray<CompletedOf<J>>
-  readonly failed: ReadonlyArray<FailedOf<J>>
-  readonly cancelled: ReadonlyArray<CancelledOf<J>>
+  readonly counts: ChildCounts
+  readonly all: Effect.Effect<SettledChildren<J>>
+  readonly stream: Stream.Stream<SettledChild<J>>
 }
 
 /**
@@ -323,8 +368,9 @@ export interface Flow<
   readonly unschedule: Parent["unschedule"]
 
   /**
-   * The flow's recorded child results (decoded), regardless of parent
-   * state — pending children are simply absent from every bucket.
+   * The flow's recorded child results, in any parent state: live `counts`
+   * plus the `all`/`stream` accessors — children still pending are absent
+   * from both.
    */
   readonly childResults: (
     flowId: JobId
@@ -406,54 +452,115 @@ export const make = <
   }
   const failFast = options.onChildFailure === "fail"
 
-  // Decode dependency rows into the typed buckets. Buckets follow the
-  // DECODED exit where one exists (a defensive net for outcome/exit drift);
-  // rows without an exit follow their recorded status.
-  const decodeRows = (rows: ReadonlyArray<FlowChildRecord>) =>
+  // A dependency row decoded into a settled, tagged entry. The outcome
+  // follows the DECODED exit where one exists (a defensive net for
+  // outcome/exit drift); rows without an exit follow their recorded status.
+  // Pending rows decode to undefined (only reachable via `childResults` on
+  // an unsettled flow).
+  type SettledEntry =
+    | { readonly outcome: "completed"; readonly key: string; readonly name: string; readonly value: unknown }
+    | { readonly outcome: "failed"; readonly key: string; readonly name: string; readonly cause: Cause.Cause<unknown> }
+    | { readonly outcome: "cancelled"; readonly key: string; readonly name: string }
+  const decodeRow = (row: FlowChildRecord) =>
     Effect.gen(function*() {
-      const completed: Array<{ key: string; name: string; value: unknown }> = []
-      const failed: Array<{ key: string; name: string; cause: Cause.Cause<unknown> }> = []
-      const cancelled: Array<{ key: string; name: string }> = []
-      for (const row of rows) {
-        if (row.status === "pending") continue
-        if (row.status === "cancelled") {
-          cancelled.push({ key: row.childKey, name: row.name })
-          continue
-        }
-        if (row.exit === undefined) {
-          // Store-side failure: no exit was ever produced.
-          failed.push({
-            key: row.childKey,
-            name: row.name,
-            cause: Cause.die(
-              new Error(row.failedReason ?? `effect-mq: flow child "${row.childKey}" failed without a result`)
-            )
-          })
-          continue
-        }
-        const member = byName.get(row.name)
-        if (member === undefined) {
-          failed.push({
-            key: row.childKey,
-            name: row.name,
-            cause: Cause.die(
-              new Error(`effect-mq: flow "${name}" has no member definition for child "${row.name}"`)
-            )
-          })
-          continue
-        }
-        const decoded = yield* Schema.decodeUnknownEffect(member.exitSchema)(row.exit).pipe(Effect.orDie)
-        // SAFETY: a member's exitSchema Type is Exit<Success, Error> by
-        // construction in Job.make.
-        const exit = decoded as Exit.Exit<unknown, unknown>
-        if (Exit.isSuccess(exit)) {
-          completed.push({ key: row.childKey, name: row.name, value: exit.value })
-        } else {
-          failed.push({ key: row.childKey, name: row.name, cause: exit.cause })
-        }
+      if (row.status === "pending") return undefined
+      if (row.status === "cancelled") {
+        const entry: SettledEntry = { outcome: "cancelled", key: row.childKey, name: row.name }
+        return entry
       }
-      return { completed, failed, cancelled }
+      if (row.exit === undefined) {
+        // Store-side failure: no exit was ever produced.
+        const entry: SettledEntry = {
+          outcome: "failed",
+          key: row.childKey,
+          name: row.name,
+          cause: Cause.die(
+            new Error(row.failedReason ?? `effect-mq: flow child "${row.childKey}" failed without a result`)
+          )
+        }
+        return entry
+      }
+      const member = byName.get(row.name)
+      if (member === undefined) {
+        const entry: SettledEntry = {
+          outcome: "failed",
+          key: row.childKey,
+          name: row.name,
+          cause: Cause.die(
+            new Error(`effect-mq: flow "${name}" has no member definition for child "${row.name}"`)
+          )
+        }
+        return entry
+      }
+      const decoded = yield* Schema.decodeUnknownEffect(member.exitSchema)(row.exit).pipe(Effect.orDie)
+      // SAFETY: a member's exitSchema Type is Exit<Success, Error> by
+      // construction in Job.make.
+      const exit = decoded as Exit.Exit<unknown, unknown>
+      const entry: SettledEntry = Exit.isSuccess(exit)
+        ? { outcome: "completed", key: row.childKey, name: row.name, value: exit.value }
+        : { outcome: "failed", key: row.childKey, name: row.name, cause: exit.cause }
+      return entry
     })
+
+  // Build the collect-facing accessors over a flow's dependency rows.
+  // Accessors are lazy and may run in the caller's fiber later, so they
+  // carry the context captured at construction (the registration context
+  // under a worker; the caller's own context via `childResults`) — that is
+  // what lets their public types declare no requirements.
+  const makeResults = (
+    store: StoreService,
+    flow: FlowState,
+    flowId: JobId,
+    services: Context.Context<never>
+  ) => {
+    // SAFETY: the captured context carries the members' decoding services,
+    // declared on toLayer's / childResults' public signatures.
+    const withCaptured = <A, E>(effect: Effect.Effect<A, E, unknown>): Effect.Effect<A, E> =>
+      effect.pipe(
+        Effect.updateContext((input) => Context.merge(input, services) as Context.Context<unknown>)
+      ) as Effect.Effect<A, E>
+    const decodePage = (cursor: string | undefined) =>
+      store.listChildResults(flowId, { cursor }).pipe(
+        Effect.orDie,
+        Effect.flatMap((page) =>
+          Effect.forEach(page.items, decodeRow).pipe(
+            Effect.map((entries) =>
+              [
+                entries.filter((entry) => entry !== undefined),
+                Option.fromNullishOr(page.cursor)
+              ] as const
+            )
+          )
+        )
+      )
+    const stream = Stream.paginate<string | undefined, SettledEntry>(
+      undefined,
+      (cursor) => withCaptured(decodePage(cursor))
+    )
+    const all = withCaptured(Effect.gen(function*() {
+      const completed: Array<SettledEntry> = []
+      const failed: Array<SettledEntry> = []
+      const cancelled: Array<SettledEntry> = []
+      let cursor: string | undefined
+      do {
+        const [entries, next] = yield* decodePage(cursor)
+        for (const entry of entries) {
+          if (entry.outcome === "completed") completed.push(entry)
+          else if (entry.outcome === "failed") failed.push(entry)
+          else cancelled.push(entry)
+        }
+        cursor = Option.getOrUndefined(next)
+      } while (cursor !== undefined)
+      return { completed, failed, cancelled }
+    }))
+    const counts = {
+      pending: flow.pending,
+      completed: flow.completed,
+      failed: flow.failed,
+      cancelled: flow.cancelled
+    }
+    return { counts, all, stream }
+  }
 
   // Turn the fanOut handler's groups into complete FlowChildSpecs:
   // deterministic ids, `parent` envelopes, encoded payloads, and the
@@ -465,6 +572,19 @@ export const make = <
     context: JobContext
   ) =>
     Effect.gen(function*() {
+      // Child ids embed the full ancestor chain, so "flow/" occurrences in
+      // the parent's own id count the nesting depth. Definitions cannot be
+      // cycle-checked statically (a job does not know which flows parent
+      // it), so a runaway A→B→A recursion surfaces here instead of growing
+      // forever.
+      const depth = context.jobId.split("flow/").length - 1
+      if (depth >= 8) {
+        return yield* Effect.die(unrecoverable(
+          new Error(
+            `effect-mq: flow "${name}" exceeds the nesting depth limit (8) — flow definitions must not form cycles`
+          )
+        ))
+      }
       const groups = Array.isArray(input) ? input : [input]
       const span = yield* Effect.currentSpan.pipe(
         Effect.map((current) => ({
@@ -560,18 +680,6 @@ export const make = <
       return specs
     })
 
-  const fetchRows = (store: StoreService, flowId: JobId) =>
-    Effect.gen(function*() {
-      const rows: Array<FlowChildRecord> = []
-      let cursor: string | undefined
-      do {
-        const page = yield* store.listChildResults(flowId, { cursor }).pipe(Effect.orDie)
-        for (const item of page.items) rows.push(item)
-        cursor = page.cursor
-      } while (cursor !== undefined)
-      return rows
-    })
-
   const toLayer = (
     handlers: FlowHandlers<ParentJob, ReadonlyArray<MemberJob>, unknown, unknown>,
     registerOptions?: RegisterOptions | undefined
@@ -594,20 +702,32 @@ export const make = <
         handlers.fanOut(payload as never, context).pipe(
           Effect.flatMap((produced) => buildSpecs(produced, context))
         ),
-      collect: (payload, rows, context) =>
-        decodeRows(rows).pipe(
-          // SAFETY: same as fanOut for `payload`; `results` was decoded
+      collect: (payload, flowState, context) =>
+        Effect.gen(function*() {
+          const store = yield* parent.store
+          const services = yield* Effect.context<never>()
+          const results = makeResults(store, flowState, context.jobId, services)
+          // SAFETY: same as fanOut for `payload`; the accessors decode
           // through each member's schemas, matching ChildResults.
-          Effect.flatMap((results) => handlers.collect(payload as never, results as never, context))
-        )
+          return yield* handlers.collect(payload as never, results as never, context)
+        })
     }
     return Layer.effectDiscard(
       Effect.flatMap(Worker, (worker) => worker.registerFlow(descriptor, registerOptions))
     )
   }
 
+  const emptyFlow: FlowState = { failFast, pending: 0, completed: 0, failed: 0, cancelled: 0 }
   const childResults = (flowId: JobId) =>
-    Effect.flatMap(parent.store, (store) => fetchRows(store, flowId).pipe(Effect.flatMap(decodeRows)))
+    Effect.gen(function*() {
+      const store = yield* parent.store
+      const services = yield* Effect.context<never>()
+      const record = yield* store.getJob(flowId).pipe(Effect.orDie)
+      const flowState = Option.isSome(record) && record.value.flow !== undefined
+        ? record.value.flow
+        : emptyFlow
+      return makeResults(store, flowState, flowId, services)
+    })
 
   // SAFETY: the `Flow` interface re-declares the precise member signatures
   // (delegated producer methods carry the parent's own types; toLayer's

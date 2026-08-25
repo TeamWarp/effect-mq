@@ -17,11 +17,13 @@ import {
   type EnqueueRequest,
   type ExtendLocksResult,
   type FlowChildRecord,
+  type FlowChildReport,
   type FlowChildSpec,
   type FlowSweepWork,
   type HistoryTtlByState,
   type HistoryTtlInput,
   type IdGenerator,
+  type OutboxEntry,
   JobId,
   JobNotCancellableError,
   JobNotFoundError,
@@ -137,6 +139,26 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
   // Flow dependency rows, keyed by parent job id then child key. Insertion
   // order is FanOut spec order; listChildResults sorts by child key.
   const flowChildren = new Map<JobId, Map<string, MemFlowChild>>()
+  // Undelivered child-result reports, appended atomically with every
+  // terminal transition of an envelope-carrying job (see OutboxEntry).
+  const outbox: Array<OutboxEntry> = []
+  let outboxSeq = 0
+
+  const appendOutbox = (job: MemJob, outcome: FlowChildReport["outcome"]) => {
+    if (job.parent === undefined) return
+    outbox.push({
+      id: `ob-${++outboxSeq}`,
+      flowName: job.parent.flowName,
+      parentStoreKey: job.parent.parentStoreKey,
+      report: {
+        flowId: job.parent.flowId,
+        childKey: job.parent.childKey,
+        outcome,
+        exit: job.exit,
+        failedReason: job.failedReason
+      }
+    })
+  }
   // Dedup registry: one entry per (name, key). `expiresAt` is set for
   // ttl/throttle windows; pending-mode entries live as long as their job.
   const dedupes = new Map<string, { jobId: JobId; expiresAt: number | undefined }>()
@@ -249,16 +271,27 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
   // Settle-time marking: remaining pending rows flip to cancelled (NOT
   // cascaded — the sweeper still owes the child stores real cancels), so
   // late reports find their row terminal and drop, and `listChildResults`
-  // stays truthful. Lock order note: in this driver everything is one
-  // synchronous block, but the row-then-parent order is still observed.
-  const markPendingRowsCancelled = (flowId: JobId) => {
+  // stays truthful. Returns how many rows flipped, for the flow counters.
+  // Lock order note: in this driver everything is one synchronous block,
+  // but the row-then-parent order is still observed.
+  const markPendingRowsCancelled = (flowId: JobId): number => {
     const rows = flowChildren.get(flowId)
-    if (rows === undefined) return
+    if (rows === undefined) return 0
+    let marked = 0
     for (const row of rows.values()) {
       if (row.status === "pending") {
         row.status = "cancelled"
         row.cascaded = false
+        marked += 1
       }
+    }
+    return marked
+  }
+
+  const settleMarkRows = (job: MemJob) => {
+    const marked = markPendingRowsCancelled(job.id)
+    if (job.flow !== undefined) {
+      job.flow = { ...job.flow, pending: 0, cancelled: job.flow.cancelled + marked }
     }
   }
 
@@ -266,14 +299,12 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
     clearLock(job)
     job.cancelRequested = false
     if (job.state === "waiting-children") {
-      markPendingRowsCancelled(job.id)
-      if (job.flow !== undefined) {
-        job.flow = { ...job.flow, pending: 0 }
-      }
+      settleMarkRows(job)
     }
     job.state = "cancelled"
     job.finishedAt = now
     recordAttempt(job, "cancelled", now, undefined)
+    appendOutbox(job, "cancelled")
     releaseDedupe(job, now)
     applyKeep(job, now)
   }
@@ -560,7 +591,13 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
           case "FanOut": {
             recordAttempt(job, "fanned-out", now, undefined)
             if (job.flow === undefined) {
-              job.flow = { failFast: outcome.failFast, pending: outcome.children.length }
+              job.flow = {
+                failFast: outcome.failFast,
+                pending: outcome.children.length,
+                completed: 0,
+                failed: 0,
+                cancelled: 0
+              }
               const rows = new Map<string, MemFlowChild>()
               for (const child of outcome.children) {
                 rows.set(child.childKey, {
@@ -585,8 +622,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
               // here — the job is still `active`, so markCancelled's own
               // waiting-children marking does not apply — and the sweeper
               // cascades (mostly no-op cancels for never-enqueued children).
-              markPendingRowsCancelled(job.id)
-              job.flow = { ...job.flow, pending: 0 }
+              settleMarkRows(job)
               markCancelled(job, now)
               break
             }
@@ -607,6 +643,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
             job.exit = outcome.exit
             job.finishedAt = now
             recordAttempt(job, "completed", now, outcome.exit)
+            appendOutbox(job, "completed")
             releaseDedupe(job, now)
             applyKeep(job, now)
             break
@@ -617,6 +654,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
             job.exit = outcome.exit
             job.finishedAt = now
             recordAttempt(job, "failed", now, outcome.exit)
+            appendOutbox(job, "failed")
             releaseDedupe(job, now)
             applyKeep(job, now)
             break
@@ -626,6 +664,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
             job.state = "cancelled"
             job.finishedAt = now
             recordAttempt(job, "cancelled", now, undefined)
+            appendOutbox(job, "cancelled")
             releaseDedupe(job, now)
             applyKeep(job, now)
             break
@@ -716,6 +755,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
             job.state = "failed"
             job.finishedAt = now
             job.failedReason = "job stalled more than allowable limit"
+            appendOutbox(job, "failed")
             releaseDedupe(job, now)
             recovered.push({ id: job.id, failed: true })
           } else {
@@ -929,50 +969,94 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
         return true
       }),
 
-    recordChildResult: (report) =>
+    recordChildResults: (reports) =>
       Effect.gen(function*() {
         const now = yield* Clock.currentTimeMillis
-        // Lock order: dependency row first, parent row second.
-        const row = flowChildren.get(report.flowId)?.get(report.childKey)
-        if (row === undefined || row.status !== "pending") {
-          return { applied: false, parentSettled: false }
+        const results = reports.map(() => ({ applied: false, parentSettled: false }))
+
+        // Phase 1 — apply every row update (lock order: rows before
+        // parents), tracking per flow which report would decide a settle.
+        const touched = new Map<JobId, { lastApplied: number; firstAppliedFailed: number | undefined }>()
+        for (const [index, report] of reports.entries()) {
+          const row = flowChildren.get(report.flowId)?.get(report.childKey)
+          if (row === undefined || row.status !== "pending") continue
+          row.status = report.outcome
+          row.exit = report.exit
+          row.failedReason = report.failedReason
+          // The outcome came from the child's store: no cancel to deliver.
+          row.cascaded = true
+          results[index] = { applied: true, parentSettled: false }
+          const parent = jobs.get(report.flowId)
+          if (parent?.flow !== undefined) {
+            const flow = parent.flow
+            parent.flow = {
+              ...flow,
+              pending: Math.max(0, flow.pending - 1),
+              completed: flow.completed + (report.outcome === "completed" ? 1 : 0),
+              failed: flow.failed + (report.outcome === "failed" ? 1 : 0),
+              cancelled: flow.cancelled + (report.outcome === "cancelled" ? 1 : 0)
+            }
+          }
+          const touch = touched.get(report.flowId) ?? { lastApplied: index, firstAppliedFailed: undefined }
+          touch.lastApplied = index
+          if (report.outcome === "failed" && touch.firstAppliedFailed === undefined) {
+            touch.firstAppliedFailed = index
+          }
+          touched.set(report.flowId, touch)
         }
-        row.status = report.outcome
-        row.exit = report.exit
-        row.failedReason = report.failedReason
-        // The outcome came from the child's store: no cancel to deliver.
-        row.cascaded = true
-        const parent = jobs.get(report.flowId)
-        if (parent === undefined || parent.flow === undefined) {
-          return { applied: true, parentSettled: false }
+
+        // Phase 2 — at most one settle decision per touched flow. Fail-fast
+        // wins ties (a batch whose failure also empties `pending` settles
+        // terminally, never into collect).
+        for (const [flowId, touch] of touched) {
+          const parent = jobs.get(flowId)
+          if (parent === undefined || parent.flow === undefined) continue
+          if (parent.state !== "waiting-children") continue
+          const failedIndex = parent.flow.failFast ? touch.firstAppliedFailed : undefined
+          const failedReport = failedIndex !== undefined ? reports[failedIndex] : undefined
+          if (failedIndex !== undefined && failedReport !== undefined) {
+            // First applied failure settles the parent terminally
+            // (store-side, like stall exhaustion) and marks the remaining
+            // rows in the same op. A nested parent's own report goes to the
+            // outbox here — this settle IS its terminal transition.
+            settleMarkRows(parent)
+            parent.cancelRequested = false
+            parent.state = "failed"
+            parent.finishedAt = now
+            parent.failedReason = `effect-mq: flow child "${failedReport.childKey}" failed`
+            recordAttempt(parent, "failed", now, undefined)
+            appendOutbox(parent, "failed")
+            releaseDedupe(parent, now)
+            applyKeep(parent, now)
+            results[failedIndex] = { applied: true, parentSettled: true }
+            continue
+          }
+          if (parent.flow.pending === 0) {
+            // All children settled: the parent resumes runnable, phase
+            // collect.
+            parent.state = "waiting"
+            parent.runAt = now
+            parent.seq = ++seq
+            signalWake(parent.queue)
+            results[touch.lastApplied] = { applied: true, parentSettled: true }
+          }
         }
-        parent.flow = { ...parent.flow, pending: Math.max(0, parent.flow.pending - 1) }
-        if (parent.state !== "waiting-children") {
-          return { applied: true, parentSettled: false }
+        return results
+      }),
+
+    peekOutbox: (options) => Effect.sync(() => outbox.slice(0, Math.max(0, options.limit))),
+
+    deleteOutbox: (ids) =>
+      Effect.sync(() => {
+        const drop = new Set(ids)
+        let write = 0
+        for (const entry of outbox) {
+          if (!drop.has(entry.id)) {
+            outbox[write] = entry
+            write += 1
+          }
         }
-        if (parent.flow.failFast && report.outcome === "failed") {
-          // First failure settles the parent terminally (store-side, like
-          // stall exhaustion) and marks the remaining rows in the same op.
-          markPendingRowsCancelled(parent.id)
-          parent.flow = { ...parent.flow, pending: 0 }
-          parent.cancelRequested = false
-          parent.state = "failed"
-          parent.finishedAt = now
-          parent.failedReason = `effect-mq: flow child "${report.childKey}" failed`
-          recordAttempt(parent, "failed", now, undefined)
-          releaseDedupe(parent, now)
-          applyKeep(parent, now)
-          return { applied: true, parentSettled: true }
-        }
-        if (parent.flow.pending === 0) {
-          // All children settled: the parent resumes runnable, phase collect.
-          parent.state = "waiting"
-          parent.runAt = now
-          parent.seq = ++seq
-          signalWake(parent.queue)
-          return { applied: true, parentSettled: true }
-        }
-        return { applied: true, parentSettled: false }
+        outbox.length = write
       }),
 
     listChildResults: (flowId, options) =>

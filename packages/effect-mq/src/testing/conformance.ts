@@ -1790,6 +1790,25 @@ export const jobStoreConformance = (
       ...overrides
     })
 
+    // Batch-of-one sugar for the single-report pins below; the batch
+    // semantics get their own section.
+    const recordOne = (store: JobStore.Service, value: JobStore.FlowChildReport) =>
+      Effect.map(
+        store.recordChildResults([value]),
+        (results) => results[0] ?? { applied: false, parentSettled: false }
+      )
+
+    const flowCounts = (
+      overrides?: Partial<Omit<JobStore.FlowState, "failFast">> & { readonly failFast?: boolean }
+    ): JobStore.FlowState => ({
+      failFast: false,
+      pending: 0,
+      completed: 0,
+      failed: 0,
+      cancelled: 0,
+      ...overrides
+    })
+
     it.effect("FanOut parks the parent with its manifest, rows, and ledger entry", () =>
       withStore((store) =>
         Effect.gen(function*() {
@@ -1798,7 +1817,7 @@ export const jobStoreConformance = (
           const parent = yield* store.getJob(flowId)
           assert(Option.isSome(parent))
           expect(parent.value.state).toBe("waiting-children")
-          expect(parent.value.flow).toEqual({ failFast: false, pending: 2 })
+          expect(parent.value.flow).toEqual(flowCounts({ pending: 2 }))
           // A fan-out is a phase transition, not a completed run.
           expect(parent.value.attemptsMade).toBe(0)
           const attempts = yield* store.getAttempts(flowId)
@@ -1880,12 +1899,12 @@ export const jobStoreConformance = (
           const parent = yield* store.getJob(flowId)
           assert(Option.isSome(parent))
           expect(parent.value.state).toBe("waiting")
-          expect(parent.value.flow).toEqual({ failFast: false, pending: 0 })
+          expect(parent.value.flow).toEqual(flowCounts())
 
           const claim = yield* store.claim(claimOptions({ token: "t-resume" }))
           assert(claim._tag === "Claimed")
           expect(claim.job.id).toBe(flowId)
-          expect(claim.job.flow).toEqual({ failFast: false, pending: 0 })
+          expect(claim.job.flow).toEqual(flowCounts())
         })
       ))
 
@@ -1894,7 +1913,7 @@ export const jobStoreConformance = (
         Effect.gen(function*() {
           const flowId = yield* fanOutParent(store)
 
-          const first = yield* store.recordChildResult(report(flowId, "a", "completed"))
+          const first = yield* recordOne(store, report(flowId, "a", "completed"))
           expect(first).toEqual({ applied: true, parentSettled: false })
           const midway = yield* store.getJob(flowId)
           assert(Option.isSome(midway))
@@ -1902,14 +1921,14 @@ export const jobStoreConformance = (
           expect(midway.value.flow?.pending).toBe(1)
 
           // Duplicates and unknowns drop on the dependency row.
-          expect(yield* store.recordChildResult(report(flowId, "a", "failed")))
+          expect(yield* recordOne(store, report(flowId, "a", "failed")))
             .toEqual({ applied: false, parentSettled: false })
-          expect(yield* store.recordChildResult(report(flowId, "ghost", "completed")))
+          expect(yield* recordOne(store, report(flowId, "ghost", "completed")))
             .toEqual({ applied: false, parentSettled: false })
-          expect(yield* store.recordChildResult(report(JobId("no-such-flow"), "a", "completed")))
+          expect(yield* recordOne(store, report(JobId("no-such-flow"), "a", "completed")))
             .toEqual({ applied: false, parentSettled: false })
 
-          const last = yield* store.recordChildResult(report(flowId, "b", "failed", {
+          const last = yield* recordOne(store, report(flowId, "b", "failed", {
             exit: { boom: true }
           }))
           expect(last).toEqual({ applied: true, parentSettled: true })
@@ -1918,7 +1937,8 @@ export const jobStoreConformance = (
           const parent = yield* store.getJob(flowId)
           assert(Option.isSome(parent))
           expect(parent.value.state).toBe("waiting")
-          expect(parent.value.flow).toEqual({ failFast: false, pending: 0 })
+          // The counters mirror the recorded outcomes exactly.
+          expect(parent.value.flow).toEqual(flowCounts({ completed: 1, failed: 1 }))
           const claim = yield* store.claim(claimOptions({ token: "t-resume" }))
           assert(claim._tag === "Claimed")
           expect(claim.job.id).toBe(flowId)
@@ -1944,7 +1964,7 @@ export const jobStoreConformance = (
             store.awaitWake([QueueName("default")], empty.wakeToken)
           )
           yield* TestClock.adjust(1)
-          yield* store.recordChildResult(report(flowId, "only", "completed"))
+          yield* recordOne(store, report(flowId, "only", "completed"))
           yield* TestClock.adjust(1)
           expect(yield* Fiber.join(waiter)).toBeUndefined()
         })
@@ -1955,10 +1975,10 @@ export const jobStoreConformance = (
         Effect.gen(function*() {
           const flowId = yield* fanOutParent(store)
           const results = yield* Effect.all([
-            store.recordChildResult(report(flowId, "a", "completed")),
-            store.recordChildResult(report(flowId, "b", "completed")),
-            store.recordChildResult(report(flowId, "a", "completed")),
-            store.recordChildResult(report(flowId, "b", "completed"))
+            recordOne(store, report(flowId, "a", "completed")),
+            recordOne(store, report(flowId, "b", "completed")),
+            recordOne(store, report(flowId, "a", "completed")),
+            recordOne(store, report(flowId, "b", "completed"))
           ], { concurrency: 4 })
           expect(results.filter((result) => result.applied).length).toBe(2)
           expect(results.filter((result) => result.parentSettled).length).toBe(1)
@@ -1969,8 +1989,8 @@ export const jobStoreConformance = (
       withStore((store) =>
         Effect.gen(function*() {
           const flowId = yield* fanOutParent(store, { children: ["a", "b", "c"], failFast: true })
-          yield* store.recordChildResult(report(flowId, "a", "completed"))
-          const settle = yield* store.recordChildResult(report(flowId, "b", "failed"))
+          yield* recordOne(store, report(flowId, "a", "completed"))
+          const settle = yield* recordOne(store, report(flowId, "b", "failed"))
           expect(settle).toEqual({ applied: true, parentSettled: true })
 
           const parent = yield* store.getJob(flowId)
@@ -1984,9 +2004,13 @@ export const jobStoreConformance = (
           expect(remaining?.status).toBe("cancelled")
           // Marked by the settle — the sweeper still owes a real cancel.
           expect(remaining?.cascaded).toBe(false)
+          // Settle-time marking lands in the counters too.
+          expect(parent.value.flow).toEqual(
+            flowCounts({ failFast: true, completed: 1, failed: 1, cancelled: 1 })
+          )
 
           // A late completion finds its row terminal and drops.
-          expect(yield* store.recordChildResult(report(flowId, "c", "completed")))
+          expect(yield* recordOne(store, report(flowId, "c", "completed")))
             .toEqual({ applied: false, parentSettled: false })
         })
       ))
@@ -1995,7 +2019,7 @@ export const jobStoreConformance = (
       withStore((store) =>
         Effect.gen(function*() {
           const flowId = yield* fanOutParent(store)
-          yield* store.recordChildResult(report(flowId, "a", "completed"))
+          yield* recordOne(store, report(flowId, "a", "completed"))
           yield* store.cancel(flowId)
 
           const parent = yield* store.getJob(flowId)
@@ -2008,7 +2032,7 @@ export const jobStoreConformance = (
           expect(byKey.get("b")?.status).toBe("cancelled")
           expect(byKey.get("b")?.cascaded).toBe(false)
 
-          expect(yield* store.recordChildResult(report(flowId, "b", "completed")))
+          expect(yield* recordOne(store, report(flowId, "b", "completed")))
             .toEqual({ applied: false, parentSettled: false })
         })
       ))
@@ -2057,7 +2081,7 @@ export const jobStoreConformance = (
       withStore((store) =>
         Effect.gen(function*() {
           const flowId = yield* fanOutParent(store, { children: ["a", "b"], failFast: true })
-          yield* store.recordChildResult(report(flowId, "a", "failed"))
+          yield* recordOne(store, report(flowId, "a", "failed"))
           yield* store.retry(flowId)
 
           const parent = yield* store.getJob(flowId)
@@ -2074,7 +2098,7 @@ export const jobStoreConformance = (
       withStore((store) =>
         Effect.gen(function*() {
           const flowId = yield* fanOutParent(store, { children: ["a"] })
-          yield* store.recordChildResult(report(flowId, "a", "completed"))
+          yield* recordOne(store, report(flowId, "a", "completed"))
           // Parent settled to waiting; claim and (bug-path) fan out again
           // with DIFFERENT children.
           const claim = yield* store.claim(claimOptions({ token: "t-double" }))
@@ -2122,11 +2146,11 @@ export const jobStoreConformance = (
 
           // A recorded row leaves the reconcile set for good; a settled
           // parent leaves it entirely.
-          yield* store.recordChildResult(report(flowId, "a", "completed"))
+          yield* recordOne(store, report(flowId, "a", "completed"))
           yield* TestClock.adjust(30_000)
           const partial = yield* store.flowSweepWork({ pendingAgeMs: 30_000 })
           expect(partial.reconcile[0]?.children.map((child) => child.childKey)).toEqual(["b"])
-          yield* store.recordChildResult(report(flowId, "b", "completed"))
+          yield* recordOne(store, report(flowId, "b", "completed"))
           yield* TestClock.adjust(30_000)
           const settled = yield* store.flowSweepWork({ pendingAgeMs: 30_000 })
           expect(settled.reconcile).toEqual([])
@@ -2137,11 +2161,11 @@ export const jobStoreConformance = (
       withStore((store) =>
         Effect.gen(function*() {
           const flowId = yield* fanOutParent(store, { children: ["a", "b"], failFast: true })
-          yield* store.recordChildResult(report(flowId, "a", "completed"))
+          yield* recordOne(store, report(flowId, "a", "completed"))
           // This report triggers BOTH settle rules: pending hits zero AND it
           // is the first failure under fail-fast. Fail-fast wins: terminal
           // `failed`, never a resume into collect.
-          const last = yield* store.recordChildResult(report(flowId, "b", "failed"))
+          const last = yield* recordOne(store, report(flowId, "b", "failed"))
           expect(last).toEqual({ applied: true, parentSettled: true })
           const parent = yield* store.getJob(flowId)
           assert(Option.isSome(parent))
@@ -2183,7 +2207,7 @@ export const jobStoreConformance = (
             failFast: true,
             children: [childSpec(flowId, "a"), childSpec(flowId, "b")]
           })
-          yield* store.recordChildResult(report(flowId, "a", "failed"))
+          yield* recordOne(store, report(flowId, "a", "failed"))
 
           // A newer failed peer would evict the flow parent under count: 1 —
           // but its "b" row is cancelled and not yet cascaded.
@@ -2211,7 +2235,7 @@ export const jobStoreConformance = (
       withStore((store) =>
         Effect.gen(function*() {
           const flowId = yield* fanOutParent(store, { children: ["a", "b"], failFast: true })
-          yield* store.recordChildResult(report(flowId, "a", "failed"))
+          yield* recordOne(store, report(flowId, "a", "failed"))
 
           const work = yield* store.flowSweepWork({ pendingAgeMs: 30_000 })
           // Settled flow: nothing to reconcile, but "b" owes a cascade.
@@ -2253,7 +2277,7 @@ export const jobStoreConformance = (
           const flowId = yield* fanOutParent(store, { children: ["a"] })
           expect(yield* store.remove(flowId)).toBe(false)
 
-          yield* store.recordChildResult(report(flowId, "a", "failed", { exit: undefined }))
+          yield* recordOne(store, report(flowId, "a", "failed", { exit: undefined }))
           // continue-policy: the parent settled to waiting; cancel it so it
           // is removable, then remove it — the dependency rows go with it.
           yield* store.cancel(flowId)
@@ -2266,13 +2290,202 @@ export const jobStoreConformance = (
       withStore((store) =>
         Effect.gen(function*() {
           const flowId = yield* fanOutParent(store, { children: ["a"] })
-          yield* store.recordChildResult(report(flowId, "a", "failed", {
+          yield* recordOne(store, report(flowId, "a", "failed", {
             exit: undefined,
             failedReason: "job stalled more than allowable limit"
           }))
           const rows = yield* store.listChildResults(flowId)
           expect(rows.items[0]?.exit).toBeUndefined()
           expect(rows.items[0]?.failedReason).toBe("job stalled more than allowable limit")
+        })
+      ))
+
+    // ----------------------------------------------------------------------
+    // Batched reports + the outbox (flows v2).
+    // ----------------------------------------------------------------------
+
+    it.effect("recordChildResults applies a batch positionally and keeps counters exact", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const flowId = yield* fanOutParent(store, { children: ["a", "b", "c"] })
+          const results = yield* store.recordChildResults([
+            report(flowId, "a", "completed"),
+            report(flowId, "a", "completed"), // duplicate inside the batch
+            report(flowId, "ghost", "completed"),
+            report(flowId, "b", "failed")
+          ])
+          expect(results).toEqual([
+            { applied: true, parentSettled: false },
+            { applied: false, parentSettled: false },
+            { applied: false, parentSettled: false },
+            { applied: true, parentSettled: false }
+          ])
+          const parent = yield* store.getJob(flowId)
+          assert(Option.isSome(parent))
+          expect(parent.value.state).toBe("waiting-children")
+          expect(parent.value.flow).toEqual(flowCounts({ pending: 1, completed: 1, failed: 1 }))
+        })
+      ))
+
+    it.effect("a batch that empties pending settles once, on its last applied report", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const flowId = yield* fanOutParent(store)
+          const results = yield* store.recordChildResults([
+            report(flowId, "a", "completed"),
+            report(flowId, "b", "completed")
+          ])
+          expect(results).toEqual([
+            { applied: true, parentSettled: false },
+            { applied: true, parentSettled: true }
+          ])
+          const parent = yield* store.getJob(flowId)
+          assert(Option.isSome(parent))
+          expect(parent.value.state).toBe("waiting")
+        })
+      ))
+
+    it.effect("fail-fast wins inside a batch, after every batch-mate applied", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const flowId = yield* fanOutParent(store, { children: ["a", "b", "c"], failFast: true })
+          const results = yield* store.recordChildResults([
+            report(flowId, "b", "failed"),
+            report(flowId, "c", "completed")
+          ])
+          // Row updates apply BEFORE the settle decision: "c" keeps its real
+          // completed outcome even though "b" settles the flow.
+          expect(results).toEqual([
+            { applied: true, parentSettled: true },
+            { applied: true, parentSettled: false }
+          ])
+          const parent = yield* store.getJob(flowId)
+          assert(Option.isSome(parent))
+          expect(parent.value.state).toBe("failed")
+          expect(parent.value.failedReason).toContain("b")
+          expect(parent.value.flow).toEqual(
+            flowCounts({ failFast: true, completed: 1, failed: 1, cancelled: 1 })
+          )
+          const rows = yield* store.listChildResults(flowId)
+          const byKey = new Map(rows.items.map((row) => [row.childKey, row.status]))
+          expect(byKey.get("c")).toBe("completed")
+          expect(byKey.get("a")).toBe("cancelled")
+        })
+      ))
+
+    it.effect("a batch may span flows and settles each independently", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const first = yield* fanOutParent(store, { children: ["a"] })
+          const second = yield* fanOutParent(store, { children: ["b"] })
+          const results = yield* store.recordChildResults([
+            report(first, "a", "completed"),
+            report(second, "b", "completed")
+          ])
+          expect(results).toEqual([
+            { applied: true, parentSettled: true },
+            { applied: true, parentSettled: true }
+          ])
+        })
+      ))
+
+    it.effect("terminal transitions of envelope-carrying jobs land in the outbox", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const envelope = (key: string): JobStore.ParentEnvelope => ({
+            flowName: "test-flow",
+            flowId: JobId("remote-flow-1"),
+            childKey: key,
+            parentStoreKey: "main"
+          })
+          // A plain job's terminal ack appends nothing.
+          const plain = yield* store.enqueue(baseRequest())
+          const plainClaim = yield* store.claim(claimOptions({ token: "t-plain" }))
+          assert(plainClaim._tag === "Claimed")
+          yield* store.ack(plain.id, "t-plain", { _tag: "Complete", exit: { ok: true } })
+          expect(yield* store.peekOutbox({ limit: 10 })).toEqual([])
+
+          // Ack Complete → outbox entry with the exit.
+          const acked = yield* store.enqueue(baseRequest({ parent: envelope("acked") }))
+          const claim = yield* store.claim(claimOptions({ token: "t-child" }))
+          assert(claim._tag === "Claimed")
+          expect(claim.job.id).toBe(acked.id)
+          yield* store.ack(acked.id, "t-child", { _tag: "Complete", exit: { sent: 1 } })
+
+          // Direct cancel of a delayed child → outbox entry.
+          const cancelled = yield* store.enqueue(
+            baseRequest({ parent: envelope("cancelled"), delayMs: 60_000 })
+          )
+          yield* store.cancel(cancelled.id)
+
+          // Stall exhaustion → outbox entry carrying the failedReason.
+          yield* store.enqueue(baseRequest({ parent: envelope("stalled") }))
+          const stalledClaim = yield* store.claim(
+            claimOptions({ token: "t-stall", lockDurationMs: 1_000 })
+          )
+          assert(stalledClaim._tag === "Claimed")
+          yield* TestClock.adjust(2_000)
+          const recovered = yield* store.recoverStalled({ maxStalledCount: 0 })
+          expect(recovered).toEqual([{ id: stalledClaim.job.id, failed: true }])
+
+          // Oldest first, `limit` respected, full entry shape.
+          const firstPage = yield* store.peekOutbox({ limit: 2 })
+          expect(firstPage.map((entry) => entry.report.childKey)).toEqual(["acked", "cancelled"])
+          const head = firstPage[0]
+          assert(head !== undefined)
+          expect(head.flowName).toBe("test-flow")
+          expect(head.parentStoreKey).toBe("main")
+          expect(head.report.flowId).toBe("remote-flow-1")
+          expect(head.report.outcome).toBe("completed")
+          expect(head.report.exit).toEqual({ sent: 1 })
+          const all = yield* store.peekOutbox({ limit: 10 })
+          expect(all.map((entry) => entry.report.outcome)).toEqual([
+            "completed",
+            "cancelled",
+            "failed"
+          ])
+          expect(all[2]?.report.exit).toBeUndefined()
+          expect(all[2]?.report.failedReason).toBe("job stalled more than allowable limit")
+
+          // Peek does not consume; delete does, idempotently.
+          yield* store.deleteOutbox([head.id, "ghost-id"])
+          const rest = yield* store.peekOutbox({ limit: 10 })
+          expect(rest.map((entry) => entry.report.childKey)).toEqual(["cancelled", "stalled"])
+          yield* store.deleteOutbox([head.id])
+          expect((yield* store.peekOutbox({ limit: 10 })).length).toBe(2)
+        })
+      ))
+
+    it.effect("a fail-fast settle of a nested parent reports upward through the outbox", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          // The inner parent is itself a flow child; its terminal transition
+          // happens store-side (the settle), with no worker ack to hook.
+          const inner = yield* store.enqueue(baseRequest({
+            parent: {
+              flowName: "outer-flow",
+              flowId: JobId("outer-1"),
+              childKey: "inner",
+              parentStoreKey: "outer-store"
+            }
+          }))
+          const claim = yield* store.claim(claimOptions({ token: "t-inner" }))
+          assert(claim._tag === "Claimed")
+          yield* store.ack(inner.id, "t-inner", {
+            _tag: "FanOut",
+            failFast: true,
+            children: [childSpec(inner.id, "a")]
+          })
+          // Parking is not terminal: nothing in the outbox yet.
+          expect(yield* store.peekOutbox({ limit: 10 })).toEqual([])
+
+          yield* recordOne(store, report(inner.id, "a", "failed"))
+          const entries = yield* store.peekOutbox({ limit: 10 })
+          expect(entries.length).toBe(1)
+          expect(entries[0]?.flowName).toBe("outer-flow")
+          expect(entries[0]?.report.childKey).toBe("inner")
+          expect(entries[0]?.report.outcome).toBe("failed")
+          expect(entries[0]?.report.failedReason).toContain('"a" failed')
         })
       ))
   })
