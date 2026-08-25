@@ -256,6 +256,145 @@ describe("Flow", () => {
       ))
     }))
 
+  it.effect("children keep completing through a parent-store outage; reports deliver on recovery", () =>
+    Effect.gen(function*() {
+      const DigestFlow = Flow.make("digest", {
+        parent: SendDigest,
+        children: [SendEmail]
+      })
+      // The parent store, with recordChildResults switchable to failing —
+      // the relay (and the sweeper's synthesized reports) cannot land
+      // anything while `down` is true. Everything else works normally.
+      let down = false
+      const outageParentStore = Layer.effect(
+        JobStore.JobStore,
+        Effect.map(MemoryJobStore.makeWith(), (real) =>
+          JobStore.JobStore.of({
+            ...real,
+            recordChildResults: (reports) =>
+              down
+                ? Effect.fail(new JobStore.JobStoreError({ message: "parent store down" }))
+                : real.recordChildResults(reports)
+          }))
+      )
+      const parentSide = DigestFlow.toLayer({
+        fanOut: () =>
+          Effect.succeed(Flow.children(SendEmail, [
+            { key: "u1", payload: { userId: "u1" } },
+            { key: "u2", payload: { userId: "u2" } }
+          ])),
+        collect: (_payload, results) =>
+          Effect.succeed({ sent: results.counts.completed, failed: results.counts.failed })
+      }).pipe(Layer.provide(Worker.layer()))
+      const childSide = SendEmail.toLayer(() => Effect.succeed("ok")).pipe(
+        Layer.provide(Worker.layer({ store: ChildStore, flows: [DigestFlow] }))
+      )
+
+      yield* Effect.gen(function*() {
+        // The report path is down for the flow's whole first act: fan-out
+        // and child execution proceed regardless (neither touches it).
+        down = true
+        const fiber = yield* Effect.forkChild(DigestFlow.execute({ tenant: "acme" }))
+        yield* drain(12)
+
+        // The children finished in THEIR store; their acked reports queue
+        // in the outbox; the flow stays parked.
+        const childStore = yield* ChildStore
+        const children = yield* childStore.list({ name: "SendEmail" })
+        expect(children.items.map((job) => job.state)).toEqual(["completed", "completed"])
+        expect((yield* childStore.peekOutbox({ limit: 10 })).length).toBe(2)
+        const parentStore = yield* JobStore.JobStore
+        const parents = yield* parentStore.list({ name: "SendDigest" })
+        expect(parents.items[0]?.state).toBe("waiting-children")
+
+        // Recovery: the relay's fallback pass delivers, the flow settles,
+        // and nothing was lost.
+        down = false
+        yield* drain(3, "30 seconds")
+        const result = yield* Fiber.join(fiber)
+        expect(result).toEqual({ sent: 2, failed: 0 })
+        expect(yield* childStore.peekOutbox({ limit: 10 })).toEqual([])
+      }).pipe(Effect.provide(
+        Layer.mergeAll(parentSide, childSide).pipe(
+          Layer.provideMerge(Layer.mergeAll(outageParentStore, MemoryJobStore.layerFor(ChildStore)))
+        )
+      ))
+    }))
+
+  it.effect("cancelling the outer flow cascades through a mid-flight inner flow to its leaves", () =>
+    Effect.gen(function*() {
+      const InnerFlow = Flow.make("inner-sends", {
+        parent: SendBatch,
+        children: [SendEmail]
+      })
+      const OuterFlow = Flow.make("digest", {
+        parent: SendDigest,
+        children: [SendBatch]
+      })
+      const outerSide = OuterFlow.toLayer({
+        fanOut: () =>
+          Effect.succeed(Flow.children(SendBatch, [
+            { key: "g1", payload: { group: "g1" } },
+            { key: "g2", payload: { group: "g2" } }
+          ])),
+        collect: () => Effect.die(new Error("collect must not run on a cancelled flow"))
+      }).pipe(Layer.provide(Worker.layer()))
+      const innerSide = Layer.mergeAll(
+        InnerFlow.toLayer({
+          fanOut: (payload) =>
+            Effect.succeed(Flow.children(SendEmail, [
+              { key: `${payload.group}-a`, payload: { userId: `${payload.group}-a` } },
+              { key: `${payload.group}-b`, payload: { userId: `${payload.group}-b` } }
+            ])),
+          collect: (_payload, results) => Effect.succeed(results.counts.completed)
+        }),
+        // Leaves never finish on their own: the cancel has to interrupt them.
+        SendEmail.toLayer(() => Effect.never)
+      ).pipe(Layer.provide(Worker.layer({
+        store: ChildStore,
+        flows: [OuterFlow],
+        concurrency: 4
+      })))
+
+      yield* Effect.gen(function*() {
+        const outerId = yield* OuterFlow.enqueue({ tenant: "acme" })
+        yield* drain(4)
+
+        // Both levels are mid-flight: inner parents parked, leaves running.
+        const childStore = yield* ChildStore
+        const inner = yield* childStore.list({ name: "SendBatch" })
+        expect(inner.items.map((job) => job.state)).toEqual(["waiting-children", "waiting-children"])
+        const leaves = yield* childStore.list({ name: "SendEmail" })
+        expect(leaves.items.map((job) => job.state)).toEqual(["active", "active", "active", "active"])
+
+        yield* OuterFlow.cancel(outerId)
+        // Outer sweeper cascades to the inner parents; the inner flow's
+        // sweeper cascades to the leaves; heartbeats interrupt the running
+        // handlers. Several 30s passes cover the whole chain.
+        yield* drain(6, "30 seconds")
+
+        const parentStore = yield* JobStore.JobStore
+        const outer = yield* parentStore.getJob(outerId)
+        assert(Option.isSome(outer))
+        expect(outer.value.state).toBe("cancelled")
+        const innerAfter = yield* childStore.list({ name: "SendBatch" })
+        expect(innerAfter.items.map((job) => job.state)).toEqual(["cancelled", "cancelled"])
+        const leavesAfter = yield* childStore.list({ name: "SendEmail" })
+        expect(leavesAfter.items.map((job) => job.state)).toEqual([
+          "cancelled",
+          "cancelled",
+          "cancelled",
+          "cancelled"
+        ])
+
+        // Every owed cascade was delivered on both levels.
+        expect((yield* parentStore.flowSweepWork({ pendingAgeMs: 0 })).cascade).toEqual([])
+        expect((yield* childStore.flowSweepWork({ pendingAgeMs: 0 })).cascade).toEqual([])
+      }).pipe(Effect.provide(
+        Layer.mergeAll(outerSide, innerSide).pipe(Layer.provideMerge(stores))
+      ))
+    }))
+
   it.effect("flows nest: an inner flow settles and reports upward through the outbox relay", () =>
     Effect.gen(function*() {
       const InnerFlow = Flow.make("inner-sends", {
