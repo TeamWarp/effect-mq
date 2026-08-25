@@ -21,10 +21,15 @@ bumps are additive.
   the existing delayed/terminal structures for `runAt`/`finishedAt`
   ordering. On by default; opt out per index with
   `RedisJobStore.layer({ indexes })`, after which a query that needs a
-  disabled index dies with `ListIndexDisabledError`. First startup after
-  the upgrade backfills the indexes from existing rows (paged, marker-
-  gated, idempotent); no manual migration. `metadata` filtering remains
-  a per-row predicate by design.
+  disabled index dies with `ListIndexDisabledError`. The first startup
+  after the upgrade backfills the indexes from existing rows (cursor-
+  scanned in pages, marker-gated, idempotent), and every later startup
+  heals the tail of rows enqueued since the marker — so rolling deploys
+  with still-running 0.6.0 writers converge on their last instance's
+  boot; no manual migration. Two invariants: the `indexes` config is
+  per-PREFIX (every store sharing a prefix must agree), and disabling an
+  index removes only its marker, never shared zsets. `metadata`
+  filtering remains a per-row predicate by design.
 
 ## 0.6.0 — 2026-08-25
 

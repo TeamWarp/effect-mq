@@ -530,7 +530,7 @@ if (!available) {
         expect(nonTerminal.orderBy).toBe("finishedAt")
       }).pipe(Effect.scoped, Effect.provide(redisLive())))
 
-    it.effect("init backfills enabled indexes once, and the marker skips rebuilds", () =>
+    it.effect("init rebuilds a marker-less index via ZSCAN, and the marker confines later boots to the tail", () =>
       Effect.gen(function*() {
         const prefix = freshPrefix()
         const redis = yield* Redis.Redis
@@ -541,29 +541,58 @@ if (!available) {
         const b1 = yield* dark.enqueue(request({ name: "B", queue: JobStore.QueueName("other") }))
         yield* TestClock.adjust(1_000)
         const a2 = yield* dark.enqueue(request({ name: "A", queue: JobStore.QueueName("other") }))
-        // A bulk batch with one shared enqueuedAt forces the backfill through
-        // several keyset pages of score ties.
+        // A bulk batch with one shared enqueuedAt: the ZSCAN rebuild is
+        // linear and tie-immune.
         yield* dark.enqueueMany(Array.from({ length: 1_100 }, () => request({ name: "Bulk" })))
         expect(Number(yield* redis.send("EXISTS", `${prefix}:byname:A`, `${prefix}:byname:Bulk`))).toBe(0)
 
-        // Re-init with the indexes on: the missing markers trigger a backfill.
+        // Re-init with the indexes on: the missing markers trigger a full
+        // rebuild, stamped with this boot's clock time.
+        yield* TestClock.adjust(120_000)
         const indexed = yield* RedisJobStore.make({ prefix })
         const byName = yield* indexed.list({ name: "A", order: "asc" })
         expect(byName.items.map((job) => job.id)).toEqual([a1.id, a2.id])
         const byQueue = yield* indexed.list({ queue: JobStore.QueueName("other"), order: "asc" })
         expect(byQueue.items.map((job) => job.id)).toEqual([b1.id, a2.id])
         expect(Number(yield* redis.send("ZCARD", `${prefix}:byname:Bulk`))).toBe(1_100)
-        expect(yield* redis.send("GET", `${prefix}:index:name:ready`)).toBe("1")
+        expect(yield* redis.send("GET", `${prefix}:index:name:ready`)).toBe("122000")
 
-        // The marker makes the next init skip the rebuild: a hole poked into
-        // the index stays, proving nothing rescanned `all`.
+        // A marker keeps the next boot off the full scan: it only heals the
+        // tail (marker minus 60s onward), so a hole poked below that window
+        // stays — proving nothing rescanned `all` — and the marker advances.
         yield* redis.send("ZREM", `${prefix}:byname:A`, a1.id)
+        yield* TestClock.adjust(5_000)
         const third = yield* RedisJobStore.make({ prefix })
         const afterSkip = yield* third.list({ name: "A" })
         expect(afterSkip.items.map((job) => job.id)).toEqual([a2.id])
+        expect(yield* redis.send("GET", `${prefix}:index:name:ready`)).toBe("127000")
       }).pipe(Effect.scoped, Effect.provide(redisLive())))
 
-    it.effect("init with an index disabled deletes its zsets and marker; the other survives", () =>
+    it.effect("a boot with a marker heals unindexed rows enqueued since the marker's window", () =>
+      Effect.gen(function*() {
+        const prefix = freshPrefix()
+        const redis = yield* Redis.Redis
+        const first = yield* RedisJobStore.make({ prefix })
+        const old = yield* first.enqueue(request({ name: "A" }))
+        // A later boot re-stamps the marker well past `old`'s enqueuedAt.
+        yield* TestClock.adjust(200_000)
+        const second = yield* RedisJobStore.make({ prefix })
+        const fresh = yield* second.enqueue(request({ name: "A" }))
+        // Simulate an index-less writer (an old version mid-rolling-deploy)
+        // having inserted both rows: strip their byname entries.
+        yield* redis.send("ZREM", `${prefix}:byname:A`, old.id, fresh.id)
+
+        yield* TestClock.adjust(5_000)
+        const third = yield* RedisJobStore.make({ prefix })
+        // fresh (enqueuedAt 200_000 >= marker 200_000 - 60_000) is healed;
+        // old (enqueuedAt 0) is outside the tail window and stays missing —
+        // the heal is a tail heal, not a rescan.
+        const healed = yield* third.list({ name: "A" })
+        expect(healed.items.map((job) => job.id)).toEqual([fresh.id])
+        expect(yield* redis.send("GET", `${prefix}:index:name:ready`)).toBe("205000")
+      }).pipe(Effect.scoped, Effect.provide(redisLive())))
+
+    it.effect("disabling an index deletes only its marker; re-enabling does a full rebuild", () =>
       Effect.gen(function*() {
         const prefix = freshPrefix()
         const redis = yield* Redis.Redis
@@ -573,14 +602,26 @@ if (!available) {
         const a2 = yield* indexed.enqueue(request({ name: "A", queue: JobStore.QueueName("other") }))
         yield* indexed.enqueue(request({ name: "B" }))
 
+        // Disabling name drops ONLY its marker — the zsets stay, because an
+        // enabled sibling on the prefix may be serving reads from them.
         const cleaned = yield* RedisJobStore.make({ prefix, indexes: { name: false } })
-        expect(Number(yield* redis.send("EXISTS", `${prefix}:byname:A`, `${prefix}:byname:B`))).toBe(0)
         expect(Number(yield* redis.send("EXISTS", `${prefix}:index:name:ready`))).toBe(0)
         expect(Number(yield* redis.send("EXISTS", `${prefix}:index:queue:ready`))).toBe(1)
+        expect(Number(yield* redis.send("EXISTS", `${prefix}:byname:A`, `${prefix}:byname:B`))).toBe(2)
         const stillByQueue = yield* cleaned.list({ queue: JobStore.QueueName("other") })
         expect(stillByQueue.items.map((job) => job.id)).toEqual([a2.id])
-        // And a1's row is intact — only the index entries went away.
         expect(Option.isSome(yield* cleaned.getJob(a1.id))).toBe(true)
+
+        // Rows inserted while disabled never reach the (stale) zsets...
+        yield* TestClock.adjust(1_000)
+        const a3 = yield* cleaned.enqueue(request({ name: "A" }))
+        expect(yield* redis.send("ZSCORE", `${prefix}:byname:A`, a3.id)).toBeNull()
+
+        // ...and re-enabling does a full ZSCAN rebuild (no marker to trust),
+        // so lists are correct again, stale-era rows included.
+        const reopened = yield* RedisJobStore.make({ prefix })
+        const byName = yield* reopened.list({ name: "A", order: "asc" })
+        expect(byName.items.map((job) => job.id)).toEqual([a1.id, a2.id, a3.id])
       }).pipe(Effect.scoped, Effect.provide(redisLive())))
 
     it.effect("an index member whose job hash is gone is skipped and removed", () =>

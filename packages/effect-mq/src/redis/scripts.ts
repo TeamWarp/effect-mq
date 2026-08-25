@@ -25,9 +25,15 @@
  *                               optional, `RedisJobStoreOptions.indexes.name`)
  * - `p:byqueue:<queue>`         ZSET, score `enqueuedAt` (list queue index;
  *                               optional, `RedisJobStoreOptions.indexes.queue`)
- * - `p:index:<kind>:ready`      STRING marker: the `<kind>` index (name |
- *                               queue) holds every pre-existing row (set by
- *                               the one-shot backfill at store init)
+ * - `p:index:<kind>:ready`      STRING, millis timestamp of the last index
+ *                               reconcile's start for `<kind>` (name |
+ *                               queue). Absent: the next enabled boot does a
+ *                               full ZSCAN rebuild. Present: enabled boots
+ *                               heal the tail (rows enqueued since the value
+ *                               minus a safety margin) and re-stamp it —
+ *                               closing the rolling-deploy window where
+ *                               index-less writers inserted rows after the
+ *                               marker landed
  * - `p:finished:<state>`        ZSET, score `finishedAt` (history TTL)
  * - `p:terminal:<name>:<state>` ZSET, score `finishedAt` (keep pruning)
  * - `p:counts`                  HASH `<queue>|<state>` -> integer
@@ -289,6 +295,20 @@ local function finishCancelled(id, queue, name, startedAt, now, nowStr)
   appendOutbox(id, "cancelled")
   releaseDedupe(name, redis.call("HGET", jk, "dedupeKey"), id, now)
   applyKeep(name, "cancelled", redis.call("HGET", jk, "keep"), now)
+end
+-- Index one EXISTING job row into a list index (backfill and tail heal;
+-- insertJobRow covers live writes). A missing row is skipped — nothing to
+-- index, and the read path self-heals whatever stale member pointed here.
+local function indexInto(kind, id)
+  local row = redis.call("HMGET", jobKey(id), "name", "queue", "enqueuedAt")
+  if row[1] then
+    local enqueuedAt = tonumber(row[3]) or 0
+    if kind == "name" then
+      redis.call("ZADD", bynameKey(row[1]), enqueuedAt, id)
+    else
+      redis.call("ZADD", byqueueKey(row[2]), enqueuedAt, id)
+    end
+  end
 end
 -- Insert one fresh job row plus every index entry. String params are stored
 -- verbatim (payload/metadata/backoff/keep/trace/parent are pre-encoded JSON,
@@ -895,63 +915,58 @@ return cjson.encode({ items = items, more = more })
   ).withReturnType<string>()
 
 /**
- * backfillIndexPage(prefix, kind, cursor, pageSize) -> {processed, cursor}
+ * indexMembers(prefix, kind, idsJson) -> "1"
  *
- * One bounded page of the one-shot list-index backfill: walk `p:all` by
- * exclusive (enqueuedAt, id) keyset — immune to concurrent deletions, unlike
- * rank offsets — and ZADD each row's `kind` (name | queue) index entry. Rows
- * whose hash is gone still advance the cursor (the list script self-heals
- * `all`); rows inserted concurrently are indexed live by insertJobRow, so
- * overlap is an idempotent ZADD. The caller loops until a page comes back
- * short of `pageSize`, then sets the ready marker.
+ * Index one ZSCAN chunk of `p:all` members during a full rebuild. The driver
+ * owns the ZSCAN cursor loop (linear, tie-immune, guaranteed to terminate,
+ * and guaranteed to return every element present for the whole scan); this
+ * script only does the per-chunk work, so the single-threaded server is
+ * never held for the whole keyspace. Re-visited members and rows indexed
+ * live by insertJobRow mid-scan are idempotent ZADDs.
  */
-export const backfillIndexPage = (HELPERS: string) =>
-  Redis.script(
-    (prefix: string, kind: string, cursor: string, pageSize: number) => [prefix, kind, cursor, pageSize],
-    {
-      numberOfKeys: 0,
-      lua: `${HELPERS}
+export const indexMembers = (HELPERS: string) => Redis.script(
+  (prefix: string, kind: string, idsJson: string) => [prefix, kind, idsJson],
+  {
+    numberOfKeys: 0,
+    lua: `${HELPERS}
 local kind = ARGV[2]
-local cursorAt, cursorId = nil, nil
-if ARGV[3] ~= "" then
-  local split = string.find(ARGV[3], ":", 1, true)
-  cursorAt = tonumber(string.sub(ARGV[3], 1, split - 1))
-  cursorId = string.sub(ARGV[3], split + 1)
+for _, id in ipairs(cjson.decode(ARGV[3])) do
+  indexInto(kind, id)
 end
-local pageSize = tonumber(ARGV[4])
-local processed = 0
-local offset = 0
-local last = ""
-while processed < pageSize do
-  local batch = redis.call("ZRANGEBYSCORE", prefix .. ":all",
-    cursorAt == nil and "-inf" or fmt(cursorAt), "+inf", "WITHSCORES", "LIMIT", offset, pageSize)
-  if #batch == 0 then break end
-  for i = 1, #batch, 2 do
-    local id = batch[i]
-    local at = tonumber(batch[i + 1])
-    if processed < pageSize and (cursorAt == nil or at > cursorAt or (at == cursorAt and id > cursorId)) then
-      local row = redis.call("HMGET", jobKey(id), "name", "queue", "enqueuedAt")
-      if row[1] then
-        -- Score from the hash (authoritative), not the all-zset score.
-        local enqueuedAt = tonumber(row[3]) or at
-        if kind == "name" then
-          redis.call("ZADD", bynameKey(row[1]), enqueuedAt, id)
-        else
-          redis.call("ZADD", byqueueKey(row[2]), enqueuedAt, id)
-        end
-      end
-      processed = processed + 1
-      last = fmt(at) .. ":" .. id
-    end
-  end
-  if #batch < pageSize * 2 then break end
-  offset = offset + #batch / 2
-end
-if processed == 0 then return '{"processed":0,"cursor":""}' end
-return cjson.encode({ processed = processed, cursor = last })
+return "1"
 `
-    }
-  ).withReturnType<string>()
+  }
+).withReturnType<string>()
+
+/**
+ * indexTailPage(prefix, kind, min, offset, pageSize) -> scanned count
+ *
+ * One bounded page of the boot-time tail heal: index every `p:all` member
+ * with score >= min (the previous marker minus a safety margin). Plain
+ * LIMIT offset paging — tails are small, and a rank-shift skip from a
+ * concurrent delete is covered by the margin plus the next boot's heal.
+ */
+export const indexTailPage = (HELPERS: string) => Redis.script(
+  (prefix: string, kind: string, min: string, offset: number, pageSize: number) => [
+    prefix,
+    kind,
+    min,
+    offset,
+    pageSize
+  ],
+  {
+    numberOfKeys: 0,
+    lua: `${HELPERS}
+local kind = ARGV[2]
+local batch = redis.call("ZRANGEBYSCORE", prefix .. ":all", ARGV[3], "+inf",
+  "LIMIT", tonumber(ARGV[4]), tonumber(ARGV[5]))
+for _, id in ipairs(batch) do
+  indexInto(kind, id)
+end
+return tostring(#batch)
+`
+  }
+).withReturnType<string>()
 
 /** counts(prefix) -> HGETALL pairs of p:counts. */
 export const counts = (HELPERS: string) => Redis.script(

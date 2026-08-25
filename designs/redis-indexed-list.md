@@ -107,26 +107,39 @@ uses `terminal:<name>:<state>` and works with the name index off.
 A store with opted-out indexes is deliberately narrower than the contract
 (conformance runs against the defaults).
 
-## Redis: one-shot backfill
+## Redis: backfill and the tail heal (revised after the adversarial review)
 
 Rows written before 0.7.0 (or while an index was off) have no index
 entries; an indexed read would silently MISS them — wrong results, not
-slow ones. At store init, per index:
+slow ones. Index writes are baked into each PROCESS's scripts, so
+correctness is a keyspace property no single process can guarantee: during
+a rolling deploy, still-running pre-index writers insert unindexed rows
+AFTER a new instance's backfill completes. The review confirmed the
+original one-shot marker made those rows permanently invisible. The
+shipped lifecycle, at store init per index:
 
-- enabled and `p:index:<name>:ready` absent → page the `all` zset from the
-  driver (chunks of ~500, one small script per page: HMGET name/queue,
-  ZADD) and set the marker. Paged from TypeScript, never one giant Lua
-  call, so the single-threaded server is never held.
-- disabled and the marker present → SCAN-delete the index zsets
-  (`p:byname:*` / `p:byqueue:*`) and the marker.
+- enabled and `p:index:<kind>:ready` (`kind` = the literal `name` or
+  `queue`) absent → full build: ZSCAN the `all` zset from the driver
+  (cursor-based, linear, tie-immune — an earlier score-keyset design was
+  quadratic on equal-`enqueuedAt` runs), each member chunk fed to a small
+  script that HMGETs and ZADDs. Set the marker to the build's start time.
+- enabled and the marker present → tail heal: re-index rows with
+  `enqueuedAt > marker - 60s`, then advance the marker. Every boot. This
+  is what makes rolling deploys converge: the last instance to boot heals
+  everything older writers inserted before that moment, and afterwards
+  every writer indexes live.
+- disabled → delete the marker only, never the zsets (a sibling store may
+  be reading them; stale members self-heal on reads, manual cleanup
+  documented). Re-enabling later finds no marker and full-builds.
 
-No build lock: concurrent cold boots duplicate idempotent ZADDs, a crash
-mid-build leaves the marker unset and the next boot redoes it, and rows
-inserted during the build are indexed live by `insertJobRow` (overlap is
-idempotent). The deliberately-cut alternative — lazy backfill with
-readiness flags and scan fallback — buys zero-pause upgrades for datasets
-where the startup scan is too slow (millions of retained rows); it slots
-into the same marker mechanism later without API change.
+The `indexes` config is a per-prefix invariant — every store sharing a
+prefix must agree — and the docs say so. No build lock: concurrent cold
+boots duplicate idempotent ZADDs, a crash mid-build leaves the marker
+unset and the next boot redoes it, and rows inserted during a build are
+indexed live by `insertJobRow`. The deliberately-cut alternative — lazy
+backfill with readiness flags and scan fallback — buys zero-pause upgrades
+for datasets where the startup scan is too slow (millions of retained
+rows); it slots into the same marker mechanism later without API change.
 
 ## Errors
 

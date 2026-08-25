@@ -59,10 +59,25 @@ export interface RedisJobStoreOptions {
    * `ListIndexDisabledError` (a query servable from another structure, e.g.
    * `name` + terminal `states` ordered by `finishedAt`, never touches it).
    *
-   * Store init reconciles the configuration one-shot: an enabled index
-   * missing its `p:index:<kind>:ready` marker is backfilled from `p:all` in
-   * bounded pages; a disabled index whose marker exists has its zsets
-   * SCAN-deleted along with the marker.
+   * This setting is a PER-PREFIX invariant: every store instance sharing a
+   * key prefix must agree on it. Index writes happen at insert time in the
+   * writing process, so a store with an index off inserts rows that index
+   * never sees — enabled readers on the same prefix silently miss those rows
+   * (the `p:index:<kind>:ready` marker churn between mixed stores is a
+   * symptom of the misconfiguration, not a safety net against it).
+   *
+   * Init reconciles each index one-shot. Enabled with no `ready` marker: a
+   * full driver-paged ZSCAN of `p:all` rebuilds it, then stamps the marker
+   * with the rebuild's start time. Enabled with a marker: rows enqueued since
+   * the marker minus a 60s margin are (re-)indexed — so a rolling deploy
+   * whose old, index-less writers kept inserting after the marker landed is
+   * healed by the last new-code boot — and the marker is re-stamped.
+   * Disabled: only the marker is deleted (a future re-enable then does a full
+   * rebuild instead of trusting stale zsets). The zsets themselves are NEVER
+   * deleted at init — this store cannot know whether an enabled sibling is
+   * serving reads from them. After disabling everywhere, reclaim the memory
+   * manually, e.g.:
+   * `redis-cli --scan --pattern '<prefix>:byname:*' | xargs redis-cli del`.
    *
    * @since 0.7.0
    */
@@ -273,7 +288,8 @@ export const make = (
     const evalRecoverStalled = redis.eval(scripts.recoverStalled(HELPERS))
     const evalGetJob = redis.eval(scripts.getJob(HELPERS))
     const evalList = redis.eval(scripts.list(HELPERS))
-    const evalBackfillIndexPage = redis.eval(scripts.backfillIndexPage(HELPERS))
+    const evalIndexMembers = redis.eval(scripts.indexMembers(HELPERS))
+    const evalIndexTailPage = redis.eval(scripts.indexTailPage(HELPERS))
     const evalCounts = redis.eval(scripts.counts(HELPERS))
     const evalRemove = redis.eval(scripts.remove(HELPERS))
     const evalRetry = redis.eval(scripts.retry(HELPERS))
@@ -294,41 +310,66 @@ export const make = (
     const evalFlowSweepWork = redis.eval(scripts.flowSweepWork(HELPERS))
     const evalMarkChildrenCascaded = redis.eval(scripts.markChildrenCascaded(HELPERS))
 
-    // One-shot list-index reconcile. Enabled index missing its ready marker:
-    // backfill from `all` in bounded pages — paged from here, never one giant
-    // Lua call, so the single-threaded server is never held. There is no
-    // build lock: concurrent cold boots duplicate idempotent ZADDs, a crash
-    // mid-build leaves the marker unset and the next boot redoes it, and rows
-    // inserted during the build are indexed live by insertJobRow. Disabled
-    // index whose marker exists: SCAN-delete its zsets and the marker.
-    // Init-time infra failures die — the store never starts half-configured.
+    // List-index reconcile, once per boot per index. All work is driver-paged
+    // — never one giant Lua call — so the single-threaded server is never
+    // held. There is no build lock: concurrent boots duplicate idempotent
+    // ZADDs, a crash before the marker stamp makes the next boot redo the
+    // work, and rows inserted meanwhile are indexed live by insertJobRow.
+    //
+    // - enabled, no marker: full rebuild via ZSCAN over `all` (cursor-based
+    //   and linear — immune to score ties and rank shifts; every member
+    //   present for the whole scan is guaranteed returned). Rows deleted
+    //   mid-scan leave at most stale members the read path self-heals.
+    // - enabled, marker present: heal the tail. Index writes are per-process,
+    //   so writers without them (an older version mid-rolling-deploy, or a
+    //   misconfigured indexes-off store) may have inserted unindexed rows
+    //   AFTER the marker landed. Re-indexing everything enqueued since the
+    //   marker minus a 60s margin closes that window: the last enabled boot
+    //   after such writers stop covers everything they wrote before it.
+    // - disabled: delete ONLY the marker (a later re-enable must not trust
+    //   stale zsets). The zsets stay — an enabled sibling may be reading
+    //   them, and this store cannot know.
+    //
+    // Both paths re-stamp the marker with this boot's start time. Init-time
+    // infra failures die — the store never starts half-configured.
     yield* Effect.gen(function*() {
+      const bootAt = yield* Clock.currentTimeMillis
       for (const kind of ["name", "queue"] as const) {
         const marker = `${prefix}:index:${kind}:ready`
-        const ready = Number(yield* redis.send("EXISTS", marker)) === 1
-        if (indexes[kind] && !ready) {
-          let cursor = ""
-          while (true) {
-            const page: { processed: number; cursor: string } = JSON.parse(
-              yield* evalBackfillIndexPage(prefix, kind, cursor, 500)
-            )
-            if (page.processed > 0) cursor = page.cursor
-            if (page.processed < 500) break
-          }
-          yield* redis.send("SET", marker, "1")
-        } else if (!indexes[kind] && ready) {
-          let scanCursor = "0"
-          do {
-            const reply = yield* redis.send("SCAN", scanCursor, "MATCH", `${prefix}:by${kind}:*`, "COUNT", "500")
-            // SAFETY: SCAN always replies [nextCursor, matchedKeys].
-            const [next, keys] = reply as [string, ReadonlyArray<string>]
-            scanCursor = next
-            for (let start = 0; start < keys.length; start += 500) {
-              yield* redis.send("DEL", ...keys.slice(start, start + 500))
-            }
-          } while (scanCursor !== "0")
+        if (!indexes[kind]) {
           yield* redis.send("DEL", marker)
+          continue
         }
+        // SAFETY: GET always replies with a bulk string or null.
+        const stamped = (yield* redis.send("GET", marker)) as string | null
+        const markerAt = stamped === null || stamped === "" ? Number.NaN : Number(stamped)
+        if (Number.isNaN(markerAt)) {
+          let cursor = "0"
+          do {
+            const reply = yield* redis.send("ZSCAN", `${prefix}:all`, cursor, "COUNT", "500")
+            // SAFETY: ZSCAN always replies [nextCursor, member/score pairs].
+            const [next, flat] = reply as [string, ReadonlyArray<string>]
+            cursor = next
+            const ids: Array<string> = []
+            for (let i = 0; i < flat.length; i += 2) {
+              const id = flat[i]
+              if (id !== undefined) ids.push(id)
+            }
+            // COUNT is only a hint — chunk what actually came back.
+            for (let start = 0; start < ids.length; start += 500) {
+              yield* evalIndexMembers(prefix, kind, JSON.stringify(ids.slice(start, start + 500)))
+            }
+          } while (cursor !== "0")
+        } else {
+          const min = String(markerAt - 60_000)
+          let offset = 0
+          while (true) {
+            const scanned = Number(yield* evalIndexTailPage(prefix, kind, min, offset, 500))
+            if (scanned < 500) break
+            offset += scanned
+          }
+        }
+        yield* redis.send("SET", marker, String(bootAt))
       }
     }).pipe(Effect.orDie)
 

@@ -5,6 +5,7 @@ import { assert, describe, expect, it } from "@effect/vitest"
 import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
 import { getTableConfig, index, text } from "drizzle-orm/pg-core"
 import { Cause, Effect, Exit, Fiber, Layer, Option, Schedule, Schema } from "effect"
+import { TestClock } from "effect/testing"
 import { DeadlockError, SqlError, UnknownError } from "effect/unstable/sql/SqlError"
 import {
   DrizzleJobStore,
@@ -39,6 +40,53 @@ if (!available) {
   jobStoreConformance("DrizzleJobStore (Postgres)", freshStoreLayer)
 
   describe("DrizzleJobStore specifics", () => {
+    // Redis constrains finishedAt ordering to terminal states; Postgres (like
+    // memory) serves the mixed case, with COALESCE sorting unfinished rows as
+    // epoch 0.
+    it.effect("finishedAt ordering over mixed states sorts unfinished rows as 0", () =>
+      Effect.gen(function*() {
+        const { store } = yield* freshStoreEffect
+        const base = {
+          id: undefined,
+          name: "MixedOrder",
+          queue: JobStore.QueueName("default"),
+          payload: {},
+          metadata: {},
+          priority: 0,
+          attemptsMax: 1,
+          backoff: undefined,
+          keep: undefined,
+          timeoutMs: undefined,
+          dedupe: undefined,
+          trace: undefined,
+          parent: undefined,
+          delayMs: 0
+        }
+        // Delayed: never claimable here, so it stays without a finishedAt.
+        const pending = yield* store.enqueue({ ...base, delayMs: 60_000 }).pipe(Effect.orDie)
+        const finish = (token: string) =>
+          Effect.gen(function*() {
+            yield* store.enqueue(base)
+            const claim = yield* store.claim({
+              queue: JobStore.QueueName("default"),
+              names: ["MixedOrder"],
+              token,
+              lockDurationMs: 30_000
+            })
+            assert(claim._tag === "Claimed")
+            yield* store.ack(claim.job.id, token, { _tag: "Complete", exit: undefined })
+            yield* TestClock.adjust(1_000)
+            return claim.job.id
+          }).pipe(Effect.orDie)
+        const older = yield* finish("t-1")
+        const newer = yield* finish("t-2")
+
+        const desc = yield* store.list({ orderBy: "finishedAt", order: "desc" }).pipe(Effect.orDie)
+        expect(desc.items.map((job) => job.id)).toEqual([newer, older, pending.id])
+        const asc = yield* store.list({ orderBy: "finishedAt", order: "asc" }).pipe(Effect.orDie)
+        expect(asc.items.map((job) => job.id)).toEqual([pending.id, older, newer])
+      }).pipe(Effect.scoped, Effect.provide(pgClientLive())))
+
     it.effect("schema factories match the driver's expected DDL (drift guard)", () =>
       Effect.gen(function*() {
         const client = yield* PgClient.PgClient
