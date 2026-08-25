@@ -4,7 +4,7 @@ All notable changes to `effect-mq`. Versions follow 0.x semver: **minor
 bumps may break** (the `JobStore` driver contract in particular); patch
 bumps are additive.
 
-## 0.6.0 — unreleased
+## 0.6.0 — 2026-08-25
 
 - **Parent-child flows, cross-store, nestable** — the new `Flow` module: a
   parent job fans out N children (each bound to its own store: a Postgres
