@@ -36,6 +36,7 @@ import { sql } from "drizzle-orm"
 import {
   type AnyPgColumnBuilder,
   bigint,
+  bigserial,
   boolean,
   index,
   integer,
@@ -56,6 +57,10 @@ type BackoffPolicy = JobStore.BackoffPolicy
 type KeepPolicy = JobStore.KeepPolicy
 type AttemptOutcome = JobStore.AttemptRecord["outcome"]
 type TraceContext = JobStore.TraceContext
+type ParentEnvelope = JobStore.ParentEnvelope
+type EnqueueRequest = JobStore.EnqueueRequest
+type FlowChildStatus = JobStore.FlowChildRecord["status"]
+type FlowChildReport = JobStore.FlowChildReport
 
 /**
  * Table-factory options: `extraConfig` receives the table's columns (exactly
@@ -89,6 +94,14 @@ const jobsColumns = <JobName extends string, Queue extends string>() => ({
   cancelRequested: boolean("cancel_requested").notNull().default(false),
   dedupeKey: text("dedupe_key"),
   trace: jsonb("trace").$type<TraceContext>(),
+  /** Flow-parent link on child jobs (opaque envelope, like `trace`). */
+  parent: jsonb("parent").$type<ParentEnvelope>(),
+  /** Flow bookkeeping: NULL together until a FanOut ack lands the manifest. */
+  flowFailFast: boolean("flow_fail_fast"),
+  flowPending: integer("flow_pending"),
+  flowCompleted: integer("flow_completed"),
+  flowFailed: integer("flow_failed"),
+  flowCancelled: integer("flow_cancelled"),
   runAt: timestamp("run_at", { withTimezone: true, mode: "date" }).notNull(),
   enqueuedAt: timestamp("enqueued_at", { withTimezone: true, mode: "date" }).notNull(),
   processedAt: timestamp("processed_at", { withTimezone: true, mode: "date" }),
@@ -245,6 +258,75 @@ export const mqDedupe = <JobName extends string = string>(
     ...options?.extraConfig?.(table) ?? []
   ])
 
+const flowChildrenColumns = () => ({
+  /** The parent (flow) job's id in this store. */
+  flowId: text("flow_id").notNull().$type<JobId>(),
+  /** Unique within the flow (the idempotency mechanism). */
+  childKey: text("child_key").notNull(),
+  /** The child job's name (projection of `spec.name` for dashboards). */
+  name: text("name").notNull(),
+  /** The CHILD store's context-key string (children may live elsewhere). */
+  storeKey: text("store_key").notNull(),
+  /** The FULL `EnqueueRequest`, so the sweeper can re-enqueue from storage. */
+  spec: jsonb("spec").notNull().$type<EnqueueRequest>(),
+  status: text("status").notNull().$type<FlowChildStatus>(),
+  /** The child's schema-encoded exit; NULL for store-side failures. */
+  exit: jsonb("exit"),
+  failedReason: text("failed_reason"),
+  /** True once no cancel needs delivering into the child's store. */
+  cascaded: boolean("cascaded").notNull(),
+  pendingSince: timestamp("pending_since", { withTimezone: true, mode: "date" }).notNull()
+})
+
+/**
+ * Flow dependency rows (one per fan-out child; see `JobStore.FlowChildRecord`).
+ * Lives next to the PARENT store's jobs table.
+ *
+ * @since 0.6.0
+ */
+export const mqFlowChildren = (
+  tableName = "effect_mq_flow_children",
+  options?: MqTableOptions<ReturnType<typeof flowChildrenColumns>>
+) =>
+  pgTable(tableName, flowChildrenColumns(), (table) => [
+    primaryKey({ columns: [table.flowId, table.childKey] }),
+    // flowSweepWork reconcile: pending rows older than the threshold.
+    index(`${tableName}_pending_idx`)
+      .on(table.pendingSince)
+      .where(sql`${table.status} = 'pending'`),
+    // flowSweepWork cascade: cancelled rows not yet delivered.
+    index(`${tableName}_cascade_idx`)
+      .on(table.flowId)
+      .where(sql`${table.status} = 'cancelled' AND NOT ${table.cascaded}`),
+    ...options?.extraConfig?.(table) ?? []
+  ])
+
+const flowOutboxColumns = () => ({
+  /** Store-assigned, oldest-first; exposed to callers as an opaque string. */
+  id: bigserial("id", { mode: "number" }).primaryKey(),
+  /** The flow definition's name, for relay routing. */
+  flowName: text("flow_name").notNull(),
+  /** The PARENT store's context-key string, for relay routing. */
+  parentStoreKey: text("parent_store_key").notNull(),
+  /** The full `FlowChildReport` to deliver into the parent store. */
+  report: jsonb("report").notNull().$type<FlowChildReport>()
+})
+
+/**
+ * Undelivered child-result reports (one per terminal transition of an
+ * envelope-carrying job; see `JobStore.OutboxEntry`). Lives next to the
+ * CHILD store's jobs table.
+ *
+ * @since 0.6.0
+ */
+export const mqFlowOutbox = (
+  tableName = "effect_mq_flow_outbox",
+  options?: MqTableOptions<ReturnType<typeof flowOutboxColumns>>
+) =>
+  pgTable(tableName, flowOutboxColumns(), (table) => [
+    ...options?.extraConfig?.(table) ?? []
+  ])
+
 const queueControlColumns = <Queue extends string>() => ({
   queue: text("queue").primaryKey().$type<Queue>(),
   paused: boolean("paused").notNull().default(false)
@@ -287,3 +369,13 @@ export type MqQueueControlTable = ReturnType<typeof mqQueueControl<any>>
  * @since 0.3.0
  */
 export type MqDedupeTable = ReturnType<typeof mqDedupe<any>>
+
+/**
+ * @since 0.6.0
+ */
+export type MqFlowChildrenTable = ReturnType<typeof mqFlowChildren>
+
+/**
+ * @since 0.6.0
+ */
+export type MqFlowOutboxTable = ReturnType<typeof mqFlowOutbox>

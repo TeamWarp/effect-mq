@@ -1,5 +1,5 @@
 import { assert, describe, expect, it } from "@effect/vitest"
-import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option, Redacted, Schedule, Schema } from "effect"
+import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Logger, Option, Redacted, References, Schedule, Schema } from "effect"
 import { TestClock } from "effect/testing"
 import { Job, JobStore, MemoryJobStore, Worker } from "../src/index.ts"
 
@@ -33,9 +33,9 @@ describe("Worker", () => {
         success: Schema.String
       })
       const seen: Array<Worker.JobContext> = []
-      const handlers = Greet.toLayer((payload, context) =>
-        Effect.sync(() => {
-          seen.push(context)
+      const handlers = Greet.toLayer((payload) =>
+        Effect.gen(function*() {
+          seen.push(yield* Worker.CurrentJob)
           return `hello ${payload.name}`
         })
       )
@@ -52,6 +52,62 @@ describe("Worker", () => {
       expect(seen[0]?.attempt).toBe(1)
       expect(seen[0]?.queue).toBe("default")
       expect(seen[0]?.name).toBe("Greet")
+    }))
+
+  it.effect("CurrentJob is readable arbitrarily deep in the handler's call graph", () =>
+    Effect.gen(function*() {
+      const Deep = Job.make("Deep", {
+        payload: { n: Schema.Number },
+        success: Schema.String
+      })
+      // Two calls between the handler and the read; no parameter threading.
+      // `leaf` requires Worker.CurrentJob, and toLayer subtracts it because
+      // the worker provides it per run.
+      const leaf = Effect.gen(function*() {
+        const { attempt, jobId } = yield* Worker.CurrentJob
+        return `${jobId}:${attempt}`
+      })
+      const middle = Effect.gen(function*() {
+        return yield* leaf
+      })
+      const handlers = Deep.toLayer(() => middle)
+
+      const result = yield* Effect.gen(function*() {
+        const fiber = yield* Effect.forkChild(Deep.execute({ n: 1 }, { jobId: "deep-1" }))
+        yield* settle
+        yield* TestClock.adjust("1 second")
+        return yield* Fiber.join(fiber)
+      }).pipe(Effect.provide(harness(handlers)))
+      expect(result).toBe("deep-1:1")
+    }))
+
+  it.effect("handler log lines carry the job identity annotations", () =>
+    Effect.gen(function*() {
+      const Noisy = Job.make("Noisy", { payload: { n: Schema.Number } })
+      const handlers = Noisy.toLayer(() => Effect.log("inside the handler"))
+      const annotated: Array<{ jobId: string; queue: string; attempt: number }> = []
+      const collector = Logger.make((options) => {
+        if (String(options.message) === "inside the handler") {
+          const notes = options.fiber.getRef(References.CurrentLogAnnotations)
+          annotated.push({
+            jobId: String(notes.effectMqJobId),
+            queue: String(notes.effectMqQueue),
+            attempt: Number(notes.effectMqAttempt)
+          })
+        }
+      })
+
+      yield* Effect.gen(function*() {
+        const fiber = yield* Effect.forkChild(Noisy.execute({ n: 1 }, { jobId: "noisy-1" }))
+        yield* settle
+        yield* TestClock.adjust("1 second")
+        yield* Fiber.join(fiber)
+      }).pipe(
+        Effect.provide(harness(handlers)),
+        Effect.provide(Logger.layer([collector]))
+      )
+
+      expect(annotated).toEqual([{ jobId: "noisy-1", queue: "default", attempt: 1 }])
     }))
 
   it.effect("delayed jobs only run once the delay elapses", () =>
@@ -110,12 +166,13 @@ describe("Worker", () => {
         }
       })
       const attempts: Array<number> = []
-      const handlers = Flaky.toLayer((_, context) =>
-        Effect.suspend(() => {
-          attempts.push(context.attempt)
-          return context.attempt < 3
-            ? new SendFailure({ reason: "flake" })
-            : Effect.succeed(context.attempt)
+      const handlers = Flaky.toLayer(() =>
+        Effect.gen(function*() {
+          const { attempt } = yield* Worker.CurrentJob
+          attempts.push(attempt)
+          return attempt < 3
+            ? yield* new SendFailure({ reason: "flake" })
+            : attempt
         })
       )
 
@@ -824,6 +881,7 @@ describe("Worker hardening", () => {
           timeoutMs: undefined,
           dedupe: undefined,
           trace: undefined,
+          parent: undefined,
           delayMs: 0
         })
         yield* settle

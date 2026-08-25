@@ -63,7 +63,7 @@ export {
    */
   unrecoverable
 }
-import { type JobContext, type RegisterOptions, Worker } from "./Worker.ts"
+import { type CurrentJob, type RegisterOptions, Worker } from "./Worker.ts"
 
 const TypeId = "~effect-mq/Job" as const
 
@@ -308,7 +308,12 @@ export type EnqueueManyOptions = Omit<JobOptions, "delay"> & RunTimeInput & {
   readonly metadata?: Readonly<Record<string, string>> | undefined
 }
 
-interface ResolvedDefaults {
+/**
+ * A definition's `defaults`, normalized to store units.
+ *
+ * @since 0.6.0
+ */
+export interface ResolvedDefaults {
   readonly delayMs: number
   readonly priority: number
   readonly attempts: number
@@ -384,8 +389,12 @@ export interface JobAttempt<A, E> {
   readonly attempt: number
   readonly startedAt: number | undefined
   readonly finishedAt: number
-  readonly outcome: "completed" | "retried" | "failed" | "stalled" | "cancelled"
-  /** Absent for `stalled` and `cancelled` entries. */
+  readonly outcome: "completed" | "retried" | "failed" | "stalled" | "cancelled" | "fanned-out"
+  /**
+   * Absent for `stalled`, `cancelled`, and `fanned-out` entries — and for
+   * `failed` ones settled store-side without a handler exit (e.g. a
+   * fail-fast flow settle).
+   */
   readonly exit: Option.Option<Exit.Exit<A, E>>
 }
 
@@ -554,19 +563,20 @@ export interface Job<
 
   /**
    * Attach the handler that processes this job, as a layer to provide on top
-   * of `Worker.layer` (bound to the same store).
+   * of `Worker.layer` (bound to the same store). The handler reads the
+   * running attempt from the `Worker.CurrentJob` service — the worker
+   * provides it per run, so it never appears in the layer's requirements.
    */
   readonly toLayer: <R>(
     handler: (
-      payload: Payload["Type"],
-      context: JobContext
+      payload: Payload["Type"]
     ) => Effect.Effect<Success["Type"], Error["Type"], R>,
     options?: RegisterOptions | undefined
   ) => Layer.Layer<
     never,
     never,
     | Worker
-    | R
+    | Exclude<R, CurrentJob>
     | Payload["DecodingServices"]
     | Success["EncodingServices"]
     | Error["EncodingServices"]
@@ -589,7 +599,13 @@ const defaultPollSchedule = Schedule.min([
   Schedule.spaced("1 second")
 ])
 
-const normalizeBackoff = (input: BackoffInput | undefined): BackoffPolicy | undefined =>
+/**
+ * Normalize a user-facing `BackoffInput` to the persisted policy. Shared
+ * with the flow runtime's child-spec builder.
+ *
+ * @internal
+ */
+export const normalizeBackoff = (input: BackoffInput | undefined): BackoffPolicy | undefined =>
   input === undefined ? undefined : {
     _tag: input.type,
     delayMs: Duration.toMillis(input.delay),
@@ -601,7 +617,13 @@ const normalizeKeepState = (input: KeepStateInput): KeepStatePolicy => ({
   ageMs: input.age !== undefined ? Duration.toMillis(input.age) : undefined
 })
 
-const normalizeKeep = (input: KeepInput | undefined): KeepPolicy | undefined => {
+/**
+ * Normalize a user-facing `KeepInput` to the persisted policy. Shared with
+ * the flow runtime's child-spec builder.
+ *
+ * @internal
+ */
+export const normalizeKeep = (input: KeepInput | undefined): KeepPolicy | undefined => {
   if (input === undefined) return undefined
   const split = "completed" in input || "failed" in input || "cancelled" in input
   const flat = "count" in input || "age" in input
@@ -697,6 +719,7 @@ const Proto = {
               trace: capturedSpan === undefined
                 ? undefined
                 : { ...capturedSpan, delayed: resolvedDelayMs > 0 } satisfies TraceContext,
+              parent: undefined,
               delayMs: resolvedDelayMs
             }))
         ),
@@ -779,6 +802,7 @@ const Proto = {
               trace: capturedSpan === undefined
                 ? undefined
                 : { ...capturedSpan, delayed: resolvedDelayMs > 0 } satisfies TraceContext,
+              parent: undefined,
               delayMs: resolvedDelayMs
             })))
           )
@@ -1010,7 +1034,7 @@ const Proto = {
 
   toLayer(
     this: AnyWithProps,
-    handler: (payload: any, context: JobContext) => Effect.Effect<any, any, any>,
+    handler: (payload: any) => Effect.Effect<any, any, any>,
     options?: RegisterOptions
   ) {
     return Layer.effectDiscard(

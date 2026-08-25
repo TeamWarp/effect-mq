@@ -133,3 +133,46 @@ export const stalledRecovered = Metric.counter("effect_mq_stalled_recovered", {
 export const scheduleTicks = Metric.counter("effect_mq_schedule_ticks", {
   description: "Repeatable-schedule occurrences enqueued by the schedule sweep"
 })
+
+/**
+ * Flow fan-outs acked (manifests landed). Tags: `flow`.
+ *
+ * @since 0.6.0
+ */
+export const flowFanOuts = Metric.counter("effect_mq_flow_fanouts", {
+  description: "Flow fan-out acks (child manifests persisted)"
+})
+
+/**
+ * Child results recorded into parent stores. Tags: `flow`, `outcome`
+ * (completed | failed | cancelled), `source` (`report` = delivered by a
+ * worker's outbox relay; `reconcile` = synthesized by the flow sweeper from
+ * child-store state). Only applied reports count — duplicates dropped by
+ * the dependency row do not.
+ *
+ * @since 0.6.0
+ */
+export const flowChildReports = Metric.counter("effect_mq_flow_child_reports", {
+  description: "Applied flow child-result reports by outcome and delivery path"
+})
+
+/**
+ * Cancels delivered into child stores after a flow settle. Tags: none.
+ *
+ * @since 0.6.0
+ */
+export const flowCascades = Metric.counter("effect_mq_flow_cascades", {
+  description: "Child cancels cascaded into child stores after a flow settled"
+})
+
+/**
+ * Undelivered outbox entries a relay drain had to leave behind (their
+ * parent store is not reachable from this worker — no matching `flows`
+ * registration). Tags: none. Sustained growth means no process anywhere
+ * can relay these flows; reconciliation keeps the flows correct meanwhile.
+ *
+ * @since 0.6.0
+ */
+export const flowOutboxSkipped = Metric.counter("effect_mq_flow_outbox_skipped", {
+  description: "Outbox entries left undelivered by a relay drain (parent store unknown here)"
+})

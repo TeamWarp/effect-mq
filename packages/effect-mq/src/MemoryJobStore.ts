@@ -16,9 +16,14 @@ import {
   type ClaimResult,
   type EnqueueRequest,
   type ExtendLocksResult,
+  type FlowChildRecord,
+  type FlowChildReport,
+  type FlowChildSpec,
+  type FlowSweepWork,
   type HistoryTtlByState,
   type HistoryTtlInput,
   type IdGenerator,
+  type OutboxEntry,
   JobId,
   JobNotCancellableError,
   JobNotFoundError,
@@ -56,6 +61,8 @@ interface MemJob {
   cancelRequested: boolean
   readonly dedupeKey: string | undefined
   trace: JobRecord["trace"]
+  readonly parent: JobRecord["parent"]
+  flow: JobRecord["flow"]
   runAt: number
   readonly enqueuedAt: number
   processedAt: number | undefined
@@ -87,6 +94,8 @@ const snapshot = (job: MemJob): JobRecord => ({
   cancelRequested: job.cancelRequested,
   dedupeKey: job.dedupeKey,
   trace: job.trace,
+  parent: job.parent,
+  flow: job.flow,
   runAt: job.runAt,
   enqueuedAt: job.enqueuedAt,
   processedAt: job.processedAt,
@@ -110,10 +119,46 @@ interface MemoryStore {
   readonly sweepHistory: (now: number, ttlByState: HistoryTtlByState) => void
 }
 
+interface MemFlowChild {
+  readonly flowId: JobId
+  readonly childKey: string
+  readonly storeKey: string
+  readonly spec: EnqueueRequest
+  status: FlowChildRecord["status"]
+  exit: unknown
+  failedReason: string | undefined
+  cascaded: boolean
+  /** Sweep-eligibility timestamp: set at FanOut, re-armed on each return. */
+  pendingSince: number
+}
+
 const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemoryStore => {
   const jobs = new Map<string, MemJob>()
   const schedules = new Map<ScheduleKey, ScheduleRecord>()
   const paused = new Set<QueueName>()
+  // Flow dependency rows, keyed by parent job id then child key. Insertion
+  // order is FanOut spec order; listChildResults sorts by child key.
+  const flowChildren = new Map<JobId, Map<string, MemFlowChild>>()
+  // Undelivered child-result reports, appended atomically with every
+  // terminal transition of an envelope-carrying job (see OutboxEntry).
+  const outbox: Array<OutboxEntry> = []
+  let outboxSeq = 0
+
+  const appendOutbox = (job: MemJob, outcome: FlowChildReport["outcome"]) => {
+    if (job.parent === undefined) return
+    outbox.push({
+      id: `ob-${++outboxSeq}`,
+      flowName: job.parent.flowName,
+      parentStoreKey: job.parent.parentStoreKey,
+      report: {
+        flowId: job.parent.flowId,
+        childKey: job.parent.childKey,
+        outcome,
+        exit: job.exit,
+        failedReason: job.failedReason
+      }
+    })
+  }
   // Dedup registry: one entry per (name, key). `expiresAt` is set for
   // ttl/throttle windows; pending-mode entries live as long as their job.
   const dedupes = new Map<string, { jobId: JobId; expiresAt: number | undefined }>()
@@ -198,12 +243,68 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
     }
   }
 
+  // A pruned/removed flow parent takes its dependency rows with it.
+  const deleteJob = (id: string) => {
+    jobs.delete(id)
+    // SAFETY: flowChildren keys are JobIds; a plain string that is not one
+    // simply misses.
+    flowChildren.delete(id as JobId)
+  }
+
+  // A settled flow parent whose rows still owe cascade cancels is exempt
+  // from automatic retention (keep policies, the history sweep): deleting
+  // it would delete the only record that the child stores are still owed
+  // real cancels, leaving marked children running. Once the sweeper marks
+  // the rows cascaded, retention applies normally. The explicit `remove`
+  // verb is NOT exempted — it is an operator override.
+  const owesCascades = (id: string) => {
+    // SAFETY: flowChildren keys are JobIds; a plain string that is not one
+    // simply misses.
+    const rows = flowChildren.get(id as JobId)
+    if (rows === undefined) return false
+    for (const row of rows.values()) {
+      if (row.status === "cancelled" && !row.cascaded) return true
+    }
+    return false
+  }
+
+  // Settle-time marking: remaining pending rows flip to cancelled (NOT
+  // cascaded — the sweeper still owes the child stores real cancels), so
+  // late reports find their row terminal and drop, and `listChildResults`
+  // stays truthful. Returns how many rows flipped, for the flow counters.
+  // Lock order note: in this driver everything is one synchronous block,
+  // but the row-then-parent order is still observed.
+  const markPendingRowsCancelled = (flowId: JobId): number => {
+    const rows = flowChildren.get(flowId)
+    if (rows === undefined) return 0
+    let marked = 0
+    for (const row of rows.values()) {
+      if (row.status === "pending") {
+        row.status = "cancelled"
+        row.cascaded = false
+        marked += 1
+      }
+    }
+    return marked
+  }
+
+  const settleMarkRows = (job: MemJob) => {
+    const marked = markPendingRowsCancelled(job.id)
+    if (job.flow !== undefined) {
+      job.flow = { ...job.flow, pending: 0, cancelled: job.flow.cancelled + marked }
+    }
+  }
+
   const markCancelled = (job: MemJob, now: number) => {
     clearLock(job)
     job.cancelRequested = false
+    if (job.state === "waiting-children") {
+      settleMarkRows(job)
+    }
     job.state = "cancelled"
     job.finishedAt = now
     recordAttempt(job, "cancelled", now, undefined)
+    appendOutbox(job, "cancelled")
     releaseDedupe(job, now)
     applyKeep(job, now)
   }
@@ -253,7 +354,8 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
       }
     }
     for (const id of remove) {
-      jobs.delete(id)
+      if (owesCascades(id)) continue
+      deleteJob(id)
     }
   }
 
@@ -267,8 +369,8 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
       // The sweep honours min(per-row keep age, store ceiling) — a quiet job
       // name is pruned on the timer, not only when its group is acked.
       const effective = keepAge !== undefined && (ttl === undefined || keepAge < ttl) ? keepAge : ttl
-      if (effective !== undefined && job.finishedAt <= now - effective) {
-        jobs.delete(job.id)
+      if (effective !== undefined && job.finishedAt <= now - effective && !owesCascades(job.id)) {
+        deleteJob(job.id)
       }
     }
     // Dead dedup entries: expired window, or a pointer at a vanished job.
@@ -289,7 +391,8 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
       }
       switch (job.state) {
         case "waiting":
-        case "delayed": {
+        case "delayed":
+        case "waiting-children": {
           markCancelled(job, now)
           return
         }
@@ -321,6 +424,8 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
       cancelRequested: false,
       dedupeKey: request.dedupe?.key,
       trace: request.trace,
+      parent: request.parent,
+      flow: undefined,
       runAt: now + Math.max(0, request.delayMs),
       enqueuedAt: now,
       processedAt: undefined,
@@ -466,15 +571,79 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
         if (job.state !== "active" || job.lockToken !== token) {
           return yield* new LockLostError({ jobId: id })
         }
+        if (
+          outcome._tag === "FanOut" &&
+          outcome.children.some((child) => child.request.id === undefined)
+        ) {
+          // Validate BEFORE any mutation, so a bad spec cannot leave the job
+          // half-acked (lock cleared, ledger written, still active).
+          return yield* new JobStoreError({
+            message: "FanOut child specs require an explicit request.id"
+          })
+        }
         clearLock(job)
-        job.attemptsMade += 1
+        // A fan-out is a phase transition, not a completed run — the attempt
+        // budget spans both phases.
+        if (outcome._tag !== "FanOut") {
+          job.attemptsMade += 1
+        }
         switch (outcome._tag) {
+          case "FanOut": {
+            recordAttempt(job, "fanned-out", now, undefined)
+            if (job.flow === undefined) {
+              job.flow = {
+                failFast: outcome.failFast,
+                pending: outcome.children.length,
+                completed: 0,
+                failed: 0,
+                cancelled: 0
+              }
+              const rows = new Map<string, MemFlowChild>()
+              for (const child of outcome.children) {
+                rows.set(child.childKey, {
+                  flowId: job.id,
+                  childKey: child.childKey,
+                  storeKey: child.storeKey,
+                  spec: child.request,
+                  status: "pending",
+                  exit: undefined,
+                  failedReason: undefined,
+                  cascaded: false,
+                  pendingSince: now
+                })
+              }
+              flowChildren.set(job.id, rows)
+            }
+            // A manifest that was already present is kept untouched (double
+            // fan-out converges on the persisted children); the state
+            // transition follows the persisted pending count either way.
+            if (job.cancelRequested) {
+              // A cancel raced the fan-out: cancellation wins. Mark the rows
+              // here — the job is still `active`, so markCancelled's own
+              // waiting-children marking does not apply — and the sweeper
+              // cascades (mostly no-op cancels for never-enqueued children).
+              settleMarkRows(job)
+              markCancelled(job, now)
+              break
+            }
+            if (job.flow.pending > 0) {
+              job.state = "waiting-children"
+            } else {
+              // Empty spec: settle straight to runnable `collect`.
+              job.state = "waiting"
+              job.runAt = now
+              job.seq = ++seq
+              signalWake(job.queue)
+            }
+            break
+          }
           case "Complete": {
             job.cancelRequested = false
             job.state = "completed"
             job.exit = outcome.exit
             job.finishedAt = now
             recordAttempt(job, "completed", now, outcome.exit)
+            appendOutbox(job, "completed")
             releaseDedupe(job, now)
             applyKeep(job, now)
             break
@@ -485,6 +654,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
             job.exit = outcome.exit
             job.finishedAt = now
             recordAttempt(job, "failed", now, outcome.exit)
+            appendOutbox(job, "failed")
             releaseDedupe(job, now)
             applyKeep(job, now)
             break
@@ -494,6 +664,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
             job.state = "cancelled"
             job.finishedAt = now
             recordAttempt(job, "cancelled", now, undefined)
+            appendOutbox(job, "cancelled")
             releaseDedupe(job, now)
             applyKeep(job, now)
             break
@@ -584,6 +755,7 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
             job.state = "failed"
             job.finishedAt = now
             job.failedReason = "job stalled more than allowable limit"
+            appendOutbox(job, "failed")
             releaseDedupe(job, now)
             recovered.push({ id: job.id, failed: true })
           } else {
@@ -797,12 +969,201 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
         return true
       }),
 
+    recordChildResults: (reports) =>
+      Effect.gen(function*() {
+        const now = yield* Clock.currentTimeMillis
+        const results = reports.map(() => ({ applied: false, parentSettled: false }))
+
+        // Phase 1 — apply every row update (lock order: rows before
+        // parents), tracking per flow which report would decide a settle.
+        const touched = new Map<JobId, { lastApplied: number; firstAppliedFailed: number | undefined }>()
+        for (const [index, report] of reports.entries()) {
+          const row = flowChildren.get(report.flowId)?.get(report.childKey)
+          if (row === undefined || row.status !== "pending") continue
+          row.status = report.outcome
+          row.exit = report.exit
+          row.failedReason = report.failedReason
+          // The outcome came from the child's store: no cancel to deliver.
+          row.cascaded = true
+          results[index] = { applied: true, parentSettled: false }
+          const parent = jobs.get(report.flowId)
+          if (parent?.flow !== undefined) {
+            const flow = parent.flow
+            parent.flow = {
+              ...flow,
+              pending: Math.max(0, flow.pending - 1),
+              completed: flow.completed + (report.outcome === "completed" ? 1 : 0),
+              failed: flow.failed + (report.outcome === "failed" ? 1 : 0),
+              cancelled: flow.cancelled + (report.outcome === "cancelled" ? 1 : 0)
+            }
+          }
+          const touch = touched.get(report.flowId) ?? { lastApplied: index, firstAppliedFailed: undefined }
+          touch.lastApplied = index
+          if (report.outcome === "failed" && touch.firstAppliedFailed === undefined) {
+            touch.firstAppliedFailed = index
+          }
+          touched.set(report.flowId, touch)
+        }
+
+        // Phase 2 — at most one settle decision per touched flow. Fail-fast
+        // wins ties (a batch whose failure also empties `pending` settles
+        // terminally, never into collect).
+        for (const [flowId, touch] of touched) {
+          const parent = jobs.get(flowId)
+          if (parent === undefined || parent.flow === undefined) continue
+          if (parent.state !== "waiting-children") continue
+          const failedIndex = parent.flow.failFast ? touch.firstAppliedFailed : undefined
+          const failedReport = failedIndex !== undefined ? reports[failedIndex] : undefined
+          if (failedIndex !== undefined && failedReport !== undefined) {
+            // First applied failure settles the parent terminally
+            // (store-side, like stall exhaustion) and marks the remaining
+            // rows in the same op. A nested parent's own report goes to the
+            // outbox here — this settle IS its terminal transition.
+            settleMarkRows(parent)
+            parent.cancelRequested = false
+            parent.state = "failed"
+            parent.finishedAt = now
+            parent.failedReason = `effect-mq: flow child "${failedReport.childKey}" failed`
+            recordAttempt(parent, "failed", now, undefined)
+            appendOutbox(parent, "failed")
+            releaseDedupe(parent, now)
+            applyKeep(parent, now)
+            results[failedIndex] = { applied: true, parentSettled: true }
+            continue
+          }
+          if (parent.flow.pending === 0) {
+            // All children settled: the parent resumes runnable, phase
+            // collect.
+            parent.state = "waiting"
+            parent.runAt = now
+            parent.seq = ++seq
+            signalWake(parent.queue)
+            results[touch.lastApplied] = { applied: true, parentSettled: true }
+          }
+        }
+        return results
+      }),
+
+    peekOutbox: (options) =>
+      Effect.sync(() => {
+        // `after` compares by the id's embedded sequence so the cursor
+        // works whether or not the named entry still exists.
+        const afterSeq = options.after !== undefined && options.after.startsWith("ob-")
+          ? Number(options.after.slice(3))
+          : undefined
+        const eligible = afterSeq === undefined || Number.isNaN(afterSeq)
+          ? outbox
+          : outbox.filter((entry) => Number(entry.id.slice(3)) > afterSeq)
+        return eligible.slice(0, Math.max(0, options.limit))
+      }),
+
+    deleteOutbox: (ids) =>
+      Effect.sync(() => {
+        const drop = new Set(ids)
+        let write = 0
+        for (const entry of outbox) {
+          if (!drop.has(entry.id)) {
+            outbox[write] = entry
+            write += 1
+          }
+        }
+        outbox.length = write
+      }),
+
+    listChildResults: (flowId, options) =>
+      Effect.sync(() => {
+        const limit = Math.max(1, options?.limit ?? 1000)
+        const rows = Array.from(flowChildren.get(flowId)?.values() ?? [])
+          .toSorted((a, b) => (a.childKey < b.childKey ? -1 : a.childKey > b.childKey ? 1 : 0))
+          .filter((row) => options?.cursor === undefined || row.childKey > options.cursor)
+        const page = rows.slice(0, limit)
+        const items: Array<FlowChildRecord> = page.map((row) => ({
+          flowId: row.flowId,
+          childKey: row.childKey,
+          name: row.spec.name,
+          storeKey: row.storeKey,
+          // SAFETY: FanOut validated every spec id at ack time.
+          childJobId: row.spec.id as JobId,
+          status: row.status,
+          exit: row.exit,
+          failedReason: row.failedReason,
+          cascaded: row.cascaded
+        }))
+        const last = page[page.length - 1]
+        return {
+          items,
+          cursor: rows.length > limit && last !== undefined ? last.childKey : undefined
+        }
+      }),
+
+    flowSweepWork: (options) =>
+      Effect.gen(function*() {
+        const now = yield* Clock.currentTimeMillis
+        const limit = Math.max(1, options.limit ?? 1000)
+        const threshold = now - options.pendingAgeMs
+        const reconcile: Array<{ flowId: JobId; children: Array<FlowChildSpec> }> = []
+        const cascade: Array<
+          { flowId: JobId; children: Array<{ childKey: string; storeKey: string; childJobId: JobId }> }
+        > = []
+        let reconcileCount = 0
+        let cascadeCount = 0
+        for (const [flowId, rows] of flowChildren) {
+          const parent = jobs.get(flowId)
+          const reconciling = parent !== undefined && parent.state === "waiting-children"
+          let reconcileGroup: Array<FlowChildSpec> | undefined
+          let cascadeGroup:
+            | Array<{ childKey: string; storeKey: string; childJobId: JobId }>
+            | undefined
+          for (const row of rows.values()) {
+            if (
+              reconciling && row.status === "pending" &&
+              row.pendingSince <= threshold && reconcileCount < limit
+            ) {
+              reconcileGroup ??= []
+              reconcileGroup.push({ childKey: row.childKey, storeKey: row.storeKey, request: row.spec })
+              reconcileCount += 1
+              // Re-arm eligibility: returned work waits another pendingAgeMs
+              // before it can come back, so a full page rotates (see the
+              // interface's rotation note).
+              row.pendingSince = now
+            }
+            if (row.status === "cancelled" && !row.cascaded && cascadeCount < limit) {
+              cascadeGroup ??= []
+              cascadeGroup.push({
+                childKey: row.childKey,
+                storeKey: row.storeKey,
+                // SAFETY: FanOut validated every spec id at ack time.
+                childJobId: row.spec.id as JobId
+              })
+              cascadeCount += 1
+            }
+          }
+          if (reconcileGroup !== undefined) reconcile.push({ flowId, children: reconcileGroup })
+          if (cascadeGroup !== undefined) cascade.push({ flowId, children: cascadeGroup })
+        }
+        const work: FlowSweepWork = { reconcile, cascade }
+        return work
+      }),
+
+    markChildrenCascaded: (flowId, childKeys) =>
+      Effect.sync(() => {
+        const rows = flowChildren.get(flowId)
+        if (rows === undefined) return
+        for (const key of childKeys) {
+          const row = rows.get(key)
+          if (row !== undefined) {
+            row.cascaded = true
+          }
+        }
+      }),
+
     counts: (queue) =>
       Effect.sync(() => {
         const counts = {
           waiting: 0,
           delayed: 0,
           active: 0,
+          "waiting-children": 0,
           completed: 0,
           failed: 0,
           cancelled: 0
@@ -817,8 +1178,10 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
     remove: (id) =>
       Effect.sync(() => {
         const job = jobs.get(id)
-        if (job === undefined || job.state === "active") return false
-        jobs.delete(id)
+        if (job === undefined || job.state === "active" || job.state === "waiting-children") {
+          return false
+        }
+        deleteJob(id)
         return true
       })
   })

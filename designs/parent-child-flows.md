@@ -1,7 +1,76 @@
 # Design: parent-child flows (cross-store fan-out)
 
-Status: proposed, revision 2 — rewritten after an adversarial design review
-(3 lenses, 22 confirmed findings folded in below). Target: 0.5.0.
+Status: implemented for 0.6.0, v2 phase included. Revision 2, rewritten
+after an adversarial design review (3 lenses, 22 confirmed findings folded
+in below).
+
+The "v2" section at the bottom shipped with these shapes:
+
+- **Outbox**: the append happens inside every terminal-transition store op
+  (ack, cancel, stall exhaustion, nested-parent settles) rather than only
+  the ack; the relay is lease-free (peek → deliver → delete; dependency
+  rows dedup redelivery) and pulse-driven off each ack with the sweep
+  interval as fallback. Because the outbox made any worker's ack safe, we
+  removed the misconfigured-worker fail-unrecoverably policy:
+  `Worker.layer({ flows })` now tunes latency alone.
+- **Batched decrements**: `recordChildResults` (which replaced the
+  singular op) applies all row updates before at most one settle decision
+  per flow; fail-fast wins ties on the first applied failure in batch
+  order.
+- **Paginated collect**: `ChildResults` became `{ counts, all, stream }`,
+  with per-outcome counters persisted on `FlowState` so tallies cost no
+  row reads.
+- **Nested flows**: allowed (they fell out of the machinery: a settling
+  inner parent reports upward like any child, via the outbox); depth
+  capped at 8 as the cycle guard, since definitions cannot be
+  cycle-checked statically.
+
+As-built deviations from this document:
+
+- **Phase marker**: persisted as `JobRecord.flow`
+  (`{ failFast, pending, completed, failed, cancelled }`; the four
+  counters always sum to the manifest size); its *presence* is the
+  collect-phase marker, instead of a separate `flowPhase` enum field. The
+  fail-fast policy rides inside it.
+- **Fail-fast settle**: the store settles the parent as `failed` with
+  `failedReason: 'effect-mq: flow child "<key>" failed'` and no exit (the
+  same shape as stall exhaustion), rather than synthesizing an encoded
+  `FlowChildFailedError` exit (stores never encode exits). The failed
+  child's own exit stays inspectable via `childResults`; `awaitResult` on
+  the parent dies. The report deliverer (child worker or sweeper) logs the
+  settle at error level.
+- **Store ops**: the cascade flag write is its own op,
+  `markChildrenCascaded(flowId, childKeys)`, and the sweep threshold is a
+  caller argument (`flowSweepWork({ pendingAgeMs, limit })`). Applied
+  reports set `cascaded` immediately (the outcome came from the child's
+  store; no cancel owed).
+- **Double fan-out**: instead of rejecting, a FanOut ack that finds an
+  existing manifest converges on it (ignores the new children, transitions
+  per the persisted pending count), safer for the only way it can occur
+  (a bug or a lost-lock re-run).
+- **Missing child at reconcile**: always re-enqueued from the stored spec
+  (at-least-once); there is no "child lost" failure synthesis. The
+  retention guidance (child terminal `keep` > sweep interval) is what
+  prevents pruned-terminal-but-unreported re-runs.
+- **Report ordering** (revised after the implementation review): the child
+  worker acks first and reports only after its ack landed, inverting this
+  document's report-before-ack. Report-first let a lock-lost worker's stale
+  result poison the flow (its rejected ack meant the child re-ran, but its
+  report had already won the row first-writer-wins). Ack-first means only
+  the run that owns the lock reports; when a report then fails to deliver,
+  the sweeper synthesizes it from the child's own terminal record, so
+  children keep completing through parent-store outages, which this
+  document had deferred to the v2 outbox.
+- **Sweep fairness**: `flowSweepWork` re-arms the eligibility timestamp of
+  every reconcile row it returns, so pages rotate instead of pinning their
+  head (healthy in-flight children and rows a given sweeper cannot act on
+  no longer starve the rows behind them). Redis also purges staged
+  orphans (rows whose parent went terminal without ever landing a
+  manifest) during the sweep.
+- **Retention vs cascades**: automatic pruning (keep policies, historyTtl)
+  skips a settled parent whose rows still owe cascade cancels: those rows
+  are the only record that cancels are due in the child stores. `remove`
+  stays an operator override.
 
 ## Goal
 

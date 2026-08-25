@@ -18,11 +18,19 @@
  */
 import * as JobStore from "../JobStore.ts"
 import type { PgClient } from "@effect/sql-pg"
-import { asc, eq, getTableColumns, sql } from "drizzle-orm"
+import { asc, eq, getTableColumns, type SQL, sql } from "drizzle-orm"
 import * as PgDrizzle from "drizzle-orm/effect-postgres"
 import { getTableConfig } from "drizzle-orm/pg-core"
-import { Clock, type Context, Deferred, Duration, Effect, Layer, Option, type Scope, Stream } from "effect"
-import type { MqDedupeTable, MqJobAttemptsTable, MqJobsTable, MqQueueControlTable, MqSchedulesTable } from "./schema.ts"
+import { Cause, Clock, type Context, Deferred, Duration, Effect, Layer, Option, Predicate, type Scope, Stream } from "effect"
+import type {
+  MqDedupeTable,
+  MqFlowChildrenTable,
+  MqFlowOutboxTable,
+  MqJobAttemptsTable,
+  MqJobsTable,
+  MqQueueControlTable,
+  MqSchedulesTable
+} from "./schema.ts"
 
 const { JobId } = JobStore
 
@@ -40,6 +48,10 @@ export interface DrizzleJobStoreOptions<StoreId = JobStore.JobStore> {
   readonly queues: MqQueueControlTable
   /** The dedup-key registry table (from `mqDedupe`). */
   readonly dedupe: MqDedupeTable
+  /** The flow dependency-rows table (from `mqFlowChildren`). */
+  readonly flowChildren: MqFlowChildrenTable
+  /** The child-report outbox table (from `mqFlowOutbox`). */
+  readonly flowOutbox: MqFlowOutboxTable
   /**
    * Values for columns added via `mqJobs({ extend })`, evaluated at enqueue
    * (and on dedupe `replace`). Keys are the extended columns' TS names.
@@ -84,6 +96,50 @@ export type ExtraColumnValue = string | number | boolean | Date | null
 const storeError = (message: string) => (cause: unknown) =>
   new JobStore.JobStoreError({ message, cause })
 
+// The exact spellings a bigserial ever produces: no leading zeros, no signs,
+// no whitespace — what outbox ids look like and nothing Postgres would
+// silently normalize into one.
+const CANONICAL_BIGSERIAL = /^[1-9]\d*$/
+
+/**
+ * Whether an error surfaced by drizzle's Effect driver is a Postgres
+ * deadlock (40P01), i.e. safe to retry.
+ *
+ * The deadlock travels wrapped: drizzle's session fails with an
+ * `EffectDrizzleQueryError` whose `cause` field is `Cause.fail(SqlError)`
+ * (drizzle-orm `pg-core/effect/session.ts`), and `@effect/sql-pg` classifies
+ * pg code 40P01 into the `SqlError`'s `reason: DeadlockError` (PgClient.ts
+ * `classifyError`). Neither layer's `toString` renders the pg code, so this
+ * unwraps structurally instead of string-matching the rendered error.
+ *
+ * @internal
+ */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- a retry-predicate classifier over whatever the driver threw IS the boundary parser
+export const isDeadlockError = (error: unknown): boolean => {
+  // Unwrap drizzle's envelope: its `cause` is an Effect Cause holding the
+  // original failure. A bare SqlError (non-drizzle path) passes through.
+  const unwrapped = Predicate.hasProperty(error, "cause") && Cause.isCause(error.cause)
+    ? Option.getOrUndefined(Cause.findErrorOption(error.cause))
+    : error
+  if (
+    !Predicate.hasProperty(unwrapped, "_tag") || unwrapped._tag !== "SqlError" ||
+    !Predicate.hasProperty(unwrapped, "reason")
+  ) {
+    return false
+  }
+  const reason = unwrapped.reason
+  if (Predicate.hasProperty(reason, "_tag") && reason._tag === "DeadlockError") {
+    return true
+  }
+  // Fallback for classifiers that missed the code: the reason keeps the raw
+  // pg error, whose message for 40P01 is "deadlock detected".
+  if (Predicate.hasProperty(reason, "cause")) {
+    const raw = String(reason.cause)
+    return raw.includes("40P01") || raw.includes("deadlock detected")
+  }
+  return false
+}
+
 /**
  * drizzle's Effect driver types raw `execute` results as row arrays, but at
  * runtime the raw path yields the node-postgres `QueryResult` envelope
@@ -114,6 +170,12 @@ type JobRow = {
   readonly cancelRequested: boolean
   readonly dedupeKey: string | null
   readonly trace: JobStore.TraceContext | null
+  readonly parent: JobStore.ParentEnvelope | null
+  readonly flowFailFast: boolean | null
+  readonly flowPending: number | null
+  readonly flowCompleted: number | null
+  readonly flowFailed: number | null
+  readonly flowCancelled: number | null
   readonly runAt: Date
   readonly enqueuedAt: Date
   readonly processedAt: Date | null
@@ -175,12 +237,48 @@ const toRecord = (row: JobRow): JobStore.JobRecord => ({
   cancelRequested: row.cancelRequested,
   dedupeKey: row.dedupeKey ?? undefined,
   trace: row.trace ?? undefined,
+  parent: row.parent ?? undefined,
+  // The flow columns are NULL together; `flowPending` is the presence marker.
+  flow: row.flowPending === null || row.flowPending === undefined
+    ? undefined
+    : {
+      failFast: row.flowFailFast === true,
+      pending: Number(row.flowPending),
+      completed: Number(row.flowCompleted ?? 0),
+      failed: Number(row.flowFailed ?? 0),
+      cancelled: Number(row.flowCancelled ?? 0)
+    },
   runAt: row.runAt.getTime(),
   enqueuedAt: row.enqueuedAt.getTime(),
   processedAt: row.processedAt?.getTime(),
   finishedAt: row.finishedAt?.getTime(),
   exit: row.exit ?? undefined,
   failedReason: row.failedReason ?? undefined
+})
+
+type FlowChildRow = {
+  readonly flowId: string
+  readonly childKey: string
+  readonly name: string
+  readonly storeKey: string
+  /** Projected from `spec->>'id'` (never NULL: the FanOut ack validated it). */
+  readonly childJobId: string
+  readonly status: JobStore.FlowChildRecord["status"]
+  readonly exit: unknown
+  readonly failedReason: string | null
+  readonly cascaded: boolean
+}
+
+const toFlowChildRecord = (row: FlowChildRow): JobStore.FlowChildRecord => ({
+  flowId: JobId(row.flowId),
+  childKey: row.childKey,
+  name: row.name,
+  storeKey: row.storeKey,
+  childJobId: JobId(row.childJobId),
+  status: row.status,
+  exit: row.exit ?? undefined,
+  failedReason: row.failedReason ?? undefined,
+  cascaded: row.cascaded
 })
 
 /**
@@ -200,6 +298,8 @@ export const make = (
     const schedules = options.schedules
     const queues = options.queues
     const dedupe = options.dedupe
+    const flowChildren = options.flowChildren
+    const flowOutbox = options.flowOutbox
     const jobsName = getTableConfig(jobs).name
     const attemptsName = getTableConfig(attempts).name
     const wakeChannel = `effect_mq_wake_${jobsName}`
@@ -225,6 +325,12 @@ export const make = (
       "cancelRequested",
       "dedupeKey",
       "trace",
+      "parent",
+      "flowFailFast",
+      "flowPending",
+      "flowCompleted",
+      "flowFailed",
+      "flowCancelled",
       "runAt",
       "enqueuedAt",
       "processedAt",
@@ -263,7 +369,9 @@ export const make = (
         db.select({ jobId: attempts.jobId }).from(attempts).limit(0),
         db.select({ key: schedules.key }).from(schedules).limit(0),
         db.select({ queue: queues.queue }).from(queues).limit(0),
-        db.select({ key: dedupe.key }).from(dedupe).limit(0)
+        db.select({ key: dedupe.key }).from(dedupe).limit(0),
+        db.select({ flowId: flowChildren.flowId }).from(flowChildren).limit(0),
+        db.select({ id: flowOutbox.id }).from(flowOutbox).limit(0)
       ]).pipe(
         Effect.mapError(storeError(
           `effect-mq: tables "${jobsName}"/"${attemptsName}" are missing or mismatched — ` +
@@ -324,6 +432,28 @@ export const make = (
       Effect.forever,
       Effect.forkScoped
     )
+    // Automatic retention (the store-level sweep and per-job `keep`) never
+    // prunes a flow parent that still owes cascade cancels: its dependency
+    // rows marked `cancelled` and not `cascaded` are the only record that
+    // real cancels are still due in the child stores. The explicit `remove`
+    // verb is not exempted.
+    const owesCascades = sql`EXISTS (
+      SELECT 1 FROM ${flowChildren}
+      WHERE ${flowChildren.flowId} = ${jobs.id}
+        AND ${flowChildren.status} = 'cancelled' AND ${flowChildren.cascaded} = FALSE
+    )`
+    // A pruned flow parent's dependency rows go with it in the same statement.
+    const purgeJobsWhere = (predicate: SQL) =>
+      sql`
+        WITH deleted AS (
+          DELETE FROM ${jobs}
+          WHERE ${predicate}
+          RETURNING ${jobs.id} AS id
+        )
+        DELETE FROM ${flowChildren}
+        WHERE ${flowChildren.flowId} IN (SELECT id FROM deleted)
+      `
+
     if (options.historyTtl !== undefined) {
       const ttlByState = JobStore.normalizeHistoryTtl(options.historyTtl)
       const sweepMs = Duration.toMillis(options.historySweepInterval ?? "1 minute")
@@ -334,9 +464,8 @@ export const make = (
         // job name is pruned on the timer, not only when its group is acked.
         for (const state of ["completed", "failed", "cancelled"] as const) {
           const ttl = ttlByState[state]
-          yield* db.execute(sql`
-            DELETE FROM ${jobs}
-            WHERE ${jobs.state} = ${state} AND (
+          yield* db.execute(purgeJobsWhere(sql`
+            ${jobs.state} = ${state} AND NOT ${owesCascades} AND (
               ${ttl !== undefined ? sql`${jobs.finishedAt} <= ${new Date(now.getTime() - ttl)}` : sql`FALSE`}
               OR (
                 COALESCE(
@@ -351,7 +480,7 @@ export const make = (
                         ELSE ${jobs.keep}->>'ageMs' END
                     )::double precision) / 1000.0))
             )
-          `)
+          `))
         }
         // Dead dedup rows: expired windows, or pointers at vanished jobs.
         yield* db.execute(sql`
@@ -359,7 +488,7 @@ export const make = (
           WHERE (${dedupe.windowExpiresAt} IS NOT NULL AND ${dedupe.windowExpiresAt} <= ${now})
              OR (${dedupe.windowExpiresAt} IS NULL AND NOT EXISTS (
                SELECT 1 FROM ${jobs} WHERE ${jobs.id} = ${dedupe.jobId}
-                 AND ${jobs.state} IN ('waiting', 'delayed', 'active')
+                 AND ${jobs.state} IN ('waiting', 'delayed', 'active', 'waiting-children')
              ))
         `)
       }).pipe(
@@ -433,23 +562,23 @@ export const make = (
         const keep = keepPolicyFor(row.keep, row.state)
         if (keep === undefined) return
         if (keep.ageMs !== undefined) {
-          yield* tx.execute(sql`
-            DELETE FROM ${jobs}
-            WHERE ${jobs.name} = ${row.name} AND ${jobs.state} = ${row.state}
+          yield* tx.execute(purgeJobsWhere(sql`
+            ${jobs.name} = ${row.name} AND ${jobs.state} = ${row.state}
               AND ${jobs.finishedAt} <= ${new Date(now.getTime() - keep.ageMs)}
-          `)
+              AND NOT ${owesCascades}
+          `))
         }
         if (keep.count !== undefined) {
-          yield* tx.execute(sql`
-            DELETE FROM ${jobs}
-            WHERE ${jobs.name} = ${row.name} AND ${jobs.state} = ${row.state}
+          yield* tx.execute(purgeJobsWhere(sql`
+            ${jobs.name} = ${row.name} AND ${jobs.state} = ${row.state}
               AND ${jobs.id} NOT IN (
                 SELECT ${jobs.id} FROM ${jobs}
                 WHERE ${jobs.name} = ${row.name} AND ${jobs.state} = ${row.state}
                 ORDER BY ${jobs.finishedAt} DESC, ${jobs.seq} DESC
                 LIMIT ${keep.count}
               )
-          `)
+              AND NOT ${owesCascades}
+          `))
         }
       })
 
@@ -495,7 +624,7 @@ export const make = (
             : sql`'j-' || ${seqExpr}::text`
           const rows = rowsOf(yield* exec.execute<{ id: string }>(sql`
             INSERT INTO ${jobs} (id, name, queue, state, priority, payload, metadata,
-              attempts_max, backoff, keep, timeout_ms, dedupe_key, trace, run_at, enqueued_at${extraColumnNames})
+              attempts_max, backoff, keep, timeout_ms, dedupe_key, trace, parent, run_at, enqueued_at${extraColumnNames})
             VALUES (${idExpr}, ${request.name}, ${request.queue}, ${state}, ${request.priority},
               ${JSON.stringify(request.payload ?? null)}::jsonb, ${JSON.stringify(request.metadata)}::jsonb,
               ${request.attemptsMax},
@@ -503,6 +632,7 @@ export const make = (
               ${request.keep === undefined ? null : JSON.stringify(request.keep)}::jsonb,
               ${request.timeoutMs ?? null}, ${request.dedupe?.key ?? null},
               ${request.trace === undefined ? null : JSON.stringify(request.trace)}::jsonb,
+              ${request.parent === undefined ? null : JSON.stringify(request.parent)}::jsonb,
               ${runAt}, ${now}${extraColumnValues(request)})
             ON CONFLICT (id) DO NOTHING
             RETURNING ${jobs.id} AS id
@@ -633,7 +763,7 @@ export const make = (
         // killed and safe to retry.
         Effect.retry({
           times: 3,
-          while: (error) => String(error).includes("40P01") || String(error).includes("deadlock detected")
+          while: isDeadlockError
         }),
         Effect.mapError((error) =>
           error instanceof JobStore.JobStoreError ? error : storeError("enqueue failed")(error)
@@ -658,59 +788,139 @@ export const make = (
             AND (${dedupe.windowExpiresAt} IS NULL OR ${dedupe.windowExpiresAt} <= ${now})
         `).pipe(Effect.asVoid)
 
+    // The outbox invariant: every operation that moves a job carrying a
+    // `parent` envelope INTO a terminal state appends its report here in the
+    // same transaction (see `JobStore.OutboxEntry`). `exit`/`failedReason`
+    // mirror the job row AFTER the transition; JSON.stringify drops
+    // undefined fields so absent values read back as undefined.
+    const appendOutbox = (
+      exec: Pick<Db, "execute">,
+      parent: JobStore.ParentEnvelope | null | undefined,
+      outcome: JobStore.FlowChildReport["outcome"],
+      exit: JobStore.FlowChildReport["exit"],
+      failedReason: string | null | undefined
+    ) =>
+      parent === null || parent === undefined
+        ? Effect.void
+        : exec.execute(sql`
+          INSERT INTO ${flowOutbox} (flow_name, parent_store_key, report)
+          VALUES (${parent.flowName}, ${parent.parentStoreKey}, ${
+          JSON.stringify({
+            flowId: parent.flowId,
+            childKey: parent.childKey,
+            outcome,
+            exit,
+            failedReason: failedReason ?? undefined
+          })
+        }::jsonb)
+        `).pipe(Effect.asVoid)
+
+    // Flip a flow's still-pending dependency rows to `cancelled` and NOT
+    // `cascaded` (the sweeper still owes the child stores real cancels).
+    // Embedded as a CTE body so the caller can count the marked rows into
+    // the parent's `cancelled` counter in the same statement.
+    const cancelPendingChildren = (flowId: string) =>
+      sql`
+        UPDATE ${flowChildren} SET status = 'cancelled', cascaded = FALSE
+        WHERE ${flowChildren.flowId} = ${flowId} AND ${flowChildren.status} = 'pending'
+        RETURNING 1
+      `
+
     // Shared by cancel and cancelByDedupe.
     const cancelJob = (id: JobStore.JobId) =>
       db.transaction((tx) =>
-          Effect.gen(function*() {
-            const now = yield* nowDate
-            // One guarded statement: waiting/delayed become terminal, active
-            // gets the cancel-request flag; anything else is reported by state.
-            const rows = rowsOf(yield* tx.execute<
-              {
-                id: string
-                state: string
-                processedAt: Date | null
-                name: string
-                keep: JobStore.KeepPolicy | null
-                dedupeKey: string | null
-              }
-            >(sql`
-              UPDATE ${jobs} SET
-                state = CASE WHEN ${jobs.state} IN ('waiting', 'delayed') THEN 'cancelled' ELSE ${jobs.state} END,
-                finished_at = CASE WHEN ${jobs.state} IN ('waiting', 'delayed') THEN ${now}::timestamptz ELSE ${jobs.finishedAt} END,
-                cancel_requested = CASE WHEN ${jobs.state} = 'active' THEN TRUE ELSE ${jobs.cancelRequested} END
-              WHERE ${jobs.id} = ${id} AND ${jobs.state} IN ('waiting', 'delayed', 'active')
-              RETURNING ${jobs.id} AS id, ${jobs.state} AS state,
-                ${jobs.processedAt} AS "processedAt", ${jobs.name} AS "name", ${jobs.keep} AS "keep",
-                ${jobs.dedupeKey} AS "dedupeKey"
+        Effect.gen(function*() {
+          const now = yield* nowDate
+          // Contract lock order (dependency rows first, parent second): mark
+          // a waiting-children parent's remaining pending rows cancelled.
+          // Pending rows exist only while the parent is `waiting-children`,
+          // so this is a no-op for every other state; a non-cancellable
+          // parent rolls the transaction back anyway.
+          const firstPass = rowsOf(yield* tx.execute<{ marked: number }>(sql`
+            WITH marked AS (${cancelPendingChildren(id)})
+            SELECT count(*)::int AS marked FROM marked
+          `))
+          const preMarked = firstPass[0]?.marked ?? 0
+          // One guarded statement: waiting/delayed/waiting-children become
+          // terminal, active gets the cancel-request flag; anything else is
+          // reported by state.
+          const rows = rowsOf(yield* tx.execute<
+            {
+              id: string
+              state: string
+              processedAt: Date | null
+              name: string
+              keep: JobStore.KeepPolicy | null
+              dedupeKey: string | null
+              hasFlow: boolean
+              parent: JobStore.ParentEnvelope | null
+              exit: unknown
+              failedReason: string | null
+            }
+          >(sql`
+            UPDATE ${jobs} SET
+              state = CASE WHEN ${jobs.state} IN ('waiting', 'delayed', 'waiting-children') THEN 'cancelled' ELSE ${jobs.state} END,
+              finished_at = CASE WHEN ${jobs.state} IN ('waiting', 'delayed', 'waiting-children') THEN ${now}::timestamptz ELSE ${jobs.finishedAt} END,
+              flow_pending = CASE WHEN ${jobs.state} = 'waiting-children' THEN 0 ELSE ${jobs.flowPending} END,
+              cancel_requested = CASE WHEN ${jobs.state} = 'active' THEN TRUE ELSE ${jobs.cancelRequested} END
+            WHERE ${jobs.id} = ${id} AND ${jobs.state} IN ('waiting', 'delayed', 'active', 'waiting-children')
+            RETURNING ${jobs.id} AS id, ${jobs.state} AS state,
+              ${jobs.processedAt} AS "processedAt", ${jobs.name} AS "name", ${jobs.keep} AS "keep",
+              ${jobs.dedupeKey} AS "dedupeKey", (${jobs.flowPending} IS NOT NULL) AS "hasFlow",
+              ${jobs.parent} AS "parent", ${jobs.exit} AS "exit", ${jobs.failedReason} AS "failedReason"
+          `))
+          const row = rows[0]
+          if (row === undefined) {
+            const existing = rowsOf(yield* tx.execute<{ state: JobStore.JobState }>(sql`
+              SELECT ${jobs.state} AS state FROM ${jobs} WHERE ${jobs.id} = ${id}
             `))
-            const row = rows[0]
-            if (row === undefined) {
-              const existing = rowsOf(yield* tx.execute<{ state: JobStore.JobState }>(sql`
-                SELECT ${jobs.state} AS state FROM ${jobs} WHERE ${jobs.id} = ${id}
-              `))
-              const found = existing[0]
-              if (found === undefined) {
-                return yield* new JobStore.JobNotFoundError({ jobId: id })
-              }
-              return yield* new JobStore.JobNotCancellableError({ jobId: id, state: found.state })
+            const found = existing[0]
+            if (found === undefined) {
+              return yield* new JobStore.JobNotFoundError({ jobId: id })
             }
-            if (row.state === "cancelled") {
-              yield* insertAttempt(tx, id, "cancelled", row.processedAt, now, undefined)
-              yield* releaseDedupe(tx, row.name, row.dedupeKey, id, now)
-              yield* applyKeep(tx, { name: row.name, state: "cancelled", keep: row.keep }, now)
+            return yield* new JobStore.JobNotCancellableError({ jobId: id, state: found.state })
+          }
+          if (row.state === "cancelled") {
+            if (row.hasFlow) {
+              // Re-run the marking now that the parent lock is held: the
+              // first UPDATE above races a concurrent FanOut — its
+              // uncommitted dependency-row INSERTs are invisible, while
+              // this UPDATE's own EPQ re-check can still see the parent as
+              // 'waiting-children' after the FanOut commits. Without this
+              // pass those rows would stay 'pending' forever, invisible to
+              // both sweep classes. Every row either pass marked lands in
+              // the `cancelled` counter.
+              yield* tx.execute(sql`
+                WITH marked AS (${cancelPendingChildren(id)})
+                UPDATE ${jobs} SET flow_cancelled = ${jobs.flowCancelled} + ${preMarked}::int
+                  + (SELECT count(*)::int FROM marked)
+                WHERE ${jobs.id} = ${id}
+              `)
             }
-          })
-        ).pipe(
-          Effect.mapError((error) =>
-            error instanceof JobStore.JobNotFoundError ||
-              error instanceof JobStore.JobNotCancellableError ||
-              error instanceof JobStore.JobStoreError
-              ? error
-              : storeError("cancel failed")(error)
-          ),
-          Effect.asVoid
-        )
+            yield* insertAttempt(tx, id, "cancelled", row.processedAt, now, undefined)
+            // A cancelled child reports upward through the outbox.
+            yield* appendOutbox(tx, row.parent, "cancelled", row.exit ?? undefined, row.failedReason)
+            yield* releaseDedupe(tx, row.name, row.dedupeKey, id, now)
+            yield* applyKeep(tx, { name: row.name, state: "cancelled", keep: row.keep }, now)
+          }
+        })
+      ).pipe(
+        // Rare lock-order inversion (this row-then-parent flip vs a
+        // fail-fast settle's parent-then-rows marking) surfaces as a
+        // Postgres deadlock (40P01); one side is killed and safe to retry.
+        Effect.retry({
+          times: 3,
+          while: isDeadlockError
+        }),
+        Effect.mapError((error) =>
+          error instanceof JobStore.JobNotFoundError ||
+            error instanceof JobStore.JobNotCancellableError ||
+            error instanceof JobStore.JobStoreError
+            ? error
+            : storeError("cancel failed")(error)
+        ),
+        Effect.asVoid
+      )
 
     const enqueueOne = (request: JobStore.EnqueueRequest) =>
       Effect.gen(function*() {
@@ -800,11 +1010,12 @@ export const make = (
                 ${request.keep === undefined ? null : JSON.stringify(request.keep)}::jsonb,
                 ${request.timeoutMs ?? null}, ${request.dedupe?.key ?? null},
                 ${request.trace === undefined ? null : JSON.stringify(request.trace)}::jsonb,
+                ${request.parent === undefined ? null : JSON.stringify(request.parent)}::jsonb,
                 ${new Date(now.getTime() + Math.max(0, request.delayMs))}, ${now}${extraColumnValues(request)})`
             )
             const rows = rowsOf(yield* db.execute<{ id: string }>(sql`
               INSERT INTO ${jobs} (id, name, queue, state, priority, payload, metadata,
-                attempts_max, backoff, keep, timeout_ms, dedupe_key, trace, run_at, enqueued_at${extraColumnNames})
+                attempts_max, backoff, keep, timeout_ms, dedupe_key, trace, parent, run_at, enqueued_at${extraColumnNames})
               VALUES ${sql.join(values, sql`, `)}
               ON CONFLICT (id) DO NOTHING
               RETURNING ${jobs.id} AS id
@@ -843,6 +1054,123 @@ export const make = (
           resolved.push(result)
         }
         return resolved
+      })
+
+    // The FanOut ack: land the manifest (flow columns + dependency rows) and
+    // park the parent, all lock-token-guarded in one transaction. A fan-out
+    // is a phase transition, not a completed run — `attempts_made` is not
+    // incremented; the ledger records `fanned-out` with no exit.
+    const ackFanOut = (
+      id: JobStore.JobId,
+      token: string,
+      outcome: Extract<JobStore.AckOutcome, { _tag: "FanOut" }>
+    ): Effect.Effect<void, JobStore.JobStoreError | JobStore.JobNotFoundError | JobStore.LockLostError> =>
+      Effect.gen(function*() {
+        // Validate BEFORE any mutation, so a bad spec cannot leave the job
+        // half-acked (lock cleared, ledger written, still active).
+        if (outcome.children.some((child) => child.request.id === undefined)) {
+          return yield* new JobStore.JobStoreError({
+            message: "FanOut child specs require an explicit request.id"
+          })
+        }
+        const wakeQueue = yield* db.transaction((tx) =>
+          Effect.gen(function*() {
+            const now = yield* nowDate
+            const rows = rowsOf(yield* tx.execute<
+              {
+                processedAt: Date | null
+                name: string
+                keep: JobStore.KeepPolicy | null
+                dedupeKey: string | null
+                queue: string
+                cancelRequested: boolean
+                flowPending: number | null
+                parent: JobStore.ParentEnvelope | null
+                exit: unknown
+                failedReason: string | null
+              }
+            >(sql`
+              UPDATE ${jobs} SET lock_token = NULL, lock_expires_at = NULL
+              WHERE ${jobs.id} = ${id} AND ${jobs.state} = 'active' AND ${jobs.lockToken} = ${token}
+              RETURNING ${jobs.processedAt} AS "processedAt", ${jobs.name} AS "name",
+                ${jobs.keep} AS "keep", ${jobs.dedupeKey} AS "dedupeKey", ${jobs.queue} AS "queue",
+                ${jobs.cancelRequested} AS "cancelRequested", ${jobs.flowPending} AS "flowPending",
+                ${jobs.parent} AS "parent", ${jobs.exit} AS "exit", ${jobs.failedReason} AS "failedReason"
+            `))
+            const row = rows[0]
+            if (row === undefined) {
+              return yield* explainMiss(id)
+            }
+            yield* insertAttempt(tx, id, "fanned-out", row.processedAt, now, undefined)
+            let pending: number
+            if (row.flowPending === null || row.flowPending === undefined) {
+              pending = outcome.children.length
+              yield* tx.execute(sql`
+                UPDATE ${jobs} SET flow_fail_fast = ${outcome.failFast}, flow_pending = ${pending},
+                  flow_completed = 0, flow_failed = 0, flow_cancelled = 0
+                WHERE ${jobs.id} = ${id}
+              `)
+              // Chunked multi-row VALUES, like enqueueMany's insertBatch.
+              for (let start = 0; start < outcome.children.length; start += 500) {
+                const chunk = outcome.children.slice(start, start + 500)
+                const values = chunk.map((child) =>
+                  sql`(${id}, ${child.childKey}, ${child.request.name}, ${child.storeKey},
+                    ${JSON.stringify(child.request)}::jsonb, 'pending', NULL, NULL, FALSE, ${now})`
+                )
+                yield* tx.execute(sql`
+                  INSERT INTO ${flowChildren} (flow_id, child_key, name, store_key, spec,
+                    status, exit, failed_reason, cascaded, pending_since)
+                  VALUES ${sql.join(values, sql`, `)}
+                `)
+              }
+            } else {
+              // A manifest that was already present is kept untouched (double
+              // fan-out converges on the persisted children); the state
+              // transition follows the persisted pending count either way.
+              pending = Number(row.flowPending)
+            }
+            if (row.cancelRequested) {
+              // A cancel raced the fan-out: cancellation wins. The rows exist
+              // and get marked (into the `cancelled` counter), so the sweeper
+              // cascades (mostly no-op cancels for never-enqueued children).
+              yield* tx.execute(sql`
+                WITH marked AS (${cancelPendingChildren(id)})
+                UPDATE ${jobs} SET state = 'cancelled', finished_at = ${now},
+                  cancel_requested = FALSE, flow_pending = 0,
+                  flow_cancelled = ${jobs.flowCancelled} + (SELECT count(*)::int FROM marked)
+                WHERE ${jobs.id} = ${id}
+              `)
+              yield* insertAttempt(tx, id, "cancelled", row.processedAt, now, undefined)
+              // A cancelled NESTED parent reports upward through the outbox.
+              yield* appendOutbox(tx, row.parent, "cancelled", row.exit ?? undefined, row.failedReason)
+              yield* releaseDedupe(tx, row.name, row.dedupeKey, id, now)
+              yield* applyKeep(tx, { name: row.name, state: "cancelled", keep: row.keep }, now)
+              return undefined
+            }
+            if (pending > 0) {
+              yield* tx.execute(sql`
+                UPDATE ${jobs} SET state = 'waiting-children' WHERE ${jobs.id} = ${id}
+              `)
+              return undefined
+            }
+            // Empty (or fully recorded) manifest: straight to runnable collect.
+            yield* tx.execute(sql`
+              UPDATE ${jobs} SET state = 'waiting', run_at = ${now}, seq = ${seqExpr}
+              WHERE ${jobs.id} = ${id}
+            `)
+            return JobStore.QueueName(row.queue)
+          })
+        ).pipe(
+          Effect.mapError((error) =>
+            error instanceof JobStore.JobNotFoundError || error instanceof JobStore.LockLostError ||
+              error instanceof JobStore.JobStoreError
+              ? error
+              : storeError("ack failed")(error)
+          )
+        )
+        if (wakeQueue !== undefined) {
+          yield* wakeUp(wakeQueue)
+        }
       })
 
     const store: JobStore.Service = {
@@ -919,7 +1247,10 @@ export const make = (
                 ${jobs.stalledCount} AS "stalledCount", ${jobs.backoff} AS "backoff",
                 ${jobs.keep} AS "keep", ${jobs.timeoutMs} AS "timeoutMs",
                 ${jobs.cancelRequested} AS "cancelRequested", ${jobs.dedupeKey} AS "dedupeKey",
-                ${jobs.trace} AS "trace",
+                ${jobs.trace} AS "trace", ${jobs.parent} AS "parent",
+                ${jobs.flowFailFast} AS "flowFailFast", ${jobs.flowPending} AS "flowPending",
+                ${jobs.flowCompleted} AS "flowCompleted", ${jobs.flowFailed} AS "flowFailed",
+                ${jobs.flowCancelled} AS "flowCancelled",
                 ${jobs.runAt} AS "runAt", ${jobs.enqueuedAt} AS "enqueuedAt",
                 ${jobs.processedAt} AS "processedAt", ${jobs.finishedAt} AS "finishedAt",
                 ${jobs.exit} AS "exit", ${jobs.failedReason} AS "failedReason"
@@ -946,8 +1277,11 @@ export const make = (
           error instanceof JobStore.JobStoreError ? error : storeError("claim failed")(error)
         )),
 
-      ack: (id, token, outcome) =>
-        db.transaction((tx) =>
+      ack: (id, token, outcome) => {
+        if (outcome._tag === "FanOut") {
+          return ackFanOut(id, token, outcome)
+        }
+        return db.transaction((tx) =>
           Effect.gen(function*() {
             const now = yield* nowDate
             const update = outcome._tag === "Complete"
@@ -973,6 +1307,9 @@ export const make = (
                 keep: JobStore.KeepPolicy | null
                 dedupeKey: string | null
                 queue: string
+                parent: JobStore.ParentEnvelope | null
+                exit: unknown
+                failedReason: string | null
               }
             >(sql`
               UPDATE ${jobs} SET ${update},
@@ -980,7 +1317,8 @@ export const make = (
               WHERE ${jobs.id} = ${id} AND ${jobs.state} = 'active' AND ${jobs.lockToken} = ${token}
               RETURNING ${jobs.processedAt} AS "processedAt", ${jobs.name} AS "name",
                 ${jobs.state} AS "state", ${jobs.keep} AS "keep", ${jobs.dedupeKey} AS "dedupeKey",
-                ${jobs.queue} AS "queue"
+                ${jobs.queue} AS "queue", ${jobs.parent} AS "parent", ${jobs.exit} AS "exit",
+                ${jobs.failedReason} AS "failedReason"
             `))
             const row = rows[0]
             if (row === undefined) {
@@ -1003,6 +1341,15 @@ export const make = (
               outcome._tag === "Cancelled" || cancelledRetry ? undefined : outcome.exit
             )
             if (outcome._tag !== "Retry" || cancelledRetry) {
+              // A terminal transition of an envelope-carrying child reports
+              // upward through the outbox (exit/failedReason as persisted).
+              yield* appendOutbox(
+                tx,
+                row.parent,
+                ledgerOutcome === "retried" ? "cancelled" : ledgerOutcome,
+                row.exit ?? undefined,
+                row.failedReason
+              )
               yield* releaseDedupe(tx, row.name, row.dedupeKey, id, now)
               yield* applyKeep(tx, row, now)
             }
@@ -1019,7 +1366,8 @@ export const make = (
           ),
           Effect.tap((queue) => queue !== undefined ? wakeUp(queue) : Effect.void),
           Effect.asVoid
-        ),
+        )
+      },
 
       release: (id, token) =>
         Effect.gen(function*() {
@@ -1037,6 +1385,9 @@ export const make = (
                   keep: JobStore.KeepPolicy | null
                   dedupeKey: string | null
                   queue: string
+                  parent: JobStore.ParentEnvelope | null
+                  exit: unknown
+                  failedReason: string | null
                 }
               >(sql`
                 UPDATE ${jobs} SET
@@ -1047,12 +1398,15 @@ export const make = (
                 WHERE ${jobs.id} = ${id} AND ${jobs.state} = 'active' AND ${jobs.lockToken} = ${token}
                 RETURNING ${jobs.id} AS id, (${jobs.state} = 'cancelled') AS cancelled,
                   ${jobs.processedAt} AS "processedAt", ${jobs.name} AS "name", ${jobs.keep} AS "keep",
-                  ${jobs.dedupeKey} AS "dedupeKey", ${jobs.queue} AS "queue"
+                  ${jobs.dedupeKey} AS "dedupeKey", ${jobs.queue} AS "queue",
+                  ${jobs.parent} AS "parent", ${jobs.exit} AS "exit", ${jobs.failedReason} AS "failedReason"
               `))
               const row = rows[0]
               if (row === undefined) return undefined
               if (row.cancelled) {
                 yield* insertAttempt(tx, id, "cancelled", row.processedAt, now, undefined)
+                // A cancel honoured at release is a terminal transition too.
+                yield* appendOutbox(tx, row.parent, "cancelled", row.exit ?? undefined, row.failedReason)
                 yield* releaseDedupe(tx, row.name, row.dedupeKey, id, now)
                 yield* applyKeep(tx, { name: row.name, state: "cancelled", keep: row.keep }, now)
               }
@@ -1119,6 +1473,9 @@ export const make = (
                 name: string
                 keep: JobStore.KeepPolicy | null
                 dedupeKey: string | null
+                parent: JobStore.ParentEnvelope | null
+                exit: unknown
+                failedReason: string | null
               }
             >(sql`
               UPDATE ${jobs} SET
@@ -1139,7 +1496,8 @@ export const make = (
                 cancel_requested = FALSE
               WHERE ${jobs.state} = 'active' AND ${jobs.lockExpiresAt} <= ${now}::timestamptz
               RETURNING ${jobs.id} AS "id", ${jobs.state} AS "state", ${jobs.processedAt} AS "processedAt",
-                ${jobs.name} AS "name", ${jobs.keep} AS "keep", ${jobs.dedupeKey} AS "dedupeKey"
+                ${jobs.name} AS "name", ${jobs.keep} AS "keep", ${jobs.dedupeKey} AS "dedupeKey",
+                ${jobs.parent} AS "parent", ${jobs.exit} AS "exit", ${jobs.failedReason} AS "failedReason"
             `))
             const recovered: Array<{ id: JobStore.JobId; failed: boolean }> = []
             for (const row of rows) {
@@ -1152,6 +1510,15 @@ export const make = (
                 undefined
               )
               if (row.state === "cancelled" || row.state === "failed") {
+                // Honoured cancels and stall exhaustion are terminal
+                // transitions: envelope-carrying children report upward.
+                yield* appendOutbox(
+                  tx,
+                  row.parent,
+                  row.state === "cancelled" ? "cancelled" : "failed",
+                  row.exit ?? undefined,
+                  row.failedReason
+                )
                 yield* releaseDedupe(tx, row.name, row.dedupeKey, row.id, now)
               }
               if (row.state === "cancelled") {
@@ -1233,7 +1600,11 @@ export const make = (
               ${jobs.attemptsMax} AS "attemptsMax", ${jobs.attemptsMade} AS "attemptsMade",
               ${jobs.stalledCount} AS "stalledCount", ${jobs.backoff} AS "backoff",
               ${jobs.keep} AS "keep", ${jobs.timeoutMs} AS "timeoutMs",
-              ${jobs.cancelRequested} AS "cancelRequested",
+              ${jobs.cancelRequested} AS "cancelRequested", ${jobs.dedupeKey} AS "dedupeKey",
+              ${jobs.trace} AS "trace", ${jobs.parent} AS "parent",
+              ${jobs.flowFailFast} AS "flowFailFast", ${jobs.flowPending} AS "flowPending",
+              ${jobs.flowCompleted} AS "flowCompleted", ${jobs.flowFailed} AS "flowFailed",
+              ${jobs.flowCancelled} AS "flowCancelled",
               ${jobs.runAt} AS "runAt", ${jobs.enqueuedAt} AS "enqueuedAt",
               ${jobs.processedAt} AS "processedAt", ${jobs.finishedAt} AS "finishedAt",
               ${jobs.exit} AS "exit", ${jobs.failedReason} AS "failedReason"
@@ -1464,6 +1835,365 @@ export const make = (
           return fired
         }),
 
+      recordChildResults: (reports) =>
+        Effect.gen(function*() {
+          if (reports.length === 0) {
+            const none: Array<{ applied: boolean; parentSettled: boolean }> = []
+            return none
+          }
+          const batch = yield* db.transaction((tx) =>
+            Effect.gen(function*() {
+              const now = yield* nowDate
+              const results = reports.map(() => ({ applied: false, parentSettled: false }))
+
+              // Phase 1a — apply every row update (contract lock order:
+              // dependency rows FIRST, parents second). Only a (flow, key)'s
+              // first occurrence in the batch can apply — later duplicates
+              // would find the row non-pending anyway, and UPDATE ... FROM
+              // must never see two source rows for one target.
+              const candidates: Array<{ readonly index: number; readonly report: JobStore.FlowChildReport }> = []
+              const seen = new Set<string>()
+              for (const [index, report] of reports.entries()) {
+                const key = `${report.flowId}\u0000${report.childKey}`
+                if (seen.has(key)) continue
+                seen.add(key)
+                candidates.push({ index, report })
+              }
+              for (let start = 0; start < candidates.length; start += 200) {
+                const chunk = candidates.slice(start, start + 200)
+                const values = chunk.map(({ index, report }) =>
+                  sql`(${index}::int, ${report.flowId}::text, ${report.childKey}::text,
+                    ${report.outcome}::text,
+                    ${report.exit === undefined ? null : JSON.stringify(report.exit)}::jsonb,
+                    ${report.failedReason ?? null}::text)`
+                )
+                const appliedRows = rowsOf(yield* tx.execute<{ ord: number }>(sql`
+                  UPDATE ${flowChildren} SET status = v.outcome, exit = v.exit,
+                    failed_reason = v.failed_reason, cascaded = TRUE
+                  FROM (VALUES ${sql.join(values, sql`, `)})
+                    AS v(ord, flow_id, child_key, outcome, exit, failed_reason)
+                  WHERE ${flowChildren.flowId} = v.flow_id AND ${flowChildren.childKey} = v.child_key
+                    AND ${flowChildren.status} = 'pending'
+                  RETURNING v.ord AS "ord"
+                `))
+                for (const row of appliedRows) {
+                  const result = results[Number(row.ord)]
+                  if (result !== undefined) {
+                    result.applied = true
+                  }
+                }
+              }
+
+              // Tally the applied reports per touched flow, in batch order.
+              interface Touch {
+                appliedCount: number
+                completed: number
+                failed: number
+                cancelled: number
+                firstAppliedFailed: number | undefined
+                lastApplied: number
+              }
+              const touched = new Map<string, Touch>()
+              for (const [index, report] of reports.entries()) {
+                if (results[index]?.applied !== true) continue
+                const touch = touched.get(report.flowId) ?? {
+                  appliedCount: 0,
+                  completed: 0,
+                  failed: 0,
+                  cancelled: 0,
+                  firstAppliedFailed: undefined,
+                  lastApplied: index
+                }
+                touch.appliedCount += 1
+                touch.lastApplied = index
+                if (report.outcome === "completed") touch.completed += 1
+                if (report.outcome === "cancelled") touch.cancelled += 1
+                if (report.outcome === "failed") {
+                  touch.failed += 1
+                  touch.firstAppliedFailed ??= index
+                }
+                touched.set(report.flowId, touch)
+              }
+
+              // Phase 1b + 2 — per touched flow (sorted, so concurrent
+              // batches take parent locks in one order): move the applied
+              // children from `pending` to their outcome counters, then make
+              // at most one settle decision. Fail-fast wins the tie.
+              const wakeQueues: Array<JobStore.QueueName> = []
+              for (const flowId of [...touched.keys()].toSorted()) {
+                const touch = touched.get(flowId)
+                if (touch === undefined) continue
+                const parents = rowsOf(yield* tx.execute<
+                  {
+                    state: JobStore.JobState
+                    flowPending: number
+                    flowFailFast: boolean | null
+                    processedAt: Date | null
+                    name: string
+                    keep: JobStore.KeepPolicy | null
+                    dedupeKey: string | null
+                    queue: string
+                    parent: JobStore.ParentEnvelope | null
+                  }
+                >(sql`
+                  UPDATE ${jobs} SET
+                    flow_pending = GREATEST(${jobs.flowPending} - ${touch.appliedCount}::int, 0),
+                    flow_completed = ${jobs.flowCompleted} + ${touch.completed}::int,
+                    flow_failed = ${jobs.flowFailed} + ${touch.failed}::int,
+                    flow_cancelled = ${jobs.flowCancelled} + ${touch.cancelled}::int
+                  WHERE ${jobs.id} = ${flowId} AND ${jobs.flowPending} IS NOT NULL
+                  RETURNING ${jobs.state} AS "state", ${jobs.flowPending} AS "flowPending",
+                    ${jobs.flowFailFast} AS "flowFailFast", ${jobs.processedAt} AS "processedAt",
+                    ${jobs.name} AS "name", ${jobs.keep} AS "keep",
+                    ${jobs.dedupeKey} AS "dedupeKey", ${jobs.queue} AS "queue",
+                    ${jobs.parent} AS "parent"
+                `))
+                const parent = parents[0]
+                if (parent === undefined || parent.state !== "waiting-children") continue
+                const failedIndex = parent.flowFailFast === true ? touch.firstAppliedFailed : undefined
+                const failedReport = failedIndex !== undefined ? reports[failedIndex] : undefined
+                if (failedIndex !== undefined && failedReport !== undefined) {
+                  // The first applied failure settles the parent terminally
+                  // (store-side, like stall exhaustion: failedReason, no
+                  // exit) and marks the remaining rows in the same
+                  // transaction. A nested parent's own report goes to the
+                  // outbox here — this settle IS its terminal transition.
+                  const reason = `effect-mq: flow child "${failedReport.childKey}" failed`
+                  yield* tx.execute(sql`
+                    WITH marked AS (${cancelPendingChildren(flowId)})
+                    UPDATE ${jobs} SET state = 'failed', finished_at = ${now},
+                      failed_reason = ${reason}, cancel_requested = FALSE, flow_pending = 0,
+                      flow_cancelled = ${jobs.flowCancelled} + (SELECT count(*)::int FROM marked)
+                    WHERE ${jobs.id} = ${flowId}
+                  `)
+                  yield* insertAttempt(tx, flowId, "failed", parent.processedAt, now, undefined)
+                  yield* appendOutbox(tx, parent.parent, "failed", undefined, reason)
+                  yield* releaseDedupe(tx, parent.name, parent.dedupeKey, flowId, now)
+                  yield* applyKeep(tx, { name: parent.name, state: "failed", keep: parent.keep }, now)
+                  const decided = results[failedIndex]
+                  if (decided !== undefined) {
+                    decided.parentSettled = true
+                  }
+                  continue
+                }
+                if (Number(parent.flowPending) === 0) {
+                  // All children settled: the parent resumes runnable, phase
+                  // collect, settled at the flow's last applied report.
+                  yield* tx.execute(sql`
+                    UPDATE ${jobs} SET state = 'waiting', run_at = ${now}, seq = ${seqExpr}
+                    WHERE ${jobs.id} = ${flowId}
+                  `)
+                  wakeQueues.push(JobStore.QueueName(parent.queue))
+                  const decided = results[touch.lastApplied]
+                  if (decided !== undefined) {
+                    decided.parentSettled = true
+                  }
+                }
+              }
+              return { results, wakeQueues }
+            })
+          ).pipe(
+            // Rare lock-order inversion (a concurrent cancel/settle marking
+            // rows) surfaces as a Postgres deadlock (40P01); the killed side
+            // is safe to retry — the row-state guard keeps it idempotent.
+            Effect.retry({
+              times: 3,
+              while: isDeadlockError
+            }),
+            Effect.mapError((error) =>
+              error instanceof JobStore.JobStoreError ? error : storeError("recordChildResults failed")(error)
+            )
+          )
+          for (const queue of batch.wakeQueues) {
+            yield* wakeUp(queue)
+          }
+          return batch.results
+        }),
+
+      peekOutbox: (peekOptions) =>
+        Effect.gen(function*() {
+          const limit = Math.max(0, peekOptions.limit)
+          if (limit === 0) {
+            const none: Array<JobStore.OutboxEntry> = []
+            return none
+          }
+          // `after` pages past a previously returned id (exclusive), whether
+          // or not that entry still exists. Anything that is not a canonical
+          // id this store issued is treated as unset.
+          const after = peekOptions.after !== undefined && CANONICAL_BIGSERIAL.test(peekOptions.after)
+            ? peekOptions.after
+            : undefined
+          const rows = rowsOf(yield* db.execute<
+            {
+              id: string
+              flowName: string
+              parentStoreKey: string
+              report: JobStore.FlowChildReport
+            }
+          >(sql`
+            SELECT ${flowOutbox.id}::text AS "id", ${flowOutbox.flowName} AS "flowName",
+              ${flowOutbox.parentStoreKey} AS "parentStoreKey", ${flowOutbox.report} AS "report"
+            FROM ${flowOutbox}
+            ${after === undefined ? sql`` : sql`WHERE ${flowOutbox.id} > ${after}::bigint`}
+            ORDER BY ${flowOutbox.id} ASC
+            LIMIT ${limit}
+          `).pipe(Effect.mapError(storeError("peekOutbox failed"))))
+          return rows.map((row): JobStore.OutboxEntry => ({
+            id: row.id,
+            flowName: row.flowName,
+            parentStoreKey: row.parentStoreKey,
+            report: row.report
+          }))
+        }),
+
+      deleteOutbox: (ids) =>
+        Effect.suspend(() => {
+          // Ids are opaque strings to callers; only CANONICAL ids this store
+          // could have issued can match. The strictness matters twice: a
+          // foreign/garbled id must not blow up the ::bigint cast, and a
+          // non-canonical spelling ("007") must stay an unknown-id no-op
+          // rather than cast to 7 and delete a live entry.
+          const numeric = ids.filter((id) => CANONICAL_BIGSERIAL.test(id))
+          if (numeric.length === 0) return Effect.void
+          return db.execute(sql`
+            DELETE FROM ${flowOutbox}
+            WHERE ${flowOutbox.id} = ANY(${sql.param(numeric)}::bigint[])
+          `).pipe(
+            Effect.mapError(storeError("deleteOutbox failed")),
+            Effect.asVoid
+          )
+        }),
+
+      listChildResults: (flowId, listOptions) =>
+        Effect.gen(function*() {
+          const limit = Math.max(1, listOptions?.limit ?? 1000)
+          const cursor = listOptions?.cursor
+          // `spec->>'id'` instead of the whole spec: at 10k children the full
+          // payloads would transfer on every collect.
+          const rows = rowsOf(yield* db.execute<FlowChildRow>(sql`
+            SELECT ${flowChildren.flowId} AS "flowId", ${flowChildren.childKey} AS "childKey",
+              ${flowChildren.name} AS "name", ${flowChildren.storeKey} AS "storeKey",
+              ${flowChildren.spec}->>'id' AS "childJobId", ${flowChildren.status} AS "status",
+              ${flowChildren.exit} AS "exit", ${flowChildren.failedReason} AS "failedReason",
+              ${flowChildren.cascaded} AS "cascaded"
+            FROM ${flowChildren}
+            WHERE ${flowChildren.flowId} = ${flowId}
+              ${cursor === undefined ? sql`` : sql`AND ${flowChildren.childKey} > ${cursor}`}
+            ORDER BY ${flowChildren.childKey} ASC
+            LIMIT ${limit + 1}
+          `).pipe(Effect.mapError(storeError("listChildResults failed"))))
+          const page = rows.slice(0, limit)
+          const items = page.map(toFlowChildRecord)
+          const last = items[items.length - 1]
+          return {
+            items,
+            cursor: rows.length > limit && last !== undefined ? last.childKey : undefined
+          }
+        }),
+
+      flowSweepWork: (sweepOptions) =>
+        Effect.gen(function*() {
+          const now = yield* nowDate
+          const limit = Math.max(1, sweepOptions.limit ?? 1000)
+          const threshold = new Date(now.getTime() - sweepOptions.pendingAgeMs)
+          type SweepRow = {
+            readonly flowId: string
+            readonly childKey: string
+            readonly storeKey: string
+            readonly spec: JobStore.EnqueueRequest
+          }
+          // Reconcile: pending rows past the eligibility threshold whose
+          // parent is still parked (a settled flow never re-drives work).
+          // Returning a row re-arms `pending_since` in the same statement, so
+          // a full page rotates across sweeps instead of pinning its head.
+          // SKIP LOCKED: rows a concurrent report/settle holds are its
+          // business, and never waiting means this statement cannot deadlock.
+          // The raw column names are safe: only table names vary across
+          // factory instances. RETURNING order is unspecified — sorted below.
+          const reconcileRows = rowsOf(yield* db.execute<SweepRow>(sql`
+            WITH due AS (
+              SELECT c.flow_id, c.child_key
+              FROM ${flowChildren} c
+              JOIN ${jobs} j ON j.id = c.flow_id
+              WHERE c.status = 'pending' AND c.pending_since <= ${threshold}
+                AND j.state = 'waiting-children'
+              ORDER BY c.flow_id, c.child_key
+              LIMIT ${limit}
+              FOR UPDATE OF c SKIP LOCKED
+            )
+            UPDATE ${flowChildren} SET pending_since = ${now}
+            FROM due
+            WHERE ${flowChildren.flowId} = due.flow_id AND ${flowChildren.childKey} = due.child_key
+            RETURNING ${flowChildren.flowId} AS "flowId", ${flowChildren.childKey} AS "childKey",
+              ${flowChildren.storeKey} AS "storeKey", ${flowChildren.spec} AS "spec"
+          `).pipe(Effect.mapError(storeError("flowSweepWork failed"))))
+            .toSorted((a, b) =>
+              a.flowId !== b.flowId
+                ? (a.flowId < b.flowId ? -1 : 1)
+                : a.childKey < b.childKey
+                ? -1
+                : a.childKey > b.childKey
+                ? 1
+                : 0
+            )
+          // Cascade: cancelled rows whose cancel has not been delivered into
+          // the child's store yet (any parent state).
+          const cascadeRows = rowsOf(yield* db.execute<SweepRow>(sql`
+            SELECT ${flowChildren.flowId} AS "flowId", ${flowChildren.childKey} AS "childKey",
+              ${flowChildren.storeKey} AS "storeKey", ${flowChildren.spec} AS "spec"
+            FROM ${flowChildren}
+            WHERE ${flowChildren.status} = 'cancelled' AND ${flowChildren.cascaded} = FALSE
+            ORDER BY ${flowChildren.flowId}, ${flowChildren.childKey}
+            LIMIT ${limit}
+          `).pipe(Effect.mapError(storeError("flowSweepWork failed"))))
+          const reconcile: Array<{
+            flowId: JobStore.JobId
+            children: Array<JobStore.FlowChildSpec>
+          }> = []
+          for (const row of reconcileRows) {
+            const flowId = JobId(row.flowId)
+            let group = reconcile[reconcile.length - 1]
+            if (group === undefined || group.flowId !== flowId) {
+              group = { flowId, children: [] }
+              reconcile.push(group)
+            }
+            group.children.push({ childKey: row.childKey, storeKey: row.storeKey, request: row.spec })
+          }
+          const cascade: Array<{
+            flowId: JobStore.JobId
+            children: Array<{ childKey: string; storeKey: string; childJobId: JobStore.JobId }>
+          }> = []
+          for (const row of cascadeRows) {
+            const flowId = JobId(row.flowId)
+            let group = cascade[cascade.length - 1]
+            if (group === undefined || group.flowId !== flowId) {
+              group = { flowId, children: [] }
+              cascade.push(group)
+            }
+            group.children.push({
+              childKey: row.childKey,
+              storeKey: row.storeKey,
+              // SAFETY: the FanOut ack validated every spec id before
+              // persisting it.
+              childJobId: row.spec.id as JobStore.JobId
+            })
+          }
+          const work: JobStore.FlowSweepWork = { reconcile, cascade }
+          return work
+        }),
+
+      markChildrenCascaded: (flowId, childKeys) =>
+        childKeys.length === 0
+          ? Effect.void
+          : db.execute(sql`
+            UPDATE ${flowChildren} SET cascaded = TRUE
+            WHERE ${flowChildren.flowId} = ${flowId}
+              AND ${flowChildren.childKey} = ANY(${sql.param([...childKeys])})
+          `).pipe(
+            Effect.mapError(storeError("markChildrenCascaded failed")),
+            Effect.asVoid
+          ),
+
       counts: (queue) =>
         db.execute<{ state: JobStore.JobState; count: number }>(sql`
           SELECT ${jobs.state} AS "state", count(*)::int AS "count" FROM ${jobs}
@@ -1477,6 +2207,7 @@ export const make = (
               waiting: 0,
               delayed: 0,
               active: 0,
+              "waiting-children": 0,
               completed: 0,
               failed: 0,
               cancelled: 0
@@ -1487,10 +2218,18 @@ export const make = (
         ),
 
       remove: (id) =>
+        // The purge CTE takes a removed flow parent's dependency rows with it
+        // in the same statement.
         db.execute(sql`
-          DELETE FROM ${jobs}
-          WHERE ${jobs.id} = ${id} AND ${jobs.state} <> 'active'
-          RETURNING ${jobs.id} AS id
+          WITH deleted AS (
+            DELETE FROM ${jobs}
+            WHERE ${jobs.id} = ${id} AND ${jobs.state} NOT IN ('active', 'waiting-children')
+            RETURNING ${jobs.id} AS id
+          ), purged AS (
+            DELETE FROM ${flowChildren}
+            WHERE ${flowChildren.flowId} IN (SELECT id FROM deleted)
+          )
+          SELECT id FROM deleted
         `).pipe(
           Effect.mapError(storeError("remove failed")),
           Effect.map((result) => rowsOf(result).length > 0)

@@ -67,6 +67,8 @@ export const ScheduleKey: Brand.Constructor<ScheduleKey> = Brand.nominal<Schedul
  * - `waiting`: runnable now, ordered by (priority desc, enqueue order asc)
  * - `delayed`: must not run before `runAt`
  * - `active`: claimed by a worker holding a lock token
+ * - `waiting-children`: a flow parent parked until its children settle (see
+ *   `AckOutcome`'s `FanOut`); never claimable, not terminal
  * - `completed` / `failed`: terminal, with an encoded `Exit` stored
  *
  * @since 0.1.0
@@ -75,6 +77,7 @@ export type JobState =
   | "waiting"
   | "delayed"
   | "active"
+  | "waiting-children"
   | "completed"
   | "failed"
   | "cancelled"
@@ -205,8 +208,12 @@ export interface AttemptRecord {
   readonly startedAt: number | undefined
   /** Ack/recovery time of this run (epoch millis). */
   readonly finishedAt: number
-  readonly outcome: "completed" | "retried" | "failed" | "stalled" | "cancelled"
-  /** Schema-encoded `Exit`; undefined for `stalled`. */
+  readonly outcome: "completed" | "retried" | "failed" | "stalled" | "cancelled" | "fanned-out"
+  /**
+   * Schema-encoded `Exit`; undefined for `stalled`, `cancelled`, and
+   * `fanned-out` entries, and for `failed` entries written by a store-side
+   * settle (a fail-fast flow parent) rather than a handler run.
+   */
   readonly exit: unknown
 }
 
@@ -244,6 +251,10 @@ export interface JobRecord {
   readonly dedupeKey: string | undefined
   /** The producer's span context, restored as the handler span's parent. */
   readonly trace: TraceContext | undefined
+  /** Present on flow children: the link back to their parent flow. */
+  readonly parent: ParentEnvelope | undefined
+  /** Present on flow parents once their manifest landed (see `FlowState`). */
+  readonly flow: FlowState | undefined
   /** Epoch millis before which the job must not be claimed. */
   readonly runAt: number
   readonly enqueuedAt: number
@@ -305,6 +316,171 @@ export interface TraceContext {
 }
 
 /**
+ * The persisted link from a flow child job to its parent flow. Attached by
+ * the flow runtime at fan-out (never by producers). Its presence puts the
+ * job under the outbox invariant: the child's store appends its report to
+ * the outbox with every terminal transition (see `OutboxEntry`), and a
+ * worker's relay delivers it into the parent's store (see
+ * `Worker.layer({ flows })`).
+ *
+ * @since 0.6.0
+ */
+export interface ParentEnvelope {
+  /** The flow definition's name (`Flow.make(name, ...)`). */
+  readonly flowName: string
+  /** The parent job's id in the parent store. */
+  readonly flowId: JobId
+  /** This child's key, unique within the flow (the idempotency mechanism). */
+  readonly childKey: string
+  /** The parent store's context-key string, for cross-store report routing. */
+  readonly parentStoreKey: string
+  /**
+   * This child's nesting level: 1 for children of a top-level flow, one
+   * more per level of nesting. Carried explicitly (never parsed out of
+   * ids — user keys are arbitrary strings) so the fan-out depth cap can
+   * catch cyclic definitions.
+   */
+  readonly depth: number
+}
+
+/**
+ * Flow bookkeeping persisted on a parent job by the `FanOut` ack. Its
+ * presence IS the phase marker: absent means the parent has not fanned out
+ * yet (a claim dispatches `fanOut`); present means the manifest landed (a
+ * claim dispatches `collect`, and a re-run can never fan out twice).
+ *
+ * The four counters always sum to the manifest size: applied reports move
+ * one child from `pending` to its outcome bucket, and settle-time marking
+ * (fail-fast, parent cancel) moves every remaining `pending` child to
+ * `cancelled` in the same atomic op. `collect` reads its tallies from here
+ * without touching a single dependency row.
+ *
+ * @since 0.6.0
+ */
+export interface FlowState {
+  /** When true, the first failed child report settles the parent as failed. */
+  readonly failFast: boolean
+  /** Children whose result has not been recorded yet. */
+  readonly pending: number
+  readonly completed: number
+  readonly failed: number
+  readonly cancelled: number
+}
+
+/**
+ * One child of a flow fan-out, persisted on its dependency row so the flow
+ * sweeper can (re-)enqueue the child from storage alone after any crash.
+ * `request.id` is the deterministic flow child id — derived from the parent
+ * store key, flow id, and child key, so re-enqueues are idempotent — and
+ * `request.parent` carries the envelope.
+ *
+ * @since 0.6.0
+ */
+export interface FlowChildSpec {
+  readonly childKey: string
+  /** The CHILD store's context-key string (children may live elsewhere). */
+  readonly storeKey: string
+  readonly request: EnqueueRequest
+}
+
+/**
+ * A dependency row: one child's status and result as recorded in the PARENT
+ * store. `exit` is the child's schema-encoded exit; `failedReason` carries
+ * store-side child failures (stall exhaustion, a nested parent's fail-fast
+ * settle) that never produced an exit. `cascaded` marks that a cancel no
+ * longer needs to be delivered into the child's store (set by
+ * `markChildrenCascaded`, or immediately when the recorded outcome came
+ * FROM the child's store).
+ *
+ * @since 0.6.0
+ */
+export interface FlowChildRecord {
+  readonly flowId: JobId
+  readonly childKey: string
+  readonly name: string
+  readonly storeKey: string
+  readonly childJobId: JobId
+  readonly status: "pending" | "completed" | "failed" | "cancelled"
+  readonly exit: unknown
+  readonly failedReason: string | undefined
+  readonly cascaded: boolean
+}
+
+/**
+ * An idempotent child-result report delivered into the parent store — by a
+ * worker's outbox relay (the push path) or synthesized by the flow sweeper
+ * from child-store state (the reconcile path). Both may deliver the same
+ * report; the dependency row's state dedups them.
+ *
+ * @since 0.6.0
+ */
+export interface FlowChildReport {
+  readonly flowId: JobId
+  readonly childKey: string
+  readonly outcome: "completed" | "failed" | "cancelled"
+  /** The child's schema-encoded exit; undefined for store-side failures. */
+  readonly exit: unknown
+  /** Present when the child was failed store-side (no exit exists). */
+  readonly failedReason: string | undefined
+}
+
+/**
+ * One undelivered child-result report in a CHILD store's outbox.
+ *
+ * The outbox invariant every driver must uphold: whenever a store operation
+ * moves a job carrying a `parent` envelope INTO a terminal state — a
+ * `Complete`/`Fail`/`Cancelled` ack, stall exhaustion, a direct `cancel` of
+ * a waiting/delayed child, a cancel honoured during release or stall
+ * recovery, or a fail-fast settle of a NESTED flow parent (its terminal
+ * transition happens store-side, with no ack) — the same atomic operation
+ * appends the corresponding report here. The worker's relay then drains
+ * the outbox into the parent store in batches and deletes what it
+ * delivered. Because dependency rows dedup redelivery, the relay needs no
+ * leases: crash anywhere and the entries are simply delivered again.
+ *
+ * `remove` appends nothing (an operator override), and a `FanOut` ack
+ * appends nothing (`waiting-children` is not terminal).
+ *
+ * @since 0.6.0
+ */
+export interface OutboxEntry {
+  /** Store-assigned, opaque; pass back to `deleteOutbox` verbatim. */
+  readonly id: string
+  readonly flowName: string
+  /** The parent store's context-key string, for relay routing. */
+  readonly parentStoreKey: string
+  readonly report: FlowChildReport
+}
+
+/**
+ * The flow sweeper's work list, scoped by parent state so settled flows
+ * never re-drive work:
+ *
+ * - `reconcile`: for parents still in `waiting-children`, dependency rows
+ *   `pending` longer than the caller's threshold, with their stored specs —
+ *   the sweeper checks the child's store and either enqueues the child
+ *   (missing) or synthesizes its report (terminal).
+ * - `cascade`: rows marked `cancelled` by a settle but not yet delivered as
+ *   real cancels into their child store (any parent state).
+ *
+ * @since 0.6.0
+ */
+export interface FlowSweepWork {
+  readonly reconcile: ReadonlyArray<{
+    readonly flowId: JobId
+    readonly children: ReadonlyArray<FlowChildSpec>
+  }>
+  readonly cascade: ReadonlyArray<{
+    readonly flowId: JobId
+    readonly children: ReadonlyArray<{
+      readonly childKey: string
+      readonly storeKey: string
+      readonly childJobId: JobId
+    }>
+  }>
+}
+
+/**
  * @since 0.1.0
  */
 export interface EnqueueRequest {
@@ -327,6 +503,8 @@ export interface EnqueueRequest {
   readonly dedupe: DedupePolicy | undefined
   /** The producer's span context, for cross-process trace propagation. */
   readonly trace: TraceContext | undefined
+  /** Flow-parent link, set only by the flow runtime (opaque to the store). */
+  readonly parent: ParentEnvelope | undefined
   readonly delayMs: number
 }
 
@@ -389,7 +567,18 @@ export type ClaimResult =
  * attempts accounting) is computed by the worker; the store only applies it.
  *
  * Every outcome appends an `AttemptRecord` to the job's ledger (`Complete` →
- * completed, `Retry` → retried, `Fail` → failed).
+ * completed, `Retry` → retried, `Fail` → failed, `FanOut` → fanned-out).
+ *
+ * `FanOut` (flow parents only) atomically: persists `FlowState` (phase
+ * marker + policy + `pending = children.length`), inserts one `pending`
+ * dependency row per child (spec stored, so crash recovery needs only the
+ * parent store), and parks the parent in `waiting-children` — or, for an
+ * empty spec, settles it straight to `waiting`. It does NOT consume an
+ * attempt (a phase transition is not a completed run), and it does NOT
+ * enqueue the children (the flow runtime and sweeper own that). A parent
+ * whose `flow` is already present keeps its persisted manifest untouched —
+ * the new children are ignored and the state transition follows the existing
+ * `pending` count, so a double fan-out cannot duplicate children.
  *
  * @since 0.1.0
  */
@@ -398,6 +587,11 @@ export type AckOutcome =
   | { readonly _tag: "Retry"; readonly delayMs: number; readonly exit: unknown }
   | { readonly _tag: "Fail"; readonly exit: unknown }
   | { readonly _tag: "Cancelled" }
+  | {
+    readonly _tag: "FanOut"
+    readonly failFast: boolean
+    readonly children: ReadonlyArray<FlowChildSpec>
+  }
 
 /**
  * Filters and pagination for `list`. Results are ordered newest-first
@@ -663,7 +857,8 @@ export interface Service {
    * Acknowledge a claimed job. Verifies the lock token, releases the lock,
    * increments `attemptsMade`, appends to the attempts ledger, then applies
    * the outcome (`Complete`/`Fail` are terminal and apply the record's `keep`
-   * policy; `Retry` re-queues after `delayMs`).
+   * policy; `Retry` re-queues after `delayMs`). Terminal outcomes for jobs
+   * carrying a `parent` envelope also append an `OutboxEntry` atomically.
    */
   readonly ack: (
     id: JobId,
@@ -693,7 +888,8 @@ export interface Service {
    * Sweep active jobs whose lock has expired. Each recovered job gets
    * `stalledCount + 1` and a `stalled` ledger entry; jobs exceeding
    * `maxStalledCount` are failed (`failed: true` in the result), the rest
-   * return to `waiting`.
+   * return to `waiting`. Stall-exhausting a job that carries a `parent`
+   * envelope appends its failed report to the outbox atomically.
    */
   readonly recoverStalled: (options: {
     readonly maxStalledCount: number
@@ -730,7 +926,10 @@ export interface Service {
   /**
    * Re-run a failed job: back to `waiting` with a fresh attempt budget
    * (`attemptsMade`/`stalledCount` reset, terminal fields cleared). The
-   * attempts ledger is preserved and keeps numbering monotonically.
+   * attempts ledger is preserved and keeps numbering monotonically. A flow
+   * parent's `flow` field and dependency rows survive: a retried fail-fast
+   * flow re-enters the `collect` phase with its recorded (mixed) results —
+   * it can never fan out twice.
    */
   readonly retry: (
     id: JobId
@@ -742,8 +941,13 @@ export interface Service {
   /**
    * Cancel a job. Waiting/delayed jobs become terminal (`cancelled`)
    * immediately; active jobs get `cancelRequested` set, and the owning
-   * worker interrupts the handler on its next heartbeat. Terminal jobs fail
-   * with `JobNotCancellableError`.
+   * worker interrupts the handler on its next heartbeat. A `waiting-children`
+   * flow parent settles to `cancelled` AND flips its remaining `pending`
+   * dependency rows to `cancelled` (not `cascaded`) in the same atomic op —
+   * the flow sweeper then delivers real cancels into the child stores, and
+   * late child reports find their row terminal and drop. Cancelling a job
+   * that itself carries a `parent` envelope appends its cancelled report to
+   * the outbox atomically. Terminal jobs fail with `JobNotCancellableError`.
    */
   readonly cancel: (
     id: JobId
@@ -838,11 +1042,137 @@ export interface Service {
     nextRunAt: number
   ) => Effect.Effect<void, JobStoreError>
 
+  /**
+   * Record a batch of child outcomes on their dependency rows — idempotent
+   * and atomic, results positional. Each report applies only when its row
+   * is still `pending` (`applied: false` for duplicate, late, or unknown
+   * reports); an applied report moves the child from the parent's `pending`
+   * counter to its outcome counter and marks the row `cascaded` (the
+   * outcome came from the child's store — no cancel needs delivering). A
+   * batch may span flows.
+   *
+   * Per flow, all row updates apply BEFORE the settle decision, and the
+   * parent settles at most once per batch (`parentSettled: true` on the
+   * report that decided it): when `pending` hits zero, `waiting-children` →
+   * `waiting` (runnable now, phase `collect`) — or on the first applied
+   * `failed` report in batch order under the fail-fast policy, which
+   * instead settles the parent terminally `failed` (store-side,
+   * `failedReason` set, no exit — like stall exhaustion) and flips every
+   * remaining `pending` row to `cancelled`/not-`cascaded` in the same
+   * atomic op. Fail-fast wins the tie when one report triggers both rules.
+   *
+   * Lock ordering (drivers MUST follow it): dependency rows first, the
+   * parent row second — reports, fail-fast marking, and cancel marking all
+   * take locks in this order, so report-vs-settle cannot deadlock.
+   *
+   * Drivers may process very large batches in atomic sub-batches (the
+   * Redis driver chunks at 500); the apply-all-before-settle rule then
+   * holds per sub-batch. Worker relays never exceed one page (500), so
+   * this only shows on direct store calls with larger batches.
+   *
+   * @since 0.6.0
+   */
+  readonly recordChildResults: (
+    reports: ReadonlyArray<FlowChildReport>
+  ) => Effect.Effect<
+    ReadonlyArray<{ readonly applied: boolean; readonly parentSettled: boolean }>,
+    JobStoreError
+  >
+
+  /**
+   * The oldest undelivered outbox entries, up to `limit` (see
+   * `OutboxEntry` for the append invariant). The relay peeks, delivers via
+   * `recordChildResults` on the parent store, then deletes — redelivery
+   * after a crash is safe because dependency rows dedup.
+   *
+   * `after` pages past a previously-returned entry id (exclusive), whether
+   * or not that entry still exists — the relay walks the whole outbox this
+   * way, so entries it cannot route (their parent store is not provided
+   * here) never blockade the ones behind them. Anything other than an id
+   * this store issued may be treated as unset.
+   *
+   * @since 0.6.0
+   */
+  readonly peekOutbox: (options: {
+    readonly limit: number
+    readonly after?: string | undefined
+  }) => Effect.Effect<ReadonlyArray<OutboxEntry>, JobStoreError>
+
+  /**
+   * Delete delivered outbox entries by id. Idempotent; unknown ids are
+   * ignored.
+   *
+   * @since 0.6.0
+   */
+  readonly deleteOutbox: (
+    ids: ReadonlyArray<string>
+  ) => Effect.Effect<void, JobStoreError>
+
+  /**
+   * A flow's dependency rows, ordered by child key; feeds `collect` and
+   * dashboards. Pass the returned `cursor` back for the next page.
+   *
+   * @since 0.6.0
+   */
+  readonly listChildResults: (
+    flowId: JobId,
+    options?: {
+      readonly cursor?: string | undefined
+      /** Page size; default 1000. */
+      readonly limit?: number | undefined
+    } | undefined
+  ) => Effect.Effect<
+    {
+      readonly items: ReadonlyArray<FlowChildRecord>
+      readonly cursor: string | undefined
+    },
+    JobStoreError
+  >
+
+  /**
+   * The flow sweeper's work list (see `FlowSweepWork`). `pendingAgeMs`
+   * scopes reconciliation to rows whose eligibility timestamp is at least
+   * this old (giving the push path time); `limit` bounds the rows returned
+   * per class per sweep.
+   *
+   * Returning a row for reconciliation re-arms its eligibility timestamp
+   * (it is not returned again until another `pendingAgeMs` elapses), so a
+   * full page ROTATES across sweeps: healthy in-flight children and rows
+   * this sweeper cannot act on never pin the head of the page and starve
+   * the rows behind them.
+   *
+   * @since 0.6.0
+   */
+  readonly flowSweepWork: (options: {
+    readonly pendingAgeMs: number
+    readonly limit?: number | undefined
+  }) => Effect.Effect<FlowSweepWork, JobStoreError>
+
+  /**
+   * Mark dependency rows as `cascaded` after their cancels were delivered
+   * into (or confirmed unnecessary by) the child's store. Idempotent.
+   *
+   * @since 0.6.0
+   */
+  readonly markChildrenCascaded: (
+    flowId: JobId,
+    childKeys: ReadonlyArray<string>
+  ) => Effect.Effect<void, JobStoreError>
+
   readonly counts: (
     queue?: QueueName
   ) => Effect.Effect<Record<JobState, number>, JobStoreError>
 
-  /** Remove a job (and its ledger). Refuses (returns false) when active. */
+  /**
+   * Remove a job (and its ledger; a flow parent's dependency rows go with
+   * it). Refuses (returns false) when active or `waiting-children`.
+   *
+   * Note the retention asymmetry for flows: AUTOMATIC pruning (`keep`
+   * policies, the `historyTtl` sweep) must skip a settled flow parent whose
+   * rows still owe cascade cancels (`cancelled` and not `cascaded`) — those
+   * rows are the only record that real cancels are still due in the child
+   * stores. `remove` is the explicit operator override and deletes anyway.
+   */
   readonly remove: (id: JobId) => Effect.Effect<boolean, JobStoreError>
 }
 

@@ -29,6 +29,7 @@ const rawRequest = (name: string, id?: string): JobStore.EnqueueRequest => ({
   timeoutMs: undefined,
   dedupe: undefined,
   trace: undefined,
+  parent: undefined,
   delayMs: 0
 })
 
@@ -691,8 +692,11 @@ describe("repeatable schedules", () => {
       const storeLayer = Layer.succeed(JobStore.JobStore, store)
       class Tick extends Job.make("Tick", { payload: { label: Schema.String } }) {}
       const seen: Array<string> = []
-      const handlers = Tick.toLayer((payload, ctx) =>
-        Effect.sync(() => void seen.push(`${payload.label}:${ctx.jobId}`))
+      const handlers = Tick.toLayer((payload) =>
+        Effect.gen(function*() {
+          const { jobId } = yield* Worker.CurrentJob
+          seen.push(`${payload.label}:${jobId}`)
+        })
       )
 
       yield* Effect.gen(function*() {
@@ -824,6 +828,7 @@ describe("deduplication", () => {
         timeoutMs: undefined,
         dedupe: { key: "k", ttlMs: undefined, extend: false, replace: false },
         trace: undefined,
+        parent: undefined,
         delayMs: 0
       }
       const first = yield* store.enqueue(request)

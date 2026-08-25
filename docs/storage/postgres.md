@@ -19,16 +19,26 @@ The factories are the single source of truth for the table layout. Re-export the
 
 ```ts
 // db/schema.ts
-import { mqDedupe, mqJobAttempts, mqJobs, mqQueueControl, mqSchedules } from "effect-mq/drizzle-postgres"
+import {
+  mqDedupe,
+  mqFlowChildren,
+  mqFlowOutbox,
+  mqJobAttempts,
+  mqJobs,
+  mqQueueControl,
+  mqSchedules
+} from "effect-mq/drizzle-postgres"
 
 // The `name` column is typed to your job tags (derived, not hand-written):
 type JobNames = typeof GenerateInvoice._tag | typeof SendEmail._tag
 
-export const jobs = mqJobs<JobNames>()          // default table: effect_mq_jobs
-export const jobAttempts = mqJobAttempts(jobs)  // default: effect_mq_job_attempts
-export const jobSchedules = mqSchedules()       // default: effect_mq_schedules
-export const jobQueues = mqQueueControl()       // default: effect_mq_queue_control
-export const jobDedupe = mqDedupe()             // default: effect_mq_dedupe
+export const jobs = mqJobs<JobNames>()              // default table: effect_mq_jobs
+export const jobAttempts = mqJobAttempts(jobs)      // default: effect_mq_job_attempts
+export const jobSchedules = mqSchedules()           // default: effect_mq_schedules
+export const jobQueues = mqQueueControl()           // default: effect_mq_queue_control
+export const jobDedupe = mqDedupe()                 // default: effect_mq_dedupe
+export const jobFlowChildren = mqFlowChildren()     // default: effect_mq_flow_children
+export const jobFlowOutbox = mqFlowOutbox()         // default: effect_mq_flow_outbox
 ```
 
 Then generate and run the migration like any other schema change:
@@ -54,14 +64,24 @@ export const jobs = mqJobs<JobNames>("effect_mq_jobs", {
 import { DrizzleJobStore } from "effect-mq/drizzle-postgres"
 import { PgClient } from "@effect/sql-pg"
 import { Layer, Redacted } from "effect"
-import { jobAttempts, jobDedupe, jobQueues, jobs, jobSchedules } from "./db/schema.ts"
+import {
+  jobAttempts,
+  jobDedupe,
+  jobFlowChildren,
+  jobFlowOutbox,
+  jobQueues,
+  jobs,
+  jobSchedules
+} from "./db/schema.ts"
 
 const JobStoreLive = DrizzleJobStore.layer({
   jobs,
   attempts: jobAttempts,
   schedules: jobSchedules,
   queues: jobQueues,
-  dedupe: jobDedupe
+  dedupe: jobDedupe,
+  flowChildren: jobFlowChildren,
+  flowOutbox: jobFlowOutbox
 }).pipe(
   Layer.provide(PgClient.layer({ url: Redacted.make(process.env.DATABASE_URL!) }))
 )
@@ -71,7 +91,7 @@ const JobStoreLive = DrizzleJobStore.layer({
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `jobs`, `attempts`, `schedules`, `queues`, `dedupe` | required | the table instances from the factories above |
+| `jobs`, `attempts`, `schedules`, `queues`, `dedupe`, `flowChildren`, `flowOutbox` | required | the table instances from the factories above |
 | `store` | default `JobStore` | bind to a [named store](/storage/stores) key |
 | `historyTtl` | off | store-level retention ceiling: one duration or a per-state split (see [Retention](/guide/retention)) |
 | `historySweepInterval` | 1 minute | history sweep cadence |
@@ -159,6 +179,14 @@ Never mutate job rows yourself. Mutations must go through the store (`MyJob.retr
 ## Upgrading
 
 Ship layout changes through your normal migration flow: bump effect-mq, run `drizzle-kit generate`, review the diff. 0.4.0 added the `trace` jsonb column to the jobs table (cross-process [trace propagation](/guide/observability)); 0.5.0 added the nullable `group_name` column to the schedules table ([schedule reconciliation](/guide/repeatable-jobs#declaring-the-full-set-reconciliation)). `drizzle-kit generate` picks each up as one small migration; migrate before deploying the new version.
+
+0.6.0 ([parent-child flows](/guide/flows)) is a bigger step, and it applies even if you never define a flow:
+
+1. The jobs table gains nullable columns: `parent` jsonb plus the flow bookkeeping (`flow_fail_fast` boolean and the `flow_pending`/`flow_completed`/`flow_failed`/`flow_cancelled` integers).
+2. Two new tables arrive as schema factories: export `mqFlowChildren()` and `mqFlowOutbox()` from your schema as shown above.
+3. `DrizzleJobStore.layer` now **requires** the `flowChildren` and `flowOutbox` table options; upgrading without them is a compile error, which is the intended nudge to run the migration first.
+
+`drizzle-kit generate` emits all of it as one migration once the factory exports are in your schema; migrate before deploying 0.6.0.
 
 ## Where to next
 

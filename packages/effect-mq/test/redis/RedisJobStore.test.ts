@@ -30,12 +30,15 @@ if (!available) {
           defaults: { attempts: 2 }
         }) {}
         let attempt = 0
-        const handlers = Report.toLayer((payload, ctx) => {
-          attempt = ctx.attempt
-          return ctx.attempt === 1
-            ? Effect.fail("flaky")
-            : Effect.succeed(`report ${payload.month} sent`)
-        })
+        const handlers = Report.toLayer((payload) =>
+          Effect.gen(function*() {
+            const current = yield* Worker.CurrentJob
+            attempt = current.attempt
+            return current.attempt === 1
+              ? yield* Effect.fail("flaky")
+              : `report ${payload.month} sent`
+          })
+        )
 
         const store = yield* RedisJobStore.make({ prefix: freshPrefix() })
         const storeLayer = Layer.succeed(JobStore.JobStore, store)
@@ -96,6 +99,7 @@ if (!available) {
           timeoutMs: undefined,
           dedupe: undefined,
           trace: undefined,
+          parent: undefined,
           delayMs: 0
         })
         yield* Fiber.join(waiter).pipe(Effect.timeout("5 seconds"))
@@ -120,6 +124,7 @@ if (!available) {
           timeoutMs: undefined,
           dedupe: undefined,
           trace: undefined,
+          parent: undefined,
           delayMs: 0
         }
         const first = yield* store.enqueue({ ...base, name: "Gen" })
@@ -159,6 +164,7 @@ if (!available) {
           timeoutMs: undefined,
           dedupe: undefined,
           trace: undefined,
+          parent: undefined,
           delayMs: 0
         }
         const { id } = yield* a.enqueue(base)
@@ -180,6 +186,124 @@ if (!available) {
         expect(claims.filter((claim) => claim._tag === "Claimed")).toHaveLength(1)
       }).pipe(Effect.scoped, Effect.provide(redisLive())))
 
+    it.effect("a FanOut past the 500-child chunk size stages atomically and lands one manifest", () =>
+      Effect.gen(function*() {
+        const store = yield* RedisJobStore.make({ prefix: freshPrefix() })
+        const queue = JobStore.QueueName("default")
+        const base = {
+          id: undefined,
+          name: "BigFlow",
+          queue,
+          payload: {},
+          metadata: {},
+          priority: 0,
+          attemptsMax: 1,
+          backoff: undefined,
+          keep: undefined,
+          timeoutMs: undefined,
+          dedupe: undefined,
+          trace: undefined,
+          parent: undefined,
+          delayMs: 0
+        }
+        const { id } = yield* store.enqueue(base)
+        const claim = yield* store.claim({
+          queue,
+          names: ["BigFlow"],
+          token: "t-big",
+          lockDurationMs: 30_000
+        })
+        assert(claim._tag === "Claimed")
+
+        // 750 children forces the driver through two staging chunks (500 +
+        // 250, the second carrying the manifest + state flip). Zero-padded
+        // keys make childKey order equal numeric order.
+        const children: Array<JobStore.FlowChildSpec> = Array.from({ length: 750 }, (_, i) => {
+          const key = `c${String(i).padStart(4, "0")}`
+          return {
+            childKey: key,
+            storeKey: "effect-mq/JobStore/children",
+            request: {
+              ...base,
+              id: JobStore.JobId(`flow/main/${id}/${key}`),
+              name: "Child",
+              parent: {
+                flowName: "big",
+                flowId: id,
+                childKey: key,
+                parentStoreKey: "main",
+                depth: 1
+              }
+            }
+          }
+        })
+        yield* store.ack(id, "t-big", { _tag: "FanOut", failFast: false, children })
+
+        const parent = yield* store.getJob(id)
+        assert(Option.isSome(parent))
+        expect(parent.value.state).toBe("waiting-children")
+        expect(parent.value.flow).toEqual({
+          failFast: false,
+          pending: 750,
+          completed: 0,
+          failed: 0,
+          cancelled: 0
+        })
+
+        // The full manifest paginates in childKey order.
+        const seen: Array<string> = []
+        let cursor: string | undefined = undefined
+        do {
+          const page: {
+            items: ReadonlyArray<JobStore.FlowChildRecord>
+            cursor: string | undefined
+          } = yield* store.listChildResults(id, { cursor, limit: 300 })
+          for (const row of page.items) seen.push(row.childKey)
+          cursor = page.cursor
+        } while (cursor !== undefined)
+        expect(seen).toEqual(children.map((child) => child.childKey))
+
+        // A report batch moves the counters; the in-batch duplicate drops.
+        const results = yield* store.recordChildResults([
+          {
+            flowId: id,
+            childKey: "c0000",
+            outcome: "completed",
+            exit: { ok: true },
+            failedReason: undefined
+          },
+          {
+            flowId: id,
+            childKey: "c0000",
+            outcome: "failed",
+            exit: undefined,
+            failedReason: undefined
+          },
+          {
+            flowId: id,
+            childKey: "c0001",
+            outcome: "completed",
+            exit: { ok: true },
+            failedReason: undefined
+          }
+        ])
+        expect(results).toEqual([
+          { applied: true, parentSettled: false },
+          { applied: false, parentSettled: false },
+          { applied: true, parentSettled: false }
+        ])
+        const after = yield* store.getJob(id)
+        assert(Option.isSome(after))
+        expect(after.value.state).toBe("waiting-children")
+        expect(after.value.flow).toEqual({
+          failFast: false,
+          pending: 748,
+          completed: 2,
+          failed: 0,
+          cancelled: 0
+        })
+      }).pipe(Effect.scoped, Effect.provide(redisLive())))
+
     it.live("historyTtl sweeps terminal jobs; live jobs survive", () =>
       Effect.gen(function*() {
         const store = yield* RedisJobStore.make({
@@ -199,6 +323,7 @@ if (!available) {
           timeoutMs: undefined,
           dedupe: undefined,
           trace: undefined,
+          parent: undefined,
           delayMs: 0
         }
         const done = yield* store.enqueue({ ...base, name: "Swept" })

@@ -2,10 +2,30 @@ import { Job, JobStore, Worker } from "../../src/index.ts"
 import { PgClient } from "@effect/sql-pg"
 import { jobStoreConformance } from "../../src/testing/index.ts"
 import { assert, describe, expect, it } from "@effect/vitest"
+import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
 import { getTableConfig, index, text } from "drizzle-orm/pg-core"
-import { Effect, Exit, Fiber, Layer, Option, Schedule, Schema } from "effect"
-import { DrizzleJobStore, mqDedupe, mqJobAttempts, mqJobs, mqQueueControl, mqSchedules } from "../../src/drizzle-postgres/index.ts"
-import { createTablesSql, freshStoreEffect, freshStoreLayer, freshTableNames, pgAvailable, pgClientLive, pgUrl } from "./support.ts"
+import { Cause, Effect, Exit, Fiber, Layer, Option, Schedule, Schema } from "effect"
+import { DeadlockError, SqlError, UnknownError } from "effect/unstable/sql/SqlError"
+import {
+  DrizzleJobStore,
+  mqDedupe,
+  mqFlowChildren,
+  mqFlowOutbox,
+  mqJobAttempts,
+  mqJobs,
+  mqQueueControl,
+  mqSchedules
+} from "../../src/drizzle-postgres/index.ts"
+import {
+  createTablesSql,
+  dropTablesSql,
+  freshStoreEffect,
+  freshStoreLayer,
+  freshTableNames,
+  pgAvailable,
+  pgClientLive,
+  pgUrl
+} from "./support.ts"
 
 const available = await pgAvailable()
 
@@ -23,22 +43,17 @@ if (!available) {
       Effect.gen(function*() {
         const client = yield* PgClient.PgClient
         const names = freshTableNames()
-        for (
-          const statement of createTablesSql(names.jobs, names.attempts, names.schedules, names.queues, names.dedupe)
-        ) {
+        for (const statement of createTablesSql(names)) {
           yield* client.unsafe(statement).pipe(Effect.orDie)
         }
-        yield* Effect.addFinalizer(() =>
-          client.unsafe(
-            `DROP TABLE IF EXISTS "${names.attempts}", "${names.jobs}", "${names.schedules}", "${names.queues}", "${names.dedupe}" CASCADE`
-          ).pipe(Effect.ignore)
-        )
+        yield* Effect.addFinalizer(() => client.unsafe(dropTablesSql(names)).pipe(Effect.ignore))
 
         const typeMap = new Map<string, string>([
           ["PgBoolean", "boolean"],
           ["PgText", "text"],
           ["PgInteger", "integer"],
           ["PgBigInt53", "bigint"],
+          ["PgBigSerial53", "bigint"],
           ["PgJsonb", "jsonb"],
           ["PgTimestamp", "timestamp with time zone"]
         ])
@@ -48,7 +63,9 @@ if (!available) {
             [mqJobAttempts(mqJobs(names.jobs), names.attempts), names.attempts],
             [mqSchedules(names.schedules), names.schedules],
             [mqQueueControl(names.queues), names.queues],
-            [mqDedupe(names.dedupe), names.dedupe]
+            [mqDedupe(names.dedupe), names.dedupe],
+            [mqFlowChildren(names.flowChildren), names.flowChildren],
+            [mqFlowOutbox(names.flowOutbox), names.flowOutbox]
           ] as const
         ) {
           const config = getTableConfig(table)
@@ -87,12 +104,13 @@ if (!available) {
         }) {}
 
         let attempt = 0
-        const handlers = SendReport.toLayer((payload, context) =>
-          Effect.suspend(() => {
+        const handlers = SendReport.toLayer((payload) =>
+          Effect.gen(function*() {
             attempt++
-            return context.attempt === 1
-              ? Effect.die("transient failure")
-              : Effect.succeed(`report ${payload.month} sent`)
+            const current = yield* Worker.CurrentJob
+            return current.attempt === 1
+              ? yield* Effect.die("transient failure")
+              : `report ${payload.month} sent`
           })
         )
 
@@ -145,6 +163,7 @@ if (!available) {
             timeoutMs: undefined,
             dedupe: undefined,
             trace: undefined,
+            parent: undefined,
             delayMs: 0
           })
           expect((yield* durable.counts()).waiting).toBe(1)
@@ -168,16 +187,12 @@ if (!available) {
         const schedules = mqSchedules(names.schedules)
         const queues = mqQueueControl(names.queues)
         const dedupe = mqDedupe(names.dedupe)
-        for (
-          const statement of createTablesSql(names.jobs, names.attempts, names.schedules, names.queues, names.dedupe)
-        ) {
+        const flowChildren = mqFlowChildren(names.flowChildren)
+        const flowOutbox = mqFlowOutbox(names.flowOutbox)
+        for (const statement of createTablesSql(names)) {
           yield* client.unsafe(statement).pipe(Effect.orDie)
         }
-        yield* Effect.addFinalizer(() =>
-          client.unsafe(
-            `DROP TABLE IF EXISTS "${names.attempts}", "${names.jobs}", "${names.schedules}", "${names.queues}", "${names.dedupe}" CASCADE`
-          ).pipe(Effect.ignore)
-        )
+        yield* Effect.addFinalizer(() => client.unsafe(dropTablesSql(names)).pipe(Effect.ignore))
         let n = 0
         const store = yield* DrizzleJobStore.make({
           jobs,
@@ -185,6 +200,8 @@ if (!available) {
           schedules,
           queues,
           dedupe,
+          flowChildren,
+          flowOutbox,
           idGenerator: ({ name }) => `job_${name}_${++n}`
         }).pipe(Effect.orDie)
 
@@ -200,6 +217,7 @@ if (!available) {
           timeoutMs: undefined,
           dedupe: undefined,
           trace: undefined,
+          parent: undefined,
           delayMs: 0
         }
         const first = yield* store.enqueue({ ...base, name: "Gen" })
@@ -237,6 +255,7 @@ if (!available) {
           timeoutMs: undefined,
           dedupe: { key: "race", ttlMs: undefined, extend: false, replace: false },
           trace: undefined,
+          parent: undefined,
           delayMs: 0
         }
         const results = yield* Effect.all(
@@ -264,20 +283,16 @@ if (!available) {
         const schedules = mqSchedules(names.schedules)
         const queues = mqQueueControl(names.queues)
         const dedupe = mqDedupe(names.dedupe)
-        for (
-          const statement of createTablesSql(names.jobs, names.attempts, names.schedules, names.queues, names.dedupe)
-        ) {
+        const flowChildren = mqFlowChildren(names.flowChildren)
+        const flowOutbox = mqFlowOutbox(names.flowOutbox)
+        for (const statement of createTablesSql(names)) {
           yield* client.unsafe(statement).pipe(Effect.orDie)
         }
         yield* client.unsafe(
           `ALTER TABLE "${names.jobs}" ADD COLUMN company_id text NOT NULL, ADD COLUMN object_id text`
         ).pipe(Effect.orDie)
-        yield* Effect.addFinalizer(() =>
-          client.unsafe(
-            `DROP TABLE IF EXISTS "${names.attempts}", "${names.jobs}", "${names.schedules}", "${names.queues}", "${names.dedupe}" CASCADE`
-          ).pipe(Effect.ignore)
-        )
-        const store = yield* DrizzleJobStore.make({ jobs, attempts, schedules, queues, dedupe }).pipe(Effect.orDie)
+        yield* Effect.addFinalizer(() => client.unsafe(dropTablesSql(names)).pipe(Effect.ignore))
+        const store = yield* DrizzleJobStore.make({ jobs, attempts, schedules, queues, dedupe, flowChildren, flowOutbox }).pipe(Effect.orDie)
 
         const base = {
           id: undefined,
@@ -292,6 +307,7 @@ if (!available) {
           timeoutMs: undefined,
           dedupe: undefined,
           trace: undefined,
+          parent: undefined,
           delayMs: 0
         }
         // Default mapping: metadata[<TS key>] lands in the column at INSERT.
@@ -319,6 +335,8 @@ if (!available) {
           schedules,
           queues,
           dedupe,
+          flowChildren,
+          flowOutbox,
           extraValues: ({ metadata }) => ({ companyId: `tenant-${metadata.companyId}` })
         }).pipe(Effect.orDie)
         const overridden = yield* mapped.enqueue(base)
@@ -333,6 +351,7 @@ if (!available) {
           metadata: { companyId: "acme", objectId: "v1" },
           dedupe: { key: "obj", ttlMs: undefined, extend: false, replace: true },
           trace: undefined,
+          parent: undefined,
           delayMs: 60_000
         }
         const job = yield* store.enqueue(keyed)
@@ -357,20 +376,16 @@ if (!available) {
         const schedules = mqSchedules(names.schedules)
         const queues = mqQueueControl(names.queues)
         const dedupe = mqDedupe(names.dedupe)
-        for (
-          const statement of createTablesSql(names.jobs, names.attempts, names.schedules, names.queues, names.dedupe)
-        ) {
+        const flowChildren = mqFlowChildren(names.flowChildren)
+        const flowOutbox = mqFlowOutbox(names.flowOutbox)
+        for (const statement of createTablesSql(names)) {
           yield* client.unsafe(statement).pipe(Effect.orDie)
         }
         yield* client.unsafe(
           `ALTER TABLE "${names.jobs}" ADD COLUMN company_id text NOT NULL, ADD COLUMN object_id text`
         ).pipe(Effect.orDie)
-        yield* Effect.addFinalizer(() =>
-          client.unsafe(
-            `DROP TABLE IF EXISTS "${names.attempts}", "${names.jobs}", "${names.schedules}", "${names.queues}", "${names.dedupe}" CASCADE`
-          ).pipe(Effect.ignore)
-        )
-        const store = yield* DrizzleJobStore.make({ jobs, attempts, schedules, queues, dedupe }).pipe(Effect.orDie)
+        yield* Effect.addFinalizer(() => client.unsafe(dropTablesSql(names)).pipe(Effect.ignore))
+        const store = yield* DrizzleJobStore.make({ jobs, attempts, schedules, queues, dedupe, flowChildren, flowOutbox }).pipe(Effect.orDie)
 
         const base = {
           id: undefined,
@@ -385,6 +400,7 @@ if (!available) {
           timeoutMs: undefined,
           dedupe: undefined,
           trace: undefined,
+          parent: undefined,
           delayMs: 0
         }
         // The batch INSERT is a second hand-rolled VALUES list; it must fill
@@ -413,6 +429,8 @@ if (!available) {
           schedules,
           queues,
           dedupe,
+          flowChildren,
+          flowOutbox,
           extraValues: ({ metadata }) => ({ companyId: `tenant-${metadata.companyId}` })
         }).pipe(Effect.orDie)
         const overridden = yield* mapped.enqueueMany([base])
@@ -461,22 +479,20 @@ if (!available) {
         const schedules = mqSchedules(names.schedules)
         const queues = mqQueueControl(names.queues)
         const dedupe = mqDedupe(names.dedupe)
-        for (
-          const statement of createTablesSql(names.jobs, names.attempts, names.schedules, names.queues, names.dedupe)
-        ) {
+        const flowChildren = mqFlowChildren(names.flowChildren)
+        const flowOutbox = mqFlowOutbox(names.flowOutbox)
+        for (const statement of createTablesSql(names)) {
           yield* client.unsafe(statement).pipe(Effect.orDie)
         }
-        yield* Effect.addFinalizer(() =>
-          client.unsafe(
-            `DROP TABLE IF EXISTS "${names.attempts}", "${names.jobs}", "${names.schedules}", "${names.queues}", "${names.dedupe}" CASCADE`
-          ).pipe(Effect.ignore)
-        )
+        yield* Effect.addFinalizer(() => client.unsafe(dropTablesSql(names)).pipe(Effect.ignore))
         const store = yield* DrizzleJobStore.make({
           jobs,
           attempts,
           schedules,
           queues,
           dedupe,
+          flowChildren,
+          flowOutbox,
           historyTtl: "80 millis",
           historySweepInterval: "40 millis"
         }).pipe(Effect.orDie)
@@ -493,6 +509,7 @@ if (!available) {
           timeoutMs: undefined,
           dedupe: undefined,
           trace: undefined,
+          parent: undefined,
           delayMs: 0
         }
         const done = yield* store.enqueue({ ...base, name: "Swept" })
@@ -557,7 +574,9 @@ if (!available) {
           attempts: a.attempts,
           schedules: a.schedules,
           queues: a.queues,
-          dedupe: a.dedupe
+          dedupe: a.dedupe,
+          flowChildren: a.flowChildren,
+          flowOutbox: a.flowOutbox
         })
 
         const empty = yield* a.store.claim({
@@ -588,6 +607,7 @@ if (!available) {
           timeoutMs: undefined,
           dedupe: undefined,
           trace: undefined,
+          parent: undefined,
           delayMs: 0
         })
         const woken = yield* Fiber.join(waiter)
@@ -611,6 +631,7 @@ if (!available) {
             timeoutMs: undefined,
             dedupe: undefined,
             trace: undefined,
+            parent: undefined,
             delayMs: 0
           })
         }
@@ -635,21 +656,17 @@ if (!available) {
       Effect.gen(function*() {
         const names = freshTableNames()
         const client = yield* PgClient.PgClient
-        for (
-          const statement of createTablesSql(names.jobs, names.attempts, names.schedules, names.queues, names.dedupe)
-        ) {
+        for (const statement of createTablesSql(names)) {
           yield* client.unsafe(statement).pipe(Effect.orDie)
         }
-        yield* Effect.addFinalizer(() =>
-          client.unsafe(
-            `DROP TABLE IF EXISTS "${names.attempts}", "${names.jobs}", "${names.schedules}", "${names.queues}", "${names.dedupe}" CASCADE`
-          ).pipe(Effect.ignore)
-        )
+        yield* Effect.addFinalizer(() => client.unsafe(dropTablesSql(names)).pipe(Effect.ignore))
         const jobs = mqJobs(names.jobs)
         const attempts = mqJobAttempts(jobs, names.attempts)
         const schedules = mqSchedules(names.schedules)
         const queues = mqQueueControl(names.queues)
         const dedupe = mqDedupe(names.dedupe)
+        const flowChildren = mqFlowChildren(names.flowChildren)
+        const flowOutbox = mqFlowOutbox(names.flowOutbox)
 
         const Durable = JobStore.named("pg-live-durable")
         const Flaky = Job.make("PgFlaky", {
@@ -667,7 +684,7 @@ if (!available) {
         const stack = handlers.pipe(
           Layer.provideMerge(Worker.layer({ store: Durable, pollInterval: "100 millis" })),
           Layer.provideMerge(
-            DrizzleJobStore.layer({ jobs, attempts, schedules, queues, dedupe, store: Durable }).pipe(Layer.orDie)
+            DrizzleJobStore.layer({ jobs, attempts, schedules, queues, dedupe, flowChildren, flowOutbox, store: Durable }).pipe(Layer.orDie)
           ),
           Layer.provide(pgClientLive())
         )
@@ -698,15 +715,70 @@ if (!available) {
         const schedules = mqSchedules(names.schedules)
         const queues = mqQueueControl(names.queues)
         const dedupe = mqDedupe(names.dedupe)
-        const result = yield* Effect.exit(DrizzleJobStore.make({ jobs, attempts, schedules, queues, dedupe }))
+        const flowChildren = mqFlowChildren(names.flowChildren)
+        const flowOutbox = mqFlowOutbox(names.flowOutbox)
+        const result = yield* Effect.exit(DrizzleJobStore.make({ jobs, attempts, schedules, queues, dedupe, flowChildren, flowOutbox }))
         assert(Exit.isFailure(result))
         expect(JSON.stringify(result.cause)).toContain("drizzle-kit generate")
 
         // validate: false defers the failure to first use.
-        const store = yield* DrizzleJobStore.make({ jobs, attempts, schedules, queues, dedupe, validate: false })
+        const store = yield* DrizzleJobStore.make({ jobs, attempts, schedules, queues, dedupe, flowChildren, flowOutbox, validate: false })
         const first = yield* Effect.exit(store.counts())
         assert(Exit.isFailure(first))
       }).pipe(Effect.scoped, Effect.provide(pgClientLive())))
+
+    it("the deadlock retry predicate recognizes sql-pg's wrapped 40P01 shape", () => {
+      // The exact construction path of a real deadlock failure, mirrored
+      // from the installed sources: @effect/sql-pg's `classifyError` turns
+      // pg code 40P01 into `new DeadlockError({ cause, message, operation })`
+      // inside `new SqlError({ reason })` (PgClient.ts, "Failed to execute
+      // statement"/"execute"), and drizzle's Effect session wraps that as
+      // `new EffectDrizzleQueryError({ query, params, cause: Cause.fail(e) })`
+      // (pg-core/effect/session.ts). String(error) renders neither the code
+      // nor the reason tag, which is why the predicate walks the structure.
+      const pgError = Object.assign(new Error("deadlock detected"), { code: "40P01" })
+      const sqlError = new SqlError({
+        reason: new DeadlockError({
+          cause: pgError,
+          message: "Failed to execute statement",
+          operation: "execute"
+        })
+      })
+      const wrapped = new EffectDrizzleQueryError({
+        query: "UPDATE jobs SET ...",
+        params: [],
+        cause: Cause.fail(sqlError)
+      })
+      expect(DrizzleJobStore.isDeadlockError(wrapped)).toBe(true)
+      expect(DrizzleJobStore.isDeadlockError(sqlError)).toBe(true)
+      // String rendering hides both deadlock signals, so a substring
+      // predicate can never fire on this shape — the structural walk is
+      // load-bearing.
+      expect(String(wrapped).includes("40P01")).toBe(false)
+      expect(String(wrapped).includes("deadlock detected")).toBe(false)
+
+      // Fallback: an unclassified reason still carrying the raw pg error.
+      const unclassified = new SqlError({
+        reason: new UnknownError({
+          cause: pgError,
+          message: "Failed to execute statement",
+          operation: "execute"
+        })
+      })
+      expect(DrizzleJobStore.isDeadlockError(unclassified)).toBe(true)
+
+      // Non-deadlock failures must not retry.
+      const boring = new SqlError({
+        reason: new UnknownError({
+          cause: new Error("connection reset"),
+          message: "Failed to execute statement",
+          operation: "execute"
+        })
+      })
+      expect(DrizzleJobStore.isDeadlockError(boring)).toBe(false)
+      expect(DrizzleJobStore.isDeadlockError(new Error("40P01"))).toBe(false)
+      expect(DrizzleJobStore.isDeadlockError(undefined)).toBe(false)
+    })
 
     it("the jobs table `name` column is typed to the job-tag union", () => {
       const table = mqJobs<"generate-invoice" | "send-email">("typed_jobs")

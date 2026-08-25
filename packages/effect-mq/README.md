@@ -51,7 +51,7 @@ const producer = Effect.gen(function*() {
 // 3. Run. Workers are layers — deploy them in the same process or across
 //    machines against shared storage.
 const RunnerLive = SendEmail.toLayer(
-  (payload, ctx) => Effect.succeed(`message-${ctx.jobId}`),
+  (payload) => Effect.map(Worker.CurrentJob, ({ jobId }) => `message-${jobId}`),
   { concurrency: 5 }
 ).pipe(
   Layer.provideMerge(Worker.layer()),
@@ -143,6 +143,49 @@ from now and stays on its original grid. If workers are down over several
 occurrences, missed slots collapse into one run (the next sweep enqueues the
 overdue slot once, then advances past `now`). Options mirror `enqueue`:
 `metadata`, `priority`, `attempts`, `backoff`, `keep`, `timeout`.
+
+## Parent-child flows
+
+A flow fans a parent job out into N children, parks the parent until every
+child settles, then resumes it with their typed results. Children can live
+on a **different store** than the parent (a cron parent in Postgres fanning
+out 10k idempotent sends into Redis, collecting the outcomes back):
+
+```ts
+import { Flow } from "effect-mq"
+
+const DigestFlow = Flow.make("daily-digest", {
+  parent: SendDigest,            // Postgres
+  children: [SendEmail],         // Redis
+  onChildFailure: "continue"     // or "fail": first failure settles the flow
+})
+
+// The parent worker runs two phases (requires parent AND child stores):
+const DigestWorker = DigestFlow.toLayer({
+  fanOut: (payload) =>
+    Effect.map(Users.active, (users) =>
+      Flow.children(SendEmail, users.map((user) => ({
+        key: user.id,                       // unique in the flow = idempotency
+        payload: { userId: user.id }
+      })))),
+  collect: (payload, results) =>
+    Effect.succeed({ sent: results.counts.completed, failed: results.counts.failed })
+})
+
+// Workers that run the children declare the flow so their relay can push
+// results to the parent store the moment each child acks:
+Worker.layer({ store: EmailStore, flows: [DigestFlow] })
+```
+
+The parent's store owns the flow (manifest, per-child results, outcome
+counters), so "settle exactly once" is single-store atomic. Cross-store,
+every terminal child transition appends its report to the child store's
+**outbox** in the same atomic operation; worker relays push those in
+batches (children keep completing through parent-store outages) and a
+reconciliation sweeper repairs anything the push path misses, from storage
+alone. Flows nest (a child can be another flow's parent), and `collect`
+reads results as plain `counts`, materialized buckets, or a paged `Stream`.
+Docs: [Parent-child flows](https://www.effect-mq.com/guide/flows).
 
 ## Timeouts, cancellation, and unrecoverable errors
 
@@ -357,16 +400,26 @@ migrations** — no library-run DDL, no parallel migration system:
 
 ```ts
 // db/schema.ts
-import { mqDedupe, mqJobAttempts, mqJobs, mqQueueControl, mqSchedules } from "effect-mq/drizzle-postgres"
+import {
+  mqDedupe,
+  mqFlowChildren,
+  mqFlowOutbox,
+  mqJobAttempts,
+  mqJobs,
+  mqQueueControl,
+  mqSchedules
+} from "effect-mq/drizzle-postgres"
 
 // The `name` column is typed to your job tags (derived, not hand-written):
 type JobNames = typeof GenerateInvoice._tag | typeof SendEmail._tag
 
-export const jobs = mqJobs<JobNames>()          // default table: effect_mq_jobs
-export const jobAttempts = mqJobAttempts(jobs)  // default: effect_mq_job_attempts
-export const jobSchedules = mqSchedules()       // default: effect_mq_schedules
-export const jobQueues = mqQueueControl()       // default: effect_mq_queue_control
-export const jobDedupe = mqDedupe()             // default: effect_mq_dedupe
+export const jobs = mqJobs<JobNames>()            // default table: effect_mq_jobs
+export const jobAttempts = mqJobAttempts(jobs)    // default: effect_mq_job_attempts
+export const jobSchedules = mqSchedules()         // default: effect_mq_schedules
+export const jobQueues = mqQueueControl()         // default: effect_mq_queue_control
+export const jobDedupe = mqDedupe()               // default: effect_mq_dedupe
+export const jobFlowChildren = mqFlowChildren()   // default: effect_mq_flow_children
+export const jobFlowOutbox = mqFlowOutbox()       // default: effect_mq_flow_outbox
 ```
 
 Need more indexes (the built-ins cover claiming, listing, metadata
@@ -390,7 +443,7 @@ table; at enqueue the store fills each extended column from the job's
 `metadata: (payload) => ...` is your creation-time hook), NULL when absent:
 
 ```ts
-class SyncBenefits extends Job.make("sync-benefits", {
+class SyncPayments extends Job.make("sync-payments", {
   payload: { companyId: Schema.String, objectId: Schema.String },
   metadata: ({ companyId, objectId }) => ({ companyId, objectId })
 }) {}
@@ -427,14 +480,24 @@ When a future effect-mq version changes the layout, the factory changes and
 import { DrizzleJobStore } from "effect-mq/drizzle-postgres"
 import { PgClient } from "@effect/sql-pg"
 import { Layer, Redacted } from "effect"
-import { jobAttempts, jobDedupe, jobQueues, jobs, jobSchedules } from "./db/schema.ts"
+import {
+  jobAttempts,
+  jobDedupe,
+  jobFlowChildren,
+  jobFlowOutbox,
+  jobQueues,
+  jobs,
+  jobSchedules
+} from "./db/schema.ts"
 
 const JobStoreLive = DrizzleJobStore.layer({
   jobs,
   attempts: jobAttempts,
   schedules: jobSchedules,
   queues: jobQueues,
-  dedupe: jobDedupe
+  dedupe: jobDedupe,
+  flowChildren: jobFlowChildren,
+  flowOutbox: jobFlowOutbox
 }).pipe(
   Layer.provide(PgClient.layer({ url: Redacted.make(process.env.DATABASE_URL!) }))
 )
@@ -593,6 +656,9 @@ ledger), `retry`, `cancel`, `cancelByKey` (by dedup key, idempotent),
 | `queueMetricsInterval` | off | sample `store.counts()` per queue into the depth gauge |
 | `handlerSpanName` | `` `${name}.run` `` | name of the span wrapping each handler run |
 | `traceLinking` | `auto` | parent for immediate jobs, causal link for delayed ones (`parent`/`link`/`none` force a mode) |
+| `onJobFailure` | — | callback after each failed run is acked; runs isolated |
+| `flows` | — | flows whose children this worker runs (lets its relay push results) |
+| `flowSweepInterval` | 30s | flow sweeper cadence + the relay's fallback drain cadence |
 | `id` | random | identifier used in lock tokens |
 
 **Store construction** — every driver accepts `idGenerator`, `historyTtl`,
@@ -629,12 +695,14 @@ plain Effect, so it works with any test runner.
 
 ## Writing a storage driver
 
-Implement the `JobStore` service (one atomic seam: `enqueue`, `claim`, `ack`,
-`release`, `extendLocks`, `recoverStalled`, `awaitWake`, `getJob`,
-`getAttempts`, `list`, `retry`, `counts`, `remove`, `cancel`, `promote`,
-`pause`/`resume`/`pausedQueues`, `cancelByDedupe`, and the schedule ops
-`upsertSchedule`/`removeSchedule`/`listSchedules`/`dueSchedules`/`advanceSchedule`)
-and run the conformance suite against it:
+Implement the `JobStore` service (one atomic seam: `enqueue`/`enqueueMany`,
+`claim`, `ack`, `release`, `extendLocks`, `recoverStalled`, `awaitWake`,
+`getJob`, `getAttempts`, `list`, `retry`, `counts`, `remove`, `cancel`,
+`promote`, `pause`/`resume`/`pausedQueues`, `cancelByDedupe`, the schedule
+ops `upsertSchedule`/`removeSchedule`/`listSchedules`/`dueSchedules`/
+`tickSchedule`/`advanceSchedule`, and the flow ops `recordChildResults`/
+`listChildResults`/`flowSweepWork`/`markChildrenCascaded`/`peekOutbox`/
+`deleteOutbox`) and run the conformance suite against it:
 
 ```ts
 import { jobStoreConformance } from "effect-mq/testing"
@@ -652,7 +720,7 @@ suite in this repo runs the same conformance tests against a real database.
 
 Next up: drizzle schema customization (column renames, native id and
 timestamp column types, a typed queue registry), a cross-process event
-stream, and parent-child fan-out. Full prioritized list:
+stream, and global queue concurrency/rate limits. Full prioritized list:
 [ROADMAP.md](https://github.com/TeamWarp/effect-mq/blob/main/ROADMAP.md);
 release history:
 [CHANGELOG.md](https://github.com/TeamWarp/effect-mq/blob/main/CHANGELOG.md).
