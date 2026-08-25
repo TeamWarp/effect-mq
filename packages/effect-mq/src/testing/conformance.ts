@@ -1115,7 +1115,8 @@ export const jobStoreConformance = (
                 flowName: "rich-flow",
                 flowId: JobId("rich-parent"),
                 childKey: "rich-child",
-                parentStoreKey: "effect-mq/JobStore"
+                parentStoreKey: "effect-mq/JobStore",
+                depth: 1
               }
             })
           yield* store.enqueue(richRequest("rich-single"))
@@ -1168,7 +1169,8 @@ export const jobStoreConformance = (
             flowName: "rich-flow",
             flowId: "rich-parent",
             childKey: "rich-child",
-            parentStoreKey: "effect-mq/JobStore"
+            parentStoreKey: "effect-mq/JobStore",
+            depth: 1
           })
           expect(expected.flow).toBeUndefined()
           for (const id of [JobId("rich-batch"), JobId("rich-tick")]) {
@@ -1749,7 +1751,8 @@ export const jobStoreConformance = (
           flowName: "test-flow",
           flowId,
           childKey: key,
-          parentStoreKey: "main"
+          parentStoreKey: "main",
+          depth: 1
         },
         ...overrides
       })
@@ -1908,7 +1911,7 @@ export const jobStoreConformance = (
         })
       ))
 
-    it.effect("recordChildResult applies once, decrements, and settles on the last report", () =>
+    it.effect("recordChildResults applies once, decrements, and settles on the last report", () =>
       withStore((store) =>
         Effect.gen(function*() {
           const flowId = yield* fanOutParent(store)
@@ -1937,11 +1940,18 @@ export const jobStoreConformance = (
           const parent = yield* store.getJob(flowId)
           assert(Option.isSome(parent))
           expect(parent.value.state).toBe("waiting")
-          // The counters mirror the recorded outcomes exactly.
+          // The counters mirror the recorded outcomes exactly — via getJob,
+          // via the claimed record (what `collect` reads its counts from),
+          // and via list (what dashboards read). A driver whose claim/list
+          // projections drop the counter columns fails here, not in prod.
           expect(parent.value.flow).toEqual(flowCounts({ completed: 1, failed: 1 }))
           const claim = yield* store.claim(claimOptions({ token: "t-resume" }))
           assert(claim._tag === "Claimed")
           expect(claim.job.id).toBe(flowId)
+          expect(claim.job.flow).toEqual(flowCounts({ completed: 1, failed: 1 }))
+          const listed = yield* store.list({ name: "TestJob" })
+          expect(listed.items.find((job) => job.id === flowId)?.flow)
+            .toEqual(flowCounts({ completed: 1, failed: 1 }))
 
           const rows = yield* store.listChildResults(flowId)
           const byKey = new Map(rows.items.map((row) => [row.childKey, row]))
@@ -1954,7 +1964,7 @@ export const jobStoreConformance = (
         })
       ))
 
-    it.effect("recordChildResult wakes a taker parked on the parent's queue", () =>
+    it.effect("recordChildResults wakes a taker parked on the parent's queue", () =>
       withStore((store) =>
         Effect.gen(function*() {
           const flowId = yield* fanOutParent(store, { children: ["only"] })
@@ -2025,6 +2035,8 @@ export const jobStoreConformance = (
           const parent = yield* store.getJob(flowId)
           assert(Option.isSome(parent))
           expect(parent.value.state).toBe("cancelled")
+          // The settle marking moves the counters too.
+          expect(parent.value.flow).toEqual(flowCounts({ completed: 1, cancelled: 1 }))
 
           const rows = yield* store.listChildResults(flowId)
           const byKey = new Map(rows.items.map((row) => [row.childKey, row]))
@@ -2055,6 +2067,7 @@ export const jobStoreConformance = (
           const parent = yield* store.getJob(id)
           assert(Option.isSome(parent))
           expect(parent.value.state).toBe("cancelled")
+          expect(parent.value.flow).toEqual(flowCounts({ cancelled: 2 }))
 
           // The manifest landed and every row was marked for cascade, so
           // the sweeper delivers (mostly no-op) cancels to the child store.
@@ -2389,6 +2402,98 @@ export const jobStoreConformance = (
         })
       ))
 
+    it.effect("a cancelled child report moves the cancelled counter", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const flowId = yield* fanOutParent(store)
+          yield* recordOne(store, report(flowId, "a", "cancelled", { exit: undefined }))
+          const parent = yield* store.getJob(flowId)
+          assert(Option.isSome(parent))
+          expect(parent.value.flow).toEqual(flowCounts({ pending: 1, cancelled: 1 }))
+        })
+      ))
+
+    it.effect("peekOutbox pages past prior entries with `after`, even deleted ones", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const enqueueChild = (key: string) =>
+            Effect.gen(function*() {
+              const { id } = yield* store.enqueue(baseRequest({
+                parent: {
+                  flowName: "test-flow",
+                  flowId: JobId("remote-flow-3"),
+                  childKey: key,
+                  parentStoreKey: "main",
+                  depth: 1
+                }
+              }))
+              const claim = yield* store.claim(claimOptions({ token: `t-${key}` }))
+              assert(claim._tag === "Claimed")
+              yield* store.ack(id, `t-${key}`, { _tag: "Complete", exit: { key } })
+            })
+          yield* enqueueChild("one")
+          yield* enqueueChild("two")
+          yield* enqueueChild("three")
+
+          const first = yield* store.peekOutbox({ limit: 2 })
+          expect(first.map((entry) => entry.report.childKey)).toEqual(["one", "two"])
+          const cursor = first[first.length - 1]?.id
+          assert(cursor !== undefined)
+          const rest = yield* store.peekOutbox({ limit: 2, after: cursor })
+          expect(rest.map((entry) => entry.report.childKey)).toEqual(["three"])
+
+          // The cursor keeps working when the entry it names is gone.
+          yield* store.deleteOutbox([cursor])
+          const restAgain = yield* store.peekOutbox({ limit: 2, after: cursor })
+          expect(restAgain.map((entry) => entry.report.childKey)).toEqual(["three"])
+        })
+      ))
+
+    it.effect("cancels honoured by the stall sweep and retry acks land in the outbox", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const envelope = (key: string): JobStore.ParentEnvelope => ({
+            flowName: "test-flow",
+            flowId: JobId("remote-flow-4"),
+            childKey: key,
+            parentStoreKey: "main",
+            depth: 1
+          })
+          // A cancel honoured when a RETRY ack finds the flag set.
+          const retried = yield* store.enqueue(baseRequest({ parent: envelope("retry-cancel") }))
+          const claimA = yield* store.claim(claimOptions({ token: "t-a" }))
+          assert(claimA._tag === "Claimed")
+          yield* store.cancel(retried.id)
+          yield* store.ack(retried.id, "t-a", { _tag: "Retry", delayMs: 0, exit: undefined })
+
+          // A cancel honoured when the stall sweep recovers a dead worker.
+          const stalled = yield* store.enqueue(baseRequest({ parent: envelope("stall-cancel") }))
+          const claimB = yield* store.claim(claimOptions({ token: "t-b", lockDurationMs: 1_000 }))
+          assert(claimB._tag === "Claimed")
+          yield* store.cancel(stalled.id)
+          yield* TestClock.adjust(2_000)
+          yield* store.recoverStalled({ maxStalledCount: 5 })
+
+          // A direct cancel of a PARKED nested parent (waiting-children).
+          const parked = yield* store.enqueue(baseRequest({ parent: envelope("parked-cancel") }))
+          const claimC = yield* store.claim(claimOptions({ token: "t-c" }))
+          assert(claimC._tag === "Claimed")
+          yield* store.ack(parked.id, "t-c", {
+            _tag: "FanOut",
+            failFast: false,
+            children: [childSpec(parked.id, "a")]
+          })
+          yield* store.cancel(parked.id)
+
+          const entries = yield* store.peekOutbox({ limit: 10 })
+          expect(entries.map((entry) => [entry.report.childKey, entry.report.outcome])).toEqual([
+            ["retry-cancel", "cancelled"],
+            ["stall-cancel", "cancelled"],
+            ["parked-cancel", "cancelled"]
+          ])
+        })
+      ))
+
     it.effect("terminal transitions of envelope-carrying jobs land in the outbox", () =>
       withStore((store) =>
         Effect.gen(function*() {
@@ -2396,7 +2501,8 @@ export const jobStoreConformance = (
             flowName: "test-flow",
             flowId: JobId("remote-flow-1"),
             childKey: key,
-            parentStoreKey: "main"
+            parentStoreKey: "main",
+            depth: 1
           })
           // A plain job's terminal ack appends nothing.
           const plain = yield* store.enqueue(baseRequest())
@@ -2463,7 +2569,8 @@ export const jobStoreConformance = (
             flowName: "test-flow",
             flowId: JobId("remote-flow-2"),
             childKey: "released",
-            parentStoreKey: "main"
+            parentStoreKey: "main",
+            depth: 1
           }
           // A cancel that arrives while the child runs, honoured when the
           // worker RELEASES the job (shutdown) instead of acking it.
@@ -2492,7 +2599,8 @@ export const jobStoreConformance = (
               flowName: "outer-flow",
               flowId: JobId("outer-2"),
               childKey: "inner-raced",
-              parentStoreKey: "outer-store"
+              parentStoreKey: "outer-store",
+              depth: 1
             }
           }))
           const claim = yield* store.claim(claimOptions({ token: "t-race" }))
@@ -2524,7 +2632,8 @@ export const jobStoreConformance = (
               flowName: "outer-flow",
               flowId: JobId("outer-1"),
               childKey: "inner",
-              parentStoreKey: "outer-store"
+              parentStoreKey: "outer-store",
+              depth: 1
             }
           }))
           const claim = yield* store.claim(claimOptions({ token: "t-inner" }))

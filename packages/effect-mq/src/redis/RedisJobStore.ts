@@ -1003,8 +1003,28 @@ export const make = (
             const none: ReadonlyArray<JobStore.OutboxEntry> = []
             return none
           }
-          const raw = yield* redis.send("ZRANGE", `${prefix}:flowoutbox`, "0", String(limit - 1))
-          // SAFETY: ZRANGE always replies with an array of bulk strings.
+          // The `after` cursor compares by the id's embedded score (the seq
+          // prefix before the NUL), so the walk moves past the named entry
+          // whether or not it still exists. Unparseable input reads as unset.
+          let afterSeq: number | undefined = undefined
+          if (peekOptions.after !== undefined) {
+            const nul = peekOptions.after.indexOf("\u0000")
+            const seq = nul > 0 ? Number(peekOptions.after.slice(0, nul)) : Number.NaN
+            if (Number.isFinite(seq)) afterSeq = seq
+          }
+          const raw = afterSeq === undefined
+            ? yield* redis.send("ZRANGE", `${prefix}:flowoutbox`, "0", String(limit - 1))
+            : yield* redis.send(
+              "ZRANGEBYSCORE",
+              `${prefix}:flowoutbox`,
+              `(${afterSeq}`,
+              "+inf",
+              "LIMIT",
+              "0",
+              String(limit)
+            )
+          // SAFETY: ZRANGE/ZRANGEBYSCORE always reply with arrays of bulk
+          // strings.
           const members = raw as ReadonlyArray<string>
           return members.map(toOutboxEntry)
         }).pipe(Effect.mapError(storeError("peekOutbox failed"))),

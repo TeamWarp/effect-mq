@@ -37,7 +37,11 @@
  *                               (cancels still owed to child stores)
  * - `p:flowoutbox`              ZSET, score = seq from `p:flowoutbox:seq`,
  *                               member `<seq>\0<report json>` — undelivered
- *                               child-result reports (see OutboxEntry)
+ *                               child-result reports (see OutboxEntry). Peek
+ *                               is ZRANGE oldest-first; its `after` cursor
+ *                               parses the seq prefix from a prior id and
+ *                               resumes via exclusive ZRANGEBYSCORE, so the
+ *                               walk moves past deleted entries too
  *
  * `waiting-children` parents live only in the job hash, `p:all`, and
  * `p:counts` — never in a pending zset, so `claim` can never return them.

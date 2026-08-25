@@ -2,8 +2,10 @@ import { Job, JobStore, Worker } from "../../src/index.ts"
 import { PgClient } from "@effect/sql-pg"
 import { jobStoreConformance } from "../../src/testing/index.ts"
 import { assert, describe, expect, it } from "@effect/vitest"
+import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
 import { getTableConfig, index, text } from "drizzle-orm/pg-core"
-import { Effect, Exit, Fiber, Layer, Option, Schedule, Schema } from "effect"
+import { Cause, Effect, Exit, Fiber, Layer, Option, Schedule, Schema } from "effect"
+import { DeadlockError, SqlError, UnknownError } from "effect/unstable/sql/SqlError"
 import {
   DrizzleJobStore,
   mqDedupe,
@@ -723,6 +725,57 @@ if (!available) {
         const first = yield* Effect.exit(store.counts())
         assert(Exit.isFailure(first))
       }).pipe(Effect.scoped, Effect.provide(pgClientLive())))
+
+    it("the deadlock retry predicate recognizes sql-pg's wrapped 40P01 shape", () => {
+      // The exact construction path of a real deadlock failure, mirrored
+      // from the installed sources: @effect/sql-pg's `classifyError` turns
+      // pg code 40P01 into `new DeadlockError({ cause, message, operation })`
+      // inside `new SqlError({ reason })` (PgClient.ts, "Failed to execute
+      // statement"/"execute"), and drizzle's Effect session wraps that as
+      // `new EffectDrizzleQueryError({ query, params, cause: Cause.fail(e) })`
+      // (pg-core/effect/session.ts). String(error) renders neither the code
+      // nor the reason tag, which is why the predicate walks the structure.
+      const pgError = Object.assign(new Error("deadlock detected"), { code: "40P01" })
+      const sqlError = new SqlError({
+        reason: new DeadlockError({
+          cause: pgError,
+          message: "Failed to execute statement",
+          operation: "execute"
+        })
+      })
+      const wrapped = new EffectDrizzleQueryError({
+        query: "UPDATE jobs SET ...",
+        params: [],
+        cause: Cause.fail(sqlError)
+      })
+      expect(DrizzleJobStore.isDeadlockError(wrapped)).toBe(true)
+      expect(DrizzleJobStore.isDeadlockError(sqlError)).toBe(true)
+      // The old string-matching predicate never fired on this shape.
+      expect(String(wrapped).includes("40P01")).toBe(false)
+      expect(String(wrapped).includes("deadlock detected")).toBe(false)
+
+      // Fallback: an unclassified reason still carrying the raw pg error.
+      const unclassified = new SqlError({
+        reason: new UnknownError({
+          cause: pgError,
+          message: "Failed to execute statement",
+          operation: "execute"
+        })
+      })
+      expect(DrizzleJobStore.isDeadlockError(unclassified)).toBe(true)
+
+      // Non-deadlock failures must not retry.
+      const boring = new SqlError({
+        reason: new UnknownError({
+          cause: new Error("connection reset"),
+          message: "Failed to execute statement",
+          operation: "execute"
+        })
+      })
+      expect(DrizzleJobStore.isDeadlockError(boring)).toBe(false)
+      expect(DrizzleJobStore.isDeadlockError(new Error("40P01"))).toBe(false)
+      expect(DrizzleJobStore.isDeadlockError(undefined)).toBe(false)
+    })
 
     it("the jobs table `name` column is typed to the job-tag union", () => {
       const table = mqJobs<"generate-invoice" | "send-email">("typed_jobs")

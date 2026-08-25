@@ -329,6 +329,13 @@ export interface ParentEnvelope {
   readonly childKey: string
   /** The parent store's context-key string, for cross-store report routing. */
   readonly parentStoreKey: string
+  /**
+   * This child's nesting level: 1 for children of a top-level flow, one
+   * more per level of nesting. Carried explicitly (never parsed out of
+   * ids — user keys are arbitrary strings) so the fan-out depth cap can
+   * catch cyclic definitions.
+   */
+  readonly depth: number
 }
 
 /**
@@ -374,8 +381,8 @@ export interface FlowChildSpec {
 /**
  * A dependency row: one child's status and result as recorded in the PARENT
  * store. `exit` is the child's schema-encoded exit; `failedReason` carries
- * store-side child failures (stall exhaustion, unreportable workers) that
- * never produced an exit. `cascaded` marks that a cancel no longer needs to
+ * store-side child failures (stall exhaustion, a nested parent's fail-fast
+ * settle) that never produced an exit. `cascaded` marks that a cancel no longer needs to
  * be delivered into the child's store (set by `markChildrenCascaded`, or
  * immediately when the recorded outcome came FROM the child's store).
  *
@@ -1052,6 +1059,11 @@ export interface Service {
    * parent row second — reports, fail-fast marking, and cancel marking all
    * take locks in this order, so report-vs-settle cannot deadlock.
    *
+   * Drivers may process very large batches in atomic sub-batches (the
+   * Redis driver chunks at 500); the apply-all-before-settle rule then
+   * holds per sub-batch. Worker relays never exceed one page (500), so
+   * this only shows on direct store calls with larger batches.
+   *
    * @since 0.6.0
    */
   readonly recordChildResults: (
@@ -1067,10 +1079,17 @@ export interface Service {
    * `recordChildResults` on the parent store, then deletes — redelivery
    * after a crash is safe because dependency rows dedup.
    *
+   * `after` pages past a previously-returned entry id (exclusive), whether
+   * or not that entry still exists — the relay walks the whole outbox this
+   * way, so entries it cannot route (their parent store is not provided
+   * here) never blockade the ones behind them. Anything other than an id
+   * this store issued may be treated as unset.
+   *
    * @since 0.6.0
    */
   readonly peekOutbox: (options: {
     readonly limit: number
+    readonly after?: string | undefined
   }) => Effect.Effect<ReadonlyArray<OutboxEntry>, JobStoreError>
 
   /**

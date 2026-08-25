@@ -27,9 +27,11 @@ The "v2" section at the bottom shipped with these shapes:
 
 As-built deviations from this document:
 
-- **Phase marker**: persisted as `JobRecord.flow` (`{ failFast, pending }`);
-  its *presence* is the collect-phase marker, instead of a separate
-  `flowPhase` enum field. The fail-fast policy is persisted inside it.
+- **Phase marker**: persisted as `JobRecord.flow`
+  (`{ failFast, pending, completed, failed, cancelled }` — the four
+  counters always sum to the manifest size); its *presence* is the
+  collect-phase marker, instead of a separate `flowPhase` enum field. The
+  fail-fast policy is persisted inside it.
 - **Fail-fast settle**: the store settles the parent as `failed` with
   `failedReason: 'effect-mq: flow child "<key>" failed'` and no exit — the
   same shape as stall exhaustion — rather than synthesizing an encoded

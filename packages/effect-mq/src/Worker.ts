@@ -120,7 +120,9 @@ export interface FlowDescriptor extends FlowAny {
   readonly childStores: ReadonlyArray<Context.Key<any, StoreService>>
   readonly fanOut: (
     payload: JobRecord["payload"],
-    context: JobContext
+    context: JobContext,
+    /** The parent's own nesting depth (0 for top-level flows). */
+    parentDepth: number
   ) => Effect.Effect<ReadonlyArray<FlowChildSpec>, unknown, unknown>
   readonly collect: (
     payload: JobRecord["payload"],
@@ -306,7 +308,8 @@ interface HandlerEntry {
     readonly failFast: boolean
     readonly fanOut: (
       payload: JobRecord["payload"],
-      context: JobContext
+      context: JobContext,
+      parentDepth: number
     ) => Effect.Effect<ReadonlyArray<FlowChildSpec>, unknown>
     readonly enqueueChildren: (
       children: ReadonlyArray<FlowChildSpec>
@@ -564,17 +567,22 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
 
     const relayDrain = Effect.gen(function*() {
       const pageSize = 500
+      // Cursor-walk the whole outbox: `after` pages past everything already
+      // seen this drain, so entries this worker cannot route — or could not
+      // deliver just now — never blockade the ones behind them. Each drain
+      // starts from the head again, which is what retries them.
+      let after: string | undefined
       while (true) {
-        const entries = yield* retryStore(store.peekOutbox({ limit: pageSize }))
+        const entries = yield* retryStore(store.peekOutbox({ limit: pageSize, after }))
         if (entries.length === 0) return
-        // Route each entry to its parent store; entries this worker cannot
-        // route stay in the outbox for a worker that can (reconciliation
-        // keeps the flow correct regardless).
+        after = entries[entries.length - 1]?.id
         const byStore = new Map<string, Array<(typeof entries)[number]>>()
         let skipped = 0
         for (const entry of entries) {
-          const target = storesByKey.get(entry.parentStoreKey)
-          if (target === undefined) {
+          if (!storesByKey.has(entry.parentStoreKey)) {
+            // No route from this worker; a worker with the right `flows`
+            // registration relays it, and reconciliation keeps the flow
+            // correct regardless.
             skipped += 1
             continue
           }
@@ -588,54 +596,64 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
         if (skipped > 0) {
           yield* Metric.update(Metrics.flowOutboxSkipped, skipped)
         }
-        let delivered = 0
         for (const [key, group] of byStore) {
           const target = storesByKey.get(key)
           if (target === undefined) continue
-          const results = yield* retryStore(
-            target.recordChildResults(group.map((entry) => entry.report))
+          // One unreachable parent store must not block deliveries to the
+          // others: log, leave the group's entries for the next pass, move
+          // on.
+          yield* Effect.gen(function*() {
+            const results = yield* retryStore(
+              target.recordChildResults(group.map((entry) => entry.report))
+            )
+            for (const [index, result] of results.entries()) {
+              const entry = group[index]
+              if (entry === undefined) continue
+              if (result.applied) {
+                yield* Metric.update(
+                  Metrics.flowChildReports.pipe(
+                    Metric.withAttributes({
+                      flow: entry.flowName,
+                      outcome: entry.report.outcome,
+                      source: "report"
+                    })
+                  ),
+                  1
+                )
+              }
+              if (
+                result.parentSettled && entry.report.outcome === "failed" &&
+                flowPolicies.get(entry.flowName)?.failFast === true
+              ) {
+                yield* Effect.logError(
+                  `effect-mq: flow "${entry.flowName}" (${entry.report.flowId}) settled failed-fast on child "${entry.report.childKey}"`
+                )
+              }
+            }
+            yield* retryStore(store.deleteOutbox(group.map((entry) => entry.id)))
+          }).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning(
+                `effect-mq: outbox relay could not deliver to store "${key}"; retrying next pass`,
+                cause
+              )
+            )
           )
-          for (const [index, result] of results.entries()) {
-            const entry = group[index]
-            if (entry === undefined) continue
-            if (result.applied) {
-              yield* Metric.update(
-                Metrics.flowChildReports.pipe(
-                  Metric.withAttributes({
-                    flow: entry.flowName,
-                    outcome: entry.report.outcome,
-                    source: "report"
-                  })
-                ),
-                1
-              )
-            }
-            if (
-              result.parentSettled && entry.report.outcome === "failed" &&
-              flowPolicies.get(entry.flowName)?.failFast === true
-            ) {
-              yield* Effect.logError(
-                `effect-mq: flow "${entry.flowName}" (${entry.report.flowId}) settled failed-fast on child "${entry.report.childKey}"`
-              )
-            }
-          }
-          yield* retryStore(store.deleteOutbox(group.map((entry) => entry.id)))
-          delivered += group.length
         }
-        // Only continue when this page was fully consumed — a partially
-        // routable page would return the same head forever.
-        if (entries.length < pageSize || delivered < entries.length) return
+        if (entries.length < pageSize) return
       }
     })
 
     const relayLoop = Effect.gen(function*() {
       const observed = relayPulseVersion
-      yield* relayDrain
+      // Failures are contained per drain so the race below always paces the
+      // loop (no hot retry); a pulse fired DURING the drain re-runs it
+      // immediately via the version check.
+      yield* relayDrain.pipe(
+        Effect.catchCause((cause) => Effect.logError("effect-mq: outbox relay drain failed", cause))
+      )
       yield* Effect.race(awaitRelayPulse(observed), Effect.sleep(flowSweepMs))
-    }).pipe(
-      Effect.catchCause((cause) => Effect.logError("effect-mq: outbox relay failed", cause)),
-      Effect.forever
-    )
+    }).pipe(Effect.forever)
 
     const ensureRelay = Effect.suspend(() => {
       if (relayStarted) return Effect.void
@@ -739,7 +757,7 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
           const flow = entry.flow
           const isFanOut = flow !== undefined && record.flow === undefined
           const runEffect = flow !== undefined && record.flow === undefined
-            ? flow.fanOut(record.payload, context)
+            ? flow.fanOut(record.payload, context, record.parent?.depth ?? 0)
             : entry.run(record.payload, context, record.flow)
           const withRunSpan = runEffect.pipe(
             Effect.withSpan(
@@ -1462,11 +1480,11 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
             flow: {
               flowName: flow.name,
               failFast: flow.failFast,
-              fanOut: (payload, context) =>
+              fanOut: (payload, context, parentDepth) =>
                 provideCaptured(
                   decodePayload(payload).pipe(
                     Effect.orDie,
-                    Effect.flatMap((decoded) => flow.fanOut(decoded, context))
+                    Effect.flatMap((decoded) => flow.fanOut(decoded, context, parentDepth))
                   )
                 ),
               enqueueChildren: (children) =>

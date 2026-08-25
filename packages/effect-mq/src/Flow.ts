@@ -56,7 +56,7 @@
  *
  * @since 0.6.0
  */
-import { Cause, Context, Duration, Effect, Exit, Layer, Option, Schema, Stream } from "effect"
+import { Cause, Context, Duration, Effect, Exit, Layer, Option, Schema, Scope as Scope_, Stream, Tracer } from "effect"
 import {
   type AnyStructSchema,
   type JobOptions,
@@ -205,6 +205,17 @@ export type GroupsOf<J> = J extends MemberJob ? ChildGroup<J> : never
 export type ChildrenInput<J extends MemberJob> = GroupsOf<J> | ReadonlyArray<GroupsOf<J>>
 
 /**
+ * The deterministic id of a flow child. Every component is an arbitrary
+ * string (store keys, ids, and child keys may all contain "/"), so the two
+ * variable-length boundaries are pinned by a length prefix — distinct
+ * (storeKey, flowId, childKey) triples can never alias.
+ *
+ * @internal
+ */
+export const childJobId = (parentStoreKey: string, flowId: string, childKey: string): string =>
+  `flow/${parentStoreKey.length}.${flowId.length}/${parentStoreKey}/${flowId}/${childKey}`
+
+/**
  * Declare children of one member type. Payloads are validated through the
  * child's schema when the specs are built; duplicate keys (across ALL
  * groups) fail the fan-out unrecoverably.
@@ -230,7 +241,7 @@ export interface CompletedChild<Name extends string, A> {
 /**
  * A child that failed terminally. `cause` carries the decoded typed failure
  * — or a die for store-side failures that never produced an exit (stall
- * exhaustion, workers unable to report to the flow).
+ * exhaustion, a nested parent's fail-fast settle).
  *
  * @since 0.6.0
  */
@@ -412,7 +423,8 @@ export interface Flow<
  * Define a flow over existing job definitions.
  *
  * Throws (synchronously, at definition time) on duplicate child names or a
- * parent that is also a child — flows are one level deep in v1.
+ * parent listed among its own children (direct self-recursion). Nesting
+ * across DIFFERENT flows is supported — see the module docs.
  *
  * @since 0.6.0
  */
@@ -447,7 +459,7 @@ export const make = <
   }
   if (byName.has(parent._tag)) {
     throw new Error(
-      `effect-mq: flow "${name}" uses "${parent._tag}" as both parent and child; nested flows are not supported`
+      `effect-mq: flow "${name}" uses "${parent._tag}" as both its parent and one of its own children`
     )
   }
   const failFast = options.onChildFailure === "fail"
@@ -569,16 +581,17 @@ export const make = <
   // deterministic bug burns the budget for nothing.
   const buildSpecs = (
     input: ChildrenInput<MemberJob>,
-    context: JobContext
+    context: JobContext,
+    parentDepth: number
   ) =>
     Effect.gen(function*() {
-      // Child ids embed the full ancestor chain, so "flow/" occurrences in
-      // the parent's own id count the nesting depth. Definitions cannot be
+      // Depth rides the parent envelope explicitly (never parsed out of ids
+      // — keys and ids are arbitrary user strings). Definitions cannot be
       // cycle-checked statically (a job does not know which flows parent
       // it), so a runaway A→B→A recursion surfaces here instead of growing
       // forever.
-      const depth = context.jobId.split("flow/").length - 1
-      if (depth >= 8) {
+      const depth = parentDepth + 1
+      if (depth > 8) {
         return yield* Effect.die(unrecoverable(
           new Error(
             `effect-mq: flow "${name}" exceeds the nesting depth limit (8) — flow definitions must not form cycles`
@@ -645,7 +658,7 @@ export const make = <
             request: {
               // Namespaced by the parent store key: two parent stores
               // sharing one child store can never collide on parent ids.
-              id: JobId(`flow/${parent.store.key}/${context.jobId}/${item.key}`),
+              id: JobId(childJobId(parent.store.key, context.jobId, item.key)),
               name: member._tag,
               queue: member.queue,
               payload: encoded,
@@ -670,7 +683,8 @@ export const make = <
                 flowName: name,
                 flowId: context.jobId,
                 childKey: item.key,
-                parentStoreKey: parent.store.key
+                parentStoreKey: parent.store.key,
+                depth
               },
               delayMs: 0
             }
@@ -679,6 +693,14 @@ export const make = <
       }
       return specs
     })
+
+  // The lazy accessors and phase handlers run under a captured context;
+  // never capture the ambient Scope or span (they must come from the
+  // executing fiber), mirroring the worker's registration capture.
+  const captureServices = Effect.map(
+    Effect.context<never>(),
+    (context) => context.pipe(Context.omit(Scope_.Scope, Tracer.ParentSpan))
+  )
 
   const toLayer = (
     handlers: FlowHandlers<ParentJob, ReadonlyArray<MemberJob>, unknown, unknown>,
@@ -696,16 +718,16 @@ export const make = <
       },
       failFast,
       childStores: options.children.map((child) => child.store),
-      fanOut: (payload, context) =>
+      fanOut: (payload, context, parentDepth) =>
         // SAFETY: the worker decodes through the parent's payload schema
         // before calling this, so `payload` is the parent's payload type.
         handlers.fanOut(payload as never, context).pipe(
-          Effect.flatMap((produced) => buildSpecs(produced, context))
+          Effect.flatMap((produced) => buildSpecs(produced, context, parentDepth))
         ),
       collect: (payload, flowState, context) =>
         Effect.gen(function*() {
           const store = yield* parent.store
-          const services = yield* Effect.context<never>()
+          const services = yield* captureServices
           const results = makeResults(store, flowState, context.jobId, services)
           // SAFETY: same as fanOut for `payload`; the accessors decode
           // through each member's schemas, matching ChildResults.
@@ -721,7 +743,7 @@ export const make = <
   const childResults = (flowId: JobId) =>
     Effect.gen(function*() {
       const store = yield* parent.store
-      const services = yield* Effect.context<never>()
+      const services = yield* captureServices
       const record = yield* store.getJob(flowId).pipe(Effect.orDie)
       const flowState = Option.isSome(record) && record.value.flow !== undefined
         ? record.value.flow

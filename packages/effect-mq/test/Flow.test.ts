@@ -113,7 +113,9 @@ describe("Flow", () => {
         const list = yield* childStore.list({ name: "SendEmail" })
         expect(list.items).toHaveLength(3)
         for (const child of list.items) {
-          expect(child.id.startsWith("flow/effect-mq/JobStore/")).toBe(true)
+          expect(child.id).toBe(
+            Flow.childJobId("effect-mq/JobStore", child.parent?.flowId ?? "", child.parent?.childKey ?? "")
+          )
           expect(child.parent?.flowName).toBe("digest")
           expect(child.parent?.parentStoreKey).toBe("effect-mq/JobStore")
         }
@@ -202,7 +204,9 @@ describe("Flow", () => {
         // cross-store, handler interrupted on the child worker's heartbeat.
         yield* drain(3, "30 seconds")
         const childStore = yield* ChildStore
-        const slow = yield* childStore.getJob(JobStore.JobId(`flow/effect-mq/JobStore/${parent.id}/slow`))
+        const slow = yield* childStore.getJob(
+          JobStore.JobId(Flow.childJobId("effect-mq/JobStore", parent.id, "slow"))
+        )
         assert(Option.isSome(slow))
         expect(slow.value.state).toBe("cancelled")
 
@@ -322,14 +326,33 @@ describe("Flow", () => {
       }).pipe(Layer.provide(Worker.layer()))
 
       yield* Effect.gen(function*() {
-        // A parent whose id already carries eight ancestor segments — what a
-        // cyclic definition would produce by level eight.
-        const flowId = yield* DigestFlow.enqueue({ tenant: "acme" }, {
-          jobId: "flow/x/".repeat(8) + "runaway",
-          attempts: 3
+        // A parent that is itself a level-8 flow child — what a cyclic
+        // definition produces after eight rounds of fan-out. Depth rides
+        // the envelope, so names containing "flow/" cannot false-positive.
+        const parentStore = yield* JobStore.JobStore
+        const { id: flowId } = yield* parentStore.enqueue({
+          id: undefined,
+          name: "SendDigest",
+          queue: JobStore.QueueName("default"),
+          payload: { tenant: "acme" },
+          metadata: {},
+          priority: 0,
+          attemptsMax: 3,
+          backoff: undefined,
+          keep: undefined,
+          timeoutMs: undefined,
+          dedupe: undefined,
+          trace: undefined,
+          parent: {
+            flowName: "digest",
+            flowId: JobStore.JobId("level-7-parent"),
+            childKey: "runaway",
+            parentStoreKey: "effect-mq/JobStore",
+            depth: 8
+          },
+          delayMs: 0
         })
         yield* drain(3)
-        const parentStore = yield* JobStore.JobStore
         const parent = yield* parentStore.getJob(flowId)
         assert(Option.isSome(parent))
         expect(parent.value.state).toBe("failed")

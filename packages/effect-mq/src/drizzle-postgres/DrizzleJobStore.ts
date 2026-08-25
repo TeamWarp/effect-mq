@@ -21,7 +21,7 @@ import type { PgClient } from "@effect/sql-pg"
 import { asc, eq, getTableColumns, sql } from "drizzle-orm"
 import * as PgDrizzle from "drizzle-orm/effect-postgres"
 import { getTableConfig } from "drizzle-orm/pg-core"
-import { Clock, type Context, Deferred, Duration, Effect, Layer, Option, type Scope, Stream } from "effect"
+import { Cause, Clock, type Context, Deferred, Duration, Effect, Layer, Option, Predicate, type Scope, Stream } from "effect"
 import type {
   MqDedupeTable,
   MqFlowChildrenTable,
@@ -95,6 +95,50 @@ export type ExtraColumnValue = string | number | boolean | Date | null
 
 const storeError = (message: string) => (cause: unknown) =>
   new JobStore.JobStoreError({ message, cause })
+
+// The exact spellings a bigserial ever produces: no leading zeros, no signs,
+// no whitespace — what outbox ids look like and nothing Postgres would
+// silently normalize into one.
+const CANONICAL_BIGSERIAL = /^[1-9]\d*$/
+
+/**
+ * Whether an error surfaced by drizzle's Effect driver is a Postgres
+ * deadlock (40P01), i.e. safe to retry.
+ *
+ * The deadlock travels wrapped: drizzle's session fails with an
+ * `EffectDrizzleQueryError` whose `cause` field is `Cause.fail(SqlError)`
+ * (drizzle-orm `pg-core/effect/session.ts`), and `@effect/sql-pg` classifies
+ * pg code 40P01 into the `SqlError`'s `reason: DeadlockError` (PgClient.ts
+ * `classifyError`). Neither layer's `toString` renders the pg code, so this
+ * unwraps structurally instead of string-matching the rendered error.
+ *
+ * @internal
+ */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- a retry-predicate classifier over whatever the driver threw IS the boundary parser
+export const isDeadlockError = (error: unknown): boolean => {
+  // Unwrap drizzle's envelope: its `cause` is an Effect Cause holding the
+  // original failure. A bare SqlError (non-drizzle path) passes through.
+  const unwrapped = Predicate.hasProperty(error, "cause") && Cause.isCause(error.cause)
+    ? Option.getOrUndefined(Cause.findErrorOption(error.cause))
+    : error
+  if (
+    !Predicate.hasProperty(unwrapped, "_tag") || unwrapped._tag !== "SqlError" ||
+    !Predicate.hasProperty(unwrapped, "reason")
+  ) {
+    return false
+  }
+  const reason = unwrapped.reason
+  if (Predicate.hasProperty(reason, "_tag") && reason._tag === "DeadlockError") {
+    return true
+  }
+  // Fallback for classifiers that missed the code: the reason keeps the raw
+  // pg error, whose message for 40P01 is "deadlock detected".
+  if (Predicate.hasProperty(reason, "cause")) {
+    const raw = String(reason.cause)
+    return raw.includes("40P01") || raw.includes("deadlock detected")
+  }
+  return false
+}
 
 /**
  * drizzle's Effect driver types raw `execute` results as row arrays, but at
@@ -733,7 +777,7 @@ export const make = (
         // killed and safe to retry.
         Effect.retry({
           times: 3,
-          while: (error) => String(error).includes("40P01") || String(error).includes("deadlock detected")
+          while: isDeadlockError
         }),
         Effect.mapError((error) =>
           error instanceof JobStore.JobStoreError ? error : storeError("enqueue failed")(error)
@@ -878,7 +922,7 @@ export const make = (
           // Postgres deadlock (40P01); one side is killed and safe to retry.
           Effect.retry({
             times: 3,
-            while: (error) => String(error).includes("40P01") || String(error).includes("deadlock detected")
+            while: isDeadlockError
           }),
           Effect.mapError((error) =>
             error instanceof JobStore.JobNotFoundError ||
@@ -1221,6 +1265,8 @@ export const make = (
                 ${jobs.cancelRequested} AS "cancelRequested", ${jobs.dedupeKey} AS "dedupeKey",
                 ${jobs.trace} AS "trace", ${jobs.parent} AS "parent",
                 ${jobs.flowFailFast} AS "flowFailFast", ${jobs.flowPending} AS "flowPending",
+                ${jobs.flowCompleted} AS "flowCompleted", ${jobs.flowFailed} AS "flowFailed",
+                ${jobs.flowCancelled} AS "flowCancelled",
                 ${jobs.runAt} AS "runAt", ${jobs.enqueuedAt} AS "enqueuedAt",
                 ${jobs.processedAt} AS "processedAt", ${jobs.finishedAt} AS "finishedAt",
                 ${jobs.exit} AS "exit", ${jobs.failedReason} AS "failedReason"
@@ -1573,6 +1619,8 @@ export const make = (
               ${jobs.cancelRequested} AS "cancelRequested", ${jobs.dedupeKey} AS "dedupeKey",
               ${jobs.trace} AS "trace", ${jobs.parent} AS "parent",
               ${jobs.flowFailFast} AS "flowFailFast", ${jobs.flowPending} AS "flowPending",
+              ${jobs.flowCompleted} AS "flowCompleted", ${jobs.flowFailed} AS "flowFailed",
+              ${jobs.flowCancelled} AS "flowCancelled",
               ${jobs.runAt} AS "runAt", ${jobs.enqueuedAt} AS "enqueuedAt",
               ${jobs.processedAt} AS "processedAt", ${jobs.finishedAt} AS "finishedAt",
               ${jobs.exit} AS "exit", ${jobs.failedReason} AS "failedReason"
@@ -1970,7 +2018,7 @@ export const make = (
             // is safe to retry — the row-state guard keeps it idempotent.
             Effect.retry({
               times: 3,
-              while: (error) => String(error).includes("40P01") || String(error).includes("deadlock detected")
+              while: isDeadlockError
             }),
             Effect.mapError((error) =>
               error instanceof JobStore.JobStoreError ? error : storeError("recordChildResults failed")(error)
@@ -1989,6 +2037,12 @@ export const make = (
             const none: Array<JobStore.OutboxEntry> = []
             return none
           }
+          // `after` pages past a previously returned id (exclusive), whether
+          // or not that entry still exists. Anything that is not a canonical
+          // id this store issued is treated as unset.
+          const after = peekOptions.after !== undefined && CANONICAL_BIGSERIAL.test(peekOptions.after)
+            ? peekOptions.after
+            : undefined
           const rows = rowsOf(yield* db.execute<
             {
               id: string
@@ -2000,6 +2054,7 @@ export const make = (
             SELECT ${flowOutbox.id}::text AS "id", ${flowOutbox.flowName} AS "flowName",
               ${flowOutbox.parentStoreKey} AS "parentStoreKey", ${flowOutbox.report} AS "report"
             FROM ${flowOutbox}
+            ${after === undefined ? sql`` : sql`WHERE ${flowOutbox.id} > ${after}::bigint`}
             ORDER BY ${flowOutbox.id} ASC
             LIMIT ${limit}
           `).pipe(Effect.mapError(storeError("peekOutbox failed"))))
@@ -2013,10 +2068,12 @@ export const make = (
 
       deleteOutbox: (ids) =>
         Effect.suspend(() => {
-          // Ids are opaque strings to callers; only ones this store could
-          // have issued (bigserial digits) can match — filtering keeps a
-          // foreign/garbled id from blowing up the ::bigint cast.
-          const numeric = ids.filter((id) => /^\d+$/.test(id))
+          // Ids are opaque strings to callers; only CANONICAL ids this store
+          // could have issued can match. The strictness matters twice: a
+          // foreign/garbled id must not blow up the ::bigint cast, and a
+          // non-canonical spelling ("007") must stay an unknown-id no-op
+          // rather than cast to 7 and delete a live entry.
+          const numeric = ids.filter((id) => CANONICAL_BIGSERIAL.test(id))
           if (numeric.length === 0) return Effect.void
           return db.execute(sql`
             DELETE FROM ${flowOutbox}

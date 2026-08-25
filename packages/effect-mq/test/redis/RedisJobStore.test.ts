@@ -228,7 +228,8 @@ if (!available) {
                 flowName: "big",
                 flowId: id,
                 childKey: key,
-                parentStoreKey: "main"
+                parentStoreKey: "main",
+                depth: 1
               }
             }
           }

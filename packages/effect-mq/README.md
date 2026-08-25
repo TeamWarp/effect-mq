@@ -403,6 +403,7 @@ migrations** — no library-run DDL, no parallel migration system:
 import {
   mqDedupe,
   mqFlowChildren,
+  mqFlowOutbox,
   mqJobAttempts,
   mqJobs,
   mqQueueControl,
@@ -418,6 +419,7 @@ export const jobSchedules = mqSchedules()         // default: effect_mq_schedule
 export const jobQueues = mqQueueControl()         // default: effect_mq_queue_control
 export const jobDedupe = mqDedupe()               // default: effect_mq_dedupe
 export const jobFlowChildren = mqFlowChildren()   // default: effect_mq_flow_children
+export const jobFlowOutbox = mqFlowOutbox()       // default: effect_mq_flow_outbox
 ```
 
 Need more indexes (the built-ins cover claiming, listing, metadata
@@ -478,7 +480,15 @@ When a future effect-mq version changes the layout, the factory changes and
 import { DrizzleJobStore } from "effect-mq/drizzle-postgres"
 import { PgClient } from "@effect/sql-pg"
 import { Layer, Redacted } from "effect"
-import { jobAttempts, jobDedupe, jobFlowChildren, jobQueues, jobs, jobSchedules } from "./db/schema.ts"
+import {
+  jobAttempts,
+  jobDedupe,
+  jobFlowChildren,
+  jobFlowOutbox,
+  jobQueues,
+  jobs,
+  jobSchedules
+} from "./db/schema.ts"
 
 const JobStoreLive = DrizzleJobStore.layer({
   jobs,
@@ -486,7 +496,8 @@ const JobStoreLive = DrizzleJobStore.layer({
   schedules: jobSchedules,
   queues: jobQueues,
   dedupe: jobDedupe,
-  flowChildren: jobFlowChildren
+  flowChildren: jobFlowChildren,
+  flowOutbox: jobFlowOutbox
 }).pipe(
   Layer.provide(PgClient.layer({ url: Redacted.make(process.env.DATABASE_URL!) }))
 )
@@ -645,6 +656,9 @@ ledger), `retry`, `cancel`, `cancelByKey` (by dedup key, idempotent),
 | `queueMetricsInterval` | off | sample `store.counts()` per queue into the depth gauge |
 | `handlerSpanName` | `` `${name}.run` `` | name of the span wrapping each handler run |
 | `traceLinking` | `auto` | parent for immediate jobs, causal link for delayed ones (`parent`/`link`/`none` force a mode) |
+| `onJobFailure` | — | callback after each failed run is acked; runs isolated |
+| `flows` | — | flows whose children this worker runs (lets its relay push results) |
+| `flowSweepInterval` | 30s | flow sweeper cadence + the relay's fallback drain cadence |
 | `id` | random | identifier used in lock tokens |
 
 **Store construction** — every driver accepts `idGenerator`, `historyTtl`,
@@ -681,12 +695,14 @@ plain Effect, so it works with any test runner.
 
 ## Writing a storage driver
 
-Implement the `JobStore` service (one atomic seam: `enqueue`, `claim`, `ack`,
-`release`, `extendLocks`, `recoverStalled`, `awaitWake`, `getJob`,
-`getAttempts`, `list`, `retry`, `counts`, `remove`, `cancel`, `promote`,
-`pause`/`resume`/`pausedQueues`, `cancelByDedupe`, and the schedule ops
-`upsertSchedule`/`removeSchedule`/`listSchedules`/`dueSchedules`/`advanceSchedule`)
-and run the conformance suite against it:
+Implement the `JobStore` service (one atomic seam: `enqueue`/`enqueueMany`,
+`claim`, `ack`, `release`, `extendLocks`, `recoverStalled`, `awaitWake`,
+`getJob`, `getAttempts`, `list`, `retry`, `counts`, `remove`, `cancel`,
+`promote`, `pause`/`resume`/`pausedQueues`, `cancelByDedupe`, the schedule
+ops `upsertSchedule`/`removeSchedule`/`listSchedules`/`dueSchedules`/
+`tickSchedule`/`advanceSchedule`, and the flow ops `recordChildResults`/
+`listChildResults`/`flowSweepWork`/`markChildrenCascaded`/`peekOutbox`/
+`deleteOutbox`) and run the conformance suite against it:
 
 ```ts
 import { jobStoreConformance } from "effect-mq/testing"
@@ -704,7 +720,7 @@ suite in this repo runs the same conformance tests against a real database.
 
 Next up: drizzle schema customization (column renames, native id and
 timestamp column types, a typed queue registry), a cross-process event
-stream, and parent-child fan-out. Full prioritized list:
+stream, and global queue concurrency/rate limits. Full prioritized list:
 [ROADMAP.md](https://github.com/TeamWarp/effect-mq/blob/main/ROADMAP.md);
 release history:
 [CHANGELOG.md](https://github.com/TeamWarp/effect-mq/blob/main/CHANGELOG.md).

@@ -1044,7 +1044,18 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
         return results
       }),
 
-    peekOutbox: (options) => Effect.sync(() => outbox.slice(0, Math.max(0, options.limit))),
+    peekOutbox: (options) =>
+      Effect.sync(() => {
+        // `after` compares by the id's embedded sequence so the cursor
+        // works whether or not the named entry still exists.
+        const afterSeq = options.after !== undefined && options.after.startsWith("ob-")
+          ? Number(options.after.slice(3))
+          : undefined
+        const eligible = afterSeq === undefined || Number.isNaN(afterSeq)
+          ? outbox
+          : outbox.filter((entry) => Number(entry.id.slice(3)) > afterSeq)
+        return eligible.slice(0, Math.max(0, options.limit))
+      }),
 
     deleteOutbox: (ids) =>
       Effect.sync(() => {
