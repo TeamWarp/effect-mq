@@ -131,8 +131,10 @@ into the same marker mechanism later without API change.
 ## Errors
 
 Both are `Data.TaggedError` classes delivered as defects (config bugs, not
-recoverable states): `ListOrderUnsupportedError { orderBy, filters }` and
-`ListIndexDisabledError { index, filter }`.
+recoverable states): `ListOrderUnsupportedError { orderBy, message }`
+(contract-level, JobStore.ts) and `ListIndexDisabledError { index, message }`
+(Redis-only, RedisJobStore.ts), each message naming the offending filter
+and, for the latter, the config key to flip.
 
 ## Conformance
 

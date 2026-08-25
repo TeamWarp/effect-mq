@@ -71,7 +71,7 @@ While a queue is paused, claims return empty but producers are unaffected: enque
 
 ## The dashboard data layer
 
-The store is queryable enough to back an ops UI without extra infrastructure. `list` is keyset-paginated, newest first (`enqueuedAt` desc, then id desc):
+The store is queryable enough to back an ops UI without extra infrastructure. `list` is keyset-paginated, newest first (`enqueuedAt` desc, then id desc) unless you order it:
 
 ```ts
 const page = yield* store.list({
@@ -82,7 +82,20 @@ const page = yield* store.list({
   limit: 50                   // the default
 })
 // page.items, plus page.cursor to pass back for the next page
+
+// What runs next:
+yield* store.list({
+  queue: JobStore.QueueName("billing"),
+  states: ["delayed"],
+  orderBy: "runAt",
+  order: "asc"
+})
+
+// What just finished:
+yield* store.list({ states: ["completed", "failed"], orderBy: "finishedAt" })
 ```
+
+`orderBy` takes `enqueuedAt` (the default), `runAt`, or `finishedAt`; `order` takes `asc` or `desc` (default). A cursor is only valid with the options that produced it. Memory and Postgres serve every combination; Redis serves the combinations its structures cover and dies with `ListOrderUnsupportedError` on the rest rather than falling back to a full scan — see [Redis list indexes](/storage/redis#list-indexes).
 
 | Method | Returns |
 | --- | --- |

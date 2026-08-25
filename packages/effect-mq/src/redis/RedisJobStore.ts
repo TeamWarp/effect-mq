@@ -12,7 +12,20 @@
  *
  * @since 0.2.0
  */
-import { Clock, type Context, Deferred, Duration, Effect, Exit, Layer, Option, Queue, Schedule, type Scope } from "effect"
+import {
+  Clock,
+  type Context,
+  Data,
+  Deferred,
+  Duration,
+  Effect,
+  Exit,
+  Layer,
+  Option,
+  Queue,
+  Schedule,
+  type Scope
+} from "effect"
 import { Redis } from "effect/unstable/persistence"
 import * as JobStore from "../JobStore.ts"
 import * as scripts from "./scripts.ts"
@@ -37,6 +50,50 @@ export interface RedisJobStoreOptions {
    * Default: `j-<n>` from the store's counter. See `JobStore.IdGenerator`.
    */
   readonly idGenerator?: JobStore.IdGenerator | undefined
+  /**
+   * The optional list indexes: `p:byname:<name>` and `p:byqueue:<queue>`,
+   * both scored by `enqueuedAt`, serving `list({ name })` / `list({ queue })`
+   * without a full scan. Default: all on. `false` disables both; a partial
+   * object disables one (`{ name: false }`). Disable an index only when you
+   * never list that way — a `list` that ROUTES to a disabled index dies with
+   * `ListIndexDisabledError` (a query servable from another structure, e.g.
+   * `name` + terminal `states` ordered by `finishedAt`, never touches it).
+   *
+   * Store init reconciles the configuration one-shot: an enabled index
+   * missing its `p:index:<kind>:ready` marker is backfilled from `p:all` in
+   * bounded pages; a disabled index whose marker exists has its zsets
+   * SCAN-deleted along with the marker.
+   *
+   * @since 0.7.0
+   */
+  readonly indexes?: { readonly name?: boolean | undefined; readonly queue?: boolean | undefined } | false | undefined
+}
+
+/**
+ * A `list` query routed to a list index this store is configured not to
+ * maintain (`RedisJobStoreOptions.indexes`). Delivered as a defect, not a
+ * typed failure: the configuration said "we never list this way", so the
+ * query contradicting it is a programming mistake, matching the library's
+ * die-on-config-mistake idiom.
+ *
+ * @since 0.7.0
+ */
+export class ListIndexDisabledError extends Data.TaggedError("ListIndexDisabledError")<{
+  readonly index: "name" | "queue"
+  readonly message: string
+}> {}
+
+const TERMINAL_STATES: ReadonlySet<JobStore.JobState> = new Set(["completed", "failed", "cancelled"])
+
+/**
+ * The `list` predicates the routed structure does NOT pin, applied per row
+ * inside the list script. Field names are part of the script's contract.
+ */
+interface ResidualFilters {
+  readonly queue?: JobStore.QueueName | undefined
+  readonly name?: string | undefined
+  readonly states?: ReadonlyArray<JobStore.JobState> | undefined
+  readonly metadata?: Readonly<Record<string, string>> | undefined
 }
 
 const storeError = (message: string) => (cause: unknown) => new JobStore.JobStoreError({ message, cause })
@@ -202,34 +259,78 @@ export const make = (
     const redis = yield* Redis.Redis
     const prefix = options?.prefix ?? "effect-mq"
     const wakeChannel = `${prefix}:wake`
+    const indexOptions = options?.indexes
+    const indexes: scripts.IndexConfig = indexOptions === false
+      ? { name: false, queue: false }
+      : { name: indexOptions?.name ?? true, queue: indexOptions?.queue ?? true }
+    const HELPERS = scripts.helpers(indexes)
 
-    const evalEnqueue = redis.eval(scripts.enqueue)
-    const evalClaim = redis.eval(scripts.claim)
-    const evalAck = redis.eval(scripts.ack)
-    const evalRelease = redis.eval(scripts.release)
-    const evalExtendLocks = redis.eval(scripts.extendLocks)
-    const evalRecoverStalled = redis.eval(scripts.recoverStalled)
-    const evalGetJob = redis.eval(scripts.getJob)
-    const evalList = redis.eval(scripts.list)
-    const evalCounts = redis.eval(scripts.counts)
-    const evalRemove = redis.eval(scripts.remove)
-    const evalRetry = redis.eval(scripts.retry)
-    const evalCancel = redis.eval(scripts.cancel)
-    const evalPromote = redis.eval(scripts.promote)
-    const evalUpsertSchedule = redis.eval(scripts.upsertSchedule)
-    const evalRemoveSchedule = redis.eval(scripts.removeSchedule)
-    const evalListSchedules = redis.eval(scripts.listSchedules)
-    const evalDueSchedules = redis.eval(scripts.dueSchedules)
-    const evalAdvanceSchedule = redis.eval(scripts.advanceSchedule)
-    const evalTickSchedule = redis.eval(scripts.tickSchedule)
-    const evalEnqueueMany = redis.eval(scripts.enqueueMany)
-    const evalSweepState = redis.eval(scripts.sweepState)
-    const evalSweepDedupes = redis.eval(scripts.sweepDedupes)
-    const evalFanOut = redis.eval(scripts.fanOut)
-    const evalRecordChildResults = redis.eval(scripts.recordChildResults)
-    const evalListChildResults = redis.eval(scripts.listChildResults)
-    const evalFlowSweepWork = redis.eval(scripts.flowSweepWork)
-    const evalMarkChildrenCascaded = redis.eval(scripts.markChildrenCascaded)
+    const evalEnqueue = redis.eval(scripts.enqueue(HELPERS))
+    const evalClaim = redis.eval(scripts.claim(HELPERS))
+    const evalAck = redis.eval(scripts.ack(HELPERS))
+    const evalRelease = redis.eval(scripts.release(HELPERS))
+    const evalExtendLocks = redis.eval(scripts.extendLocks(HELPERS))
+    const evalRecoverStalled = redis.eval(scripts.recoverStalled(HELPERS))
+    const evalGetJob = redis.eval(scripts.getJob(HELPERS))
+    const evalList = redis.eval(scripts.list(HELPERS))
+    const evalBackfillIndexPage = redis.eval(scripts.backfillIndexPage(HELPERS))
+    const evalCounts = redis.eval(scripts.counts(HELPERS))
+    const evalRemove = redis.eval(scripts.remove(HELPERS))
+    const evalRetry = redis.eval(scripts.retry(HELPERS))
+    const evalCancel = redis.eval(scripts.cancel(HELPERS))
+    const evalPromote = redis.eval(scripts.promote(HELPERS))
+    const evalUpsertSchedule = redis.eval(scripts.upsertSchedule(HELPERS))
+    const evalRemoveSchedule = redis.eval(scripts.removeSchedule(HELPERS))
+    const evalListSchedules = redis.eval(scripts.listSchedules(HELPERS))
+    const evalDueSchedules = redis.eval(scripts.dueSchedules(HELPERS))
+    const evalAdvanceSchedule = redis.eval(scripts.advanceSchedule(HELPERS))
+    const evalTickSchedule = redis.eval(scripts.tickSchedule(HELPERS))
+    const evalEnqueueMany = redis.eval(scripts.enqueueMany(HELPERS))
+    const evalSweepState = redis.eval(scripts.sweepState(HELPERS))
+    const evalSweepDedupes = redis.eval(scripts.sweepDedupes(HELPERS))
+    const evalFanOut = redis.eval(scripts.fanOut(HELPERS))
+    const evalRecordChildResults = redis.eval(scripts.recordChildResults(HELPERS))
+    const evalListChildResults = redis.eval(scripts.listChildResults(HELPERS))
+    const evalFlowSweepWork = redis.eval(scripts.flowSweepWork(HELPERS))
+    const evalMarkChildrenCascaded = redis.eval(scripts.markChildrenCascaded(HELPERS))
+
+    // One-shot list-index reconcile. Enabled index missing its ready marker:
+    // backfill from `all` in bounded pages — paged from here, never one giant
+    // Lua call, so the single-threaded server is never held. There is no
+    // build lock: concurrent cold boots duplicate idempotent ZADDs, a crash
+    // mid-build leaves the marker unset and the next boot redoes it, and rows
+    // inserted during the build are indexed live by insertJobRow. Disabled
+    // index whose marker exists: SCAN-delete its zsets and the marker.
+    // Init-time infra failures die — the store never starts half-configured.
+    yield* Effect.gen(function*() {
+      for (const kind of ["name", "queue"] as const) {
+        const marker = `${prefix}:index:${kind}:ready`
+        const ready = Number(yield* redis.send("EXISTS", marker)) === 1
+        if (indexes[kind] && !ready) {
+          let cursor = ""
+          while (true) {
+            const page: { processed: number; cursor: string } = JSON.parse(
+              yield* evalBackfillIndexPage(prefix, kind, cursor, 500)
+            )
+            if (page.processed > 0) cursor = page.cursor
+            if (page.processed < 500) break
+          }
+          yield* redis.send("SET", marker, "1")
+        } else if (!indexes[kind] && ready) {
+          let scanCursor = "0"
+          do {
+            const reply = yield* redis.send("SCAN", scanCursor, "MATCH", `${prefix}:by${kind}:*`, "COUNT", "500")
+            // SAFETY: SCAN always replies [nextCursor, matchedKeys].
+            const [next, keys] = reply as [string, ReadonlyArray<string>]
+            scanCursor = next
+            for (let start = 0; start < keys.length; start += 500) {
+              yield* redis.send("DEL", ...keys.slice(start, start + 500))
+            }
+          } while (scanCursor !== "0")
+          yield* redis.send("DEL", marker)
+        }
+      }
+    }).pipe(Effect.orDie)
 
     // Wake protocol: a queue-filtered waiter registry (same-process wake-ups
     // never depend on the pub/sub round trip), with the channel carrying
@@ -756,24 +857,102 @@ export const make = (
       list: (listOptions) =>
         Effect.gen(function*() {
           const limit = Math.max(1, listOptions.limit ?? 50)
-          const filters = {
-            queue: listOptions.queue,
-            name: listOptions.name,
-            states: listOptions.states,
-            metadata: listOptions.metadata
+          const { metadata, name, queue, states } = listOptions
+          const orderBy = listOptions.orderBy ?? "enqueuedAt"
+          const order = listOptions.order ?? "desc"
+          // Routing: the narrowest structure whose zset score IS the
+          // requested order value; everything it does not pin stays a
+          // residual predicate applied in-script. Routing runs BEFORE the
+          // disabled-index check — a query another structure serves (e.g.
+          // name + terminal states ordered by finishedAt) must never die.
+          let sources: ReadonlyArray<string>
+          let residual: ResidualFilters
+          if (orderBy === "finishedAt") {
+            if (states === undefined || states.some((state) => !TERMINAL_STATES.has(state))) {
+              return yield* Effect.die(
+                new JobStore.ListOrderUnsupportedError({
+                  orderBy,
+                  message: "effect-mq: the Redis store serves orderBy \"finishedAt\" only with " +
+                    "states ⊆ {completed, failed, cancelled} (the finished/terminal zsets carry that order)"
+                })
+              )
+            }
+            // ≤3 per-state sources, merged by (finishedAt, id) in-script.
+            const uniqueStates = [...new Set(states)]
+            sources = name === undefined
+              ? uniqueStates.map((state) => `${prefix}:finished:${state}`)
+              : uniqueStates.map((state) => `${prefix}:terminal:${name}:${state}`)
+            residual = { queue, metadata }
+          } else if (orderBy === "runAt") {
+            const onlyDelayed = states !== undefined && states.length > 0 &&
+              states.every((state) => state === "delayed")
+            if (queue === undefined || !onlyDelayed) {
+              return yield* Effect.die(
+                new JobStore.ListOrderUnsupportedError({
+                  orderBy,
+                  message: "effect-mq: the Redis store serves orderBy \"runAt\" only with " +
+                    "states: [\"delayed\"] and a queue (the delayed:<queue> zset carries that order)"
+                })
+              )
+            }
+            sources = [`${prefix}:delayed:${queue}`]
+            residual = { name, metadata }
+          } else if (name !== undefined) {
+            if (!indexes.name) {
+              return yield* Effect.die(
+                new ListIndexDisabledError({
+                  index: "name",
+                  message: "effect-mq: list({ name }) routes to the byname index, " +
+                    "but RedisJobStoreOptions.indexes.name is disabled for this store"
+                })
+              )
+            }
+            sources = [`${prefix}:byname:${name}`]
+            residual = { queue, states, metadata }
+          } else if (queue !== undefined) {
+            if (!indexes.queue) {
+              return yield* Effect.die(
+                new ListIndexDisabledError({
+                  index: "queue",
+                  message: "effect-mq: list({ queue }) routes to the byqueue index, " +
+                    "but RedisJobStoreOptions.indexes.queue is disabled for this store"
+                })
+              )
+            }
+            sources = [`${prefix}:byqueue:${queue}`]
+            residual = { states, metadata }
+          } else {
+            sources = [`${prefix}:all`]
+            residual = { states, metadata }
           }
           const reply: { items: ReadonlyArray<ReadonlyArray<string>> | Record<string, never>; more: boolean } = JSON
             .parse(
-              yield* evalList(prefix, JSON.stringify(filters), listOptions.cursor ?? "", limit)
+              yield* evalList(
+                prefix,
+                JSON.stringify(sources),
+                order,
+                JSON.stringify(residual),
+                listOptions.cursor ?? "",
+                limit
+              ).pipe(Effect.mapError(storeError("list failed")))
             )
           const items = asArray(reply.items).map((flat) => toRecord(foldPairs(flat)))
           const last = items[items.length - 1]
+          // The cursor value is the order field, which equals the routed
+          // zset's score for every row the script returned.
+          const orderValue = last === undefined
+            ? 0
+            : orderBy === "enqueuedAt"
+            ? last.enqueuedAt
+            : orderBy === "runAt"
+            ? last.runAt
+            : last.finishedAt ?? 0
           const result: JobStore.ListResult = {
             items,
-            cursor: reply.more && last !== undefined ? `${last.enqueuedAt}:${last.id}` : undefined
+            cursor: reply.more && last !== undefined ? `${orderValue}:${last.id}` : undefined
           }
           return result
-        }).pipe(Effect.mapError(storeError("list failed"))),
+        }),
 
       retry: (id) =>
         Effect.gen(function*() {

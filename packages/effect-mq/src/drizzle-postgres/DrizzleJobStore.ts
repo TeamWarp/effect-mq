@@ -1585,12 +1585,30 @@ export const make = (
           if (listOptions.metadata !== undefined && Object.keys(listOptions.metadata).length > 0) {
             conditions.push(sql`${jobs.metadata} @> ${JSON.stringify(listOptions.metadata)}::jsonb`)
           }
+          const orderBy = listOptions.orderBy ?? "enqueuedAt"
+          const descending = (listOptions.order ?? "desc") === "desc"
+          // Order on the exact value the record reports: enqueued_at/run_at
+          // are NOT NULL columns; finished_at is absent on non-terminal rows
+          // and sorts as 0 — COALESCE to the epoch, which is what the
+          // `<orderValueMillis>:<id>` cursor round-trips through `new
+          // Date(0)`. All stored timestamps were bound from the Clock at
+          // millisecond precision, so cursor equality comparisons are exact.
+          const orderExpr = orderBy === "enqueuedAt"
+            ? sql`${jobs.enqueuedAt}`
+            : orderBy === "runAt"
+            ? sql`${jobs.runAt}`
+            : sql`COALESCE(${jobs.finishedAt}, 'epoch'::timestamptz)`
+          const direction = descending ? sql`DESC` : sql`ASC`
           if (listOptions.cursor !== undefined) {
+            // Exclusive keyset: `<orderValueMillis>:<id>`, strictly past the
+            // cursor row in the requested direction (id tiebreak included).
             const split = listOptions.cursor.indexOf(":")
             const cursorAt = new Date(Number(listOptions.cursor.slice(0, split)))
             const cursorId = listOptions.cursor.slice(split + 1)
             conditions.push(
-              sql`(${jobs.enqueuedAt}, ${jobs.id}) < (${cursorAt}, ${cursorId})`
+              descending
+                ? sql`(${orderExpr}, ${jobs.id}) < (${cursorAt}, ${cursorId})`
+                : sql`(${orderExpr}, ${jobs.id}) > (${cursorAt}, ${cursorId})`
             )
           }
           const rows = rowsOf(yield* db.execute<JobRow>(sql`
@@ -1610,7 +1628,7 @@ export const make = (
               ${jobs.exit} AS "exit", ${jobs.failedReason} AS "failedReason"
             FROM ${jobs}
             WHERE ${sql.join(conditions, sql` AND `)}
-            ORDER BY ${jobs.enqueuedAt} DESC, ${jobs.id} DESC
+            ORDER BY ${orderExpr} ${direction}, ${jobs.id} ${direction}
             LIMIT ${limit + 1}
           `).pipe(Effect.mapError(storeError("list failed"))))
           const items = rows.slice(0, limit).map(toRecord)
@@ -1618,7 +1636,13 @@ export const make = (
           return {
             items,
             cursor: rows.length > limit && last !== undefined
-              ? `${last.enqueuedAt}:${last.id}`
+              ? `${
+                orderBy === "enqueuedAt"
+                  ? last.enqueuedAt
+                  : orderBy === "runAt"
+                  ? last.runAt
+                  : last.finishedAt ?? 0
+              }:${last.id}`
               : undefined
           }
         }),
