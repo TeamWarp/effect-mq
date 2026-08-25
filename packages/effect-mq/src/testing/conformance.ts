@@ -528,21 +528,153 @@ export const jobStoreConformance = (
       withStore((store) =>
         Effect.gen(function*() {
           // No clock adjustment: every record shares one enqueuedAt, so
-          // ordering and the cursor fall back entirely to the id tie-break.
+          // ordering and the cursor fall back entirely to the id tie-break —
+          // in both directions.
           for (let i = 0; i < 7; i++) {
             yield* store.enqueue(baseRequest({ payload: { n: i } }))
           }
-          const seen = new Set<string>()
-          let cursor: string | undefined
-          do {
-            const page: JobStore.ListResult = yield* store.list({ limit: 3, cursor })
-            for (const item of page.items) {
-              expect(seen.has(item.id)).toBe(false)
-              seen.add(item.id)
+          for (const order of ["desc", "asc"] as const) {
+            const seen: Array<string> = []
+            let cursor: string | undefined
+            do {
+              const page: JobStore.ListResult = yield* store.list({ limit: 3, order, cursor })
+              for (const item of page.items) {
+                expect(seen.includes(item.id)).toBe(false)
+                seen.push(item.id)
+              }
+              cursor = page.cursor
+            } while (cursor !== undefined)
+            expect(seen.length).toBe(7)
+            // Opposite directions walk exact mirror orders.
+            if (order === "asc") {
+              const descAll = yield* store.list({ limit: 7, order: "desc" })
+              expect(seen).toEqual(descAll.items.map((item) => item.id).toReversed())
             }
-            cursor = page.cursor
-          } while (cursor !== undefined)
-          expect(seen.size).toBe(7)
+          }
+        })
+      ))
+
+    it.effect("list orders by enqueuedAt ascending on request, cursor included", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const ids: Array<JobStore.JobId> = []
+          for (let i = 0; i < 3; i++) {
+            const { id } = yield* store.enqueue(baseRequest({ payload: { n: i } }))
+            ids.push(id)
+            yield* TestClock.adjust(1_000)
+          }
+          const first = yield* store.list({ orderBy: "enqueuedAt", order: "asc", limit: 2 })
+          expect(first.items.map((job) => job.id)).toEqual([ids[0], ids[1]])
+          assert(first.cursor !== undefined)
+          const second = yield* store.list({
+            orderBy: "enqueuedAt",
+            order: "asc",
+            limit: 2,
+            cursor: first.cursor
+          })
+          expect(second.items.map((job) => job.id)).toEqual([ids[2]])
+          expect(second.cursor).toBeUndefined()
+        })
+      ))
+
+    it.effect("list orders delayed jobs by runAt within a queue", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          const late = yield* store.enqueue(baseRequest({ payload: { n: 1 }, delayMs: 30_000 }))
+          const soon = yield* store.enqueue(baseRequest({ payload: { n: 2 }, delayMs: 5_000 }))
+          const middle = yield* store.enqueue(baseRequest({ payload: { n: 3 }, delayMs: 10_000 }))
+          // An immediate job in the same queue must not appear.
+          yield* store.enqueue(baseRequest({ payload: { n: 4 } }))
+
+          const upcoming = yield* store.list({
+            queue: QueueName("default"),
+            states: ["delayed"],
+            orderBy: "runAt",
+            order: "asc",
+            limit: 2
+          })
+          expect(upcoming.items.map((job) => job.id)).toEqual([soon.id, middle.id])
+          assert(upcoming.cursor !== undefined)
+          const rest = yield* store.list({
+            queue: QueueName("default"),
+            states: ["delayed"],
+            orderBy: "runAt",
+            order: "asc",
+            limit: 2,
+            cursor: upcoming.cursor
+          })
+          expect(rest.items.map((job) => job.id)).toEqual([late.id])
+          expect(rest.cursor).toBeUndefined()
+        })
+      ))
+
+    it.effect("list orders terminal jobs by finishedAt, with and without a name", () =>
+      withStore((store) =>
+        Effect.gen(function*() {
+          // Enqueue in one order, finish in the REVERSE order, so finishedAt
+          // ordering and enqueuedAt ordering disagree — a driver that quietly
+          // ignores orderBy fails here instead of passing by coincidence.
+          const enqueueAs = (name: string, queue?: string) => {
+            const request = queue === undefined
+              ? baseRequest({ name })
+              : baseRequest({ name, queue: QueueName(queue) })
+            return Effect.map(store.enqueue(request), (result) => result.id)
+          }
+          const first = yield* enqueueAs("TestJob")
+          const second = yield* enqueueAs("OtherJob")
+          const third = yield* enqueueAs("TestJob")
+          const elsewhere = yield* enqueueAs("TestJob", "other")
+          const claims = new Map<JobStore.JobId, string>()
+          for (const token of ["t-1", "t-2", "t-3"]) {
+            const claim = yield* store.claim(claimOptions({
+              names: ["TestJob", "OtherJob"],
+              token
+            }))
+            assert(claim._tag === "Claimed")
+            claims.set(claim.job.id, token)
+          }
+          const otherClaim = yield* store.claim(claimOptions({
+            queue: QueueName("other"),
+            token: "t-4"
+          }))
+          assert(otherClaim._tag === "Claimed")
+          claims.set(elsewhere, "t-4")
+          for (const id of [elsewhere, third, second, first]) {
+            const token = claims.get(id)
+            assert(token !== undefined)
+            yield* store.ack(id, token, {
+              _tag: id === second ? "Fail" : "Complete",
+              exit: undefined
+            })
+            yield* TestClock.adjust(1_000)
+          }
+
+          // Across terminal states, newest FINISHED first: the reverse of
+          // enqueue order.
+          const recent = yield* store.list({
+            states: ["completed", "failed"],
+            orderBy: "finishedAt",
+            order: "desc"
+          })
+          expect(recent.items.map((job) => job.id)).toEqual([first, second, third, elsewhere])
+
+          // Scoped to one name and state.
+          const byName = yield* store.list({
+            name: "TestJob",
+            states: ["completed"],
+            orderBy: "finishedAt",
+            order: "desc"
+          })
+          expect(byName.items.map((job) => job.id)).toEqual([first, third, elsewhere])
+
+          // The queue filter applies on top of the finishedAt route.
+          const byQueue = yield* store.list({
+            queue: QueueName("other"),
+            states: ["completed"],
+            orderBy: "finishedAt",
+            order: "desc"
+          })
+          expect(byQueue.items.map((job) => job.id)).toEqual([elsewhere])
         })
       ))
 

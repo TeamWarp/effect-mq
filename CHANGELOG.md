@@ -4,6 +4,33 @@ All notable changes to `effect-mq`. Versions follow 0.x semver: **minor
 bumps may break** (the `JobStore` driver contract in particular); patch
 bumps are additive.
 
+## 0.7.0 — unreleased
+
+- **List ordering** — `list` gains `orderBy` (`enqueuedAt` | `runAt` |
+  `finishedAt`; missing fields sort as 0) and `order` (`asc` | `desc`),
+  with the id tiebreak following the direction and cursors valid only
+  with the options that produced them. The contract defines a required
+  (filter, orderBy) surface every driver serves (conformance-pinned);
+  beyond it a driver either serves the query or dies with the new
+  `ListOrderUnsupportedError`, never a silent full scan. Memory and
+  Postgres serve every combination. Breaking for driver authors (new
+  required list behavior); the default order is unchanged.
+- **Redis list indexes** — `list` on Redis now routes through indexes
+  instead of scanning every job: new `byname`/`byqueue` zsets (maintained
+  at the insert/delete choke points) for the immutable dimensions, and
+  the existing delayed/terminal structures for `runAt`/`finishedAt`
+  ordering. On by default; opt out per index with
+  `RedisJobStore.layer({ indexes })`, after which a query that needs a
+  disabled index dies with `ListIndexDisabledError`. The first startup
+  after the upgrade backfills the indexes from existing rows (cursor-
+  scanned in pages, marker-gated, idempotent), and every later startup
+  heals the tail of rows enqueued since the marker — so rolling deploys
+  with still-running 0.6.0 writers converge on their last instance's
+  boot; no manual migration. Two invariants: the `indexes` config is
+  per-PREFIX (every store sharing a prefix must agree), and disabling an
+  index removes only its marker, never shared zsets. `metadata`
+  filtering remains a per-row predicate by design.
+
 ## 0.6.0 — 2026-08-25
 
 - **Parent-child flows, cross-store, nestable** — the new `Flow` module: a

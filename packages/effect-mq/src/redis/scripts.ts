@@ -21,6 +21,19 @@
  * - `p:delayed:<queue>`         ZSET, score `runAt`
  * - `p:active`                  ZSET, score `lockExpiresAt`
  * - `p:all`                     ZSET, score `enqueuedAt` (list pagination)
+ * - `p:byname:<name>`           ZSET, score `enqueuedAt` (list name index;
+ *                               optional, `RedisJobStoreOptions.indexes.name`)
+ * - `p:byqueue:<queue>`         ZSET, score `enqueuedAt` (list queue index;
+ *                               optional, `RedisJobStoreOptions.indexes.queue`)
+ * - `p:index:<kind>:ready`      STRING, millis timestamp of the last index
+ *                               reconcile's start for `<kind>` (name |
+ *                               queue). Absent: the next enabled boot does a
+ *                               full ZSCAN rebuild. Present: enabled boots
+ *                               heal the tail (rows enqueued since the value
+ *                               minus a safety margin) and re-stamp it —
+ *                               closing the rolling-deploy window where
+ *                               index-less writers inserted rows after the
+ *                               marker landed
  * - `p:finished:<state>`        ZSET, score `finishedAt` (history TTL)
  * - `p:terminal:<name>:<state>` ZSET, score `finishedAt` (keep pruning)
  * - `p:counts`                  HASH `<queue>|<state>` -> integer
@@ -51,10 +64,27 @@
 import { Redis } from "effect/unstable/persistence"
 
 /**
+ * Which optional list indexes (`p:byname:<name>` / `p:byqueue:<queue>`) this
+ * store maintains. The flags are baked into the script text (the helpers are
+ * shared by every script), so a store instance only ever runs scripts that
+ * match its configuration — disabled indexes cost no writes at all.
+ *
+ * @since 0.7.0
+ */
+export interface IndexConfig {
+  readonly name: boolean
+  readonly queue: boolean
+}
+
+/**
  * Shared helpers textually prepended to every script (the `Redis.script`
  * runner has no include mechanism). `ARGV[1]` is always the key prefix.
+ * Built once per store instance: `insertJobRow` writes only the list indexes
+ * enabled by `IndexConfig` (`deleteJob` clears both unconditionally — a ZREM
+ * on a missing key is free, and stray entries from an earlier configuration
+ * must never outlive their job).
  */
-const HELPERS = `
+export const helpers = (indexes: IndexConfig): string => `
 local prefix = ARGV[1]
 local function fmt(x) return string.format("%.0f", x) end
 local function jobKey(id) return prefix .. ":job:" .. id end
@@ -62,6 +92,8 @@ local function attemptsKey(id) return prefix .. ":attempts:" .. id end
 local function waitingKey(queue) return prefix .. ":waiting:" .. queue end
 local function delayedKey(queue) return prefix .. ":delayed:" .. queue end
 local function terminalKey(name, state) return prefix .. ":terminal:" .. name .. ":" .. state end
+local function bynameKey(name) return prefix .. ":byname:" .. name end
+local function byqueueKey(queue) return prefix .. ":byqueue:" .. queue end
 -- Waiting order: score = -priority (higher priority first, full number range);
 -- FIFO within a priority via lexicographic members "<seq %016d>:<id>". A
 -- composite numeric score would clip either priority or seq past float53.
@@ -169,6 +201,8 @@ local function deleteJob(id)
   local name = redis.call("HGET", jk, "name")
   countsAdd(queue, state, -1)
   redis.call("ZREM", prefix .. ":all", id)
+  redis.call("ZREM", bynameKey(name), id)
+  redis.call("ZREM", byqueueKey(queue), id)
   redis.call("ZREM", prefix .. ":finished:" .. state, id)
   redis.call("ZREM", prefix .. ":active", id)
   redis.call("ZREM", terminalKey(name, state), id)
@@ -262,6 +296,20 @@ local function finishCancelled(id, queue, name, startedAt, now, nowStr)
   releaseDedupe(name, redis.call("HGET", jk, "dedupeKey"), id, now)
   applyKeep(name, "cancelled", redis.call("HGET", jk, "keep"), now)
 end
+-- Index one EXISTING job row into a list index (backfill and tail heal;
+-- insertJobRow covers live writes). A missing row is skipped — nothing to
+-- index, and the read path self-heals whatever stale member pointed here.
+local function indexInto(kind, id)
+  local row = redis.call("HMGET", jobKey(id), "name", "queue", "enqueuedAt")
+  if row[1] then
+    local enqueuedAt = tonumber(row[3]) or 0
+    if kind == "name" then
+      redis.call("ZADD", bynameKey(row[1]), enqueuedAt, id)
+    else
+      redis.call("ZADD", byqueueKey(row[2]), enqueuedAt, id)
+    end
+  end
+end
 -- Insert one fresh job row plus every index entry. String params are stored
 -- verbatim (payload/metadata/backoff/keep/trace/parent are pre-encoded JSON,
 -- "" = absent); priority/delayMs/now numeric-coercible. New jobs never carry
@@ -281,7 +329,9 @@ local function insertJobRow(id, name, queue, payloadJson, metadataJson, priority
     "processedAt", "", "finishedAt", "", "exit", "", "failedReason", "",
     "lockToken", "", "lockExpiresAt", "", "seq", fmt(seq))
   redis.call("ZADD", prefix .. ":all", now, id)
-  if state == "waiting" then
+${indexes.name ? `  redis.call("ZADD", bynameKey(name), now, id)\n` : ""}${
+  indexes.queue ? `  redis.call("ZADD", byqueueKey(queue), now, id)\n` : ""
+}  if state == "waiting" then
     addWaiting(queue, tonumber(priority), seq, id)
   else
     redis.call("ZADD", delayedKey(queue), runAt, id)
@@ -297,7 +347,7 @@ end
  * idMode: "user" (dedup no-op), "generated" (collision -> retry sentinel),
  * "auto" (j-<seq>, in-script collision loop).
  */
-export const enqueue = Redis.script(
+export const enqueue = (HELPERS: string) => Redis.script(
   (
     prefix: string,
     idMode: string,
@@ -435,7 +485,7 @@ return '{"id":' .. cjson.encode(id) .. ',"duplicate":false,"wake":true}'
  * waiting job whose name matches. Returns the claimed record (HGETALL pairs)
  * or an Empty result with the earliest matching delayed runAt.
  */
-export const claim = Redis.script(
+export const claim = (HELPERS: string) => Redis.script(
   (prefix: string, queue: string, namesJson: string, token: string, lockDurationMs: number, now: number) => [
     prefix,
     queue,
@@ -512,7 +562,7 @@ return cjson.encode({ empty = true, nextRunAt = nextRunAt })
  * Token-guarded. Retry on a cancel-requested job finishes it as cancelled
  * (cancellation wins over revival, mirroring release/recoverStalled).
  */
-export const ack = Redis.script(
+export const ack = (HELPERS: string) => Redis.script(
   (prefix: string, id: string, token: string, outcomeTag: string, exitJson: string, delayMs: number, now: number) => [
     prefix,
     id,
@@ -592,7 +642,7 @@ return '{"ok":true}'
  * release(prefix, id, token, now) — hand the job back without consuming an
  * attempt; a pending cancel wins and finishes the job instead.
  */
-export const release = Redis.script(
+export const release = (HELPERS: string) => Redis.script(
   (prefix: string, id: string, token: string, now: number) => [prefix, id, token, now],
   {
     numberOfKeys: 0,
@@ -626,7 +676,7 @@ return '{"ok":true,"wake":true,"queue":' .. cjson.encode(queue) .. '}'
  * extendLocks(prefix, locksJson, durationMs, now) -> { lost, cancel }
  * Cancel-requested locks are reported, not extended.
  */
-export const extendLocks = Redis.script(
+export const extendLocks = (HELPERS: string) => Redis.script(
   (prefix: string, locksJson: string, durationMs: number, now: number) => [prefix, locksJson, durationMs, now],
   {
     numberOfKeys: 0,
@@ -655,7 +705,7 @@ return cjson.encode({ lost = lost, cancel = cancel })
  * recoverStalled(prefix, maxStalledCount, now) -> recovered [{id, failed}]
  * A pending cancel finishes the job as cancelled (not reported as recovered).
  */
-export const recoverStalled = Redis.script(
+export const recoverStalled = (HELPERS: string) => Redis.script(
   (prefix: string, maxStalledCount: number, now: number) => [prefix, maxStalledCount, now],
   {
     numberOfKeys: 0,
@@ -707,7 +757,7 @@ return cjson.encode(recovered)
 ).withReturnType<string>()
 
 /** getJob(prefix, id) -> HGETALL pairs (empty array when missing). */
-export const getJob = Redis.script(
+export const getJob = (HELPERS: string) => Redis.script(
   (prefix: string, id: string) => [prefix, id],
   {
     numberOfKeys: 0,
@@ -720,46 +770,117 @@ return cjson.encode(record)
 ).withReturnType<string>()
 
 /**
- * list(prefix, filtersJson, cursor, limit)
- * Keyset pagination over p:all, newest first (enqueuedAt DESC, id DESC).
+ * list(prefix, sourcesJson, order, filtersJson, cursor, limit)
+ *
+ * Indexed list. The DRIVER routes the query to the narrowest zset(s) — see
+ * `RedisJobStore`'s routing matrix — and this script merges those sorted
+ * sources by (score, id) in the requested direction, pages past the
+ * exclusive `<orderValue>:<id>` keyset cursor, loads each candidate row, and
+ * applies the residual predicates until `limit` matches accumulate. Sources
+ * must be plain-id-membered zsets whose score IS the requested order value
+ * (`all`/`byname:`/`byqueue:` = enqueuedAt, `delayed:<queue>` = runAt,
+ * `finished:`/`terminal:` = finishedAt) and must be pairwise disjoint; the
+ * waiting zsets (seq-prefixed members, priority scores) are never routed
+ * here. A member whose job hash is gone is an orphan: it is ZREM'd from the
+ * source being scanned (self-heal) and skipped.
  */
-export const list = Redis.script(
-  (prefix: string, filtersJson: string, cursor: string, limit: number) => [prefix, filtersJson, cursor, limit],
-  {
-    numberOfKeys: 0,
-    lua: `${HELPERS}
--- A filter that Redis's cjson cannot decode (e.g. lone-surrogate escapes)
--- degrades to an empty page instead of a script error.
-local okFilters, filters = pcall(cjson.decode, ARGV[2])
-if not okFilters then return '{"items":[],"more":false}' end
+export const list = (HELPERS: string) =>
+  Redis.script(
+    (prefix: string, sourcesJson: string, order: string, filtersJson: string, cursor: string, limit: number) => [
+      prefix,
+      sourcesJson,
+      order,
+      filtersJson,
+      cursor,
+      limit
+    ],
+    {
+      numberOfKeys: 0,
+      lua: `${HELPERS}
+-- Input that Redis's cjson cannot decode (e.g. lone-surrogate escapes in a
+-- filter or key name) degrades to an empty page instead of a script error.
+local okSources, sources = pcall(cjson.decode, ARGV[2])
+local okFilters, filters = pcall(cjson.decode, ARGV[4])
+if not okSources or not okFilters then return '{"items":[],"more":false}' end
+local desc = ARGV[3] == "desc"
 local stateSet = nil
 if filters.states ~= nil then
   stateSet = {}
   for _, s in ipairs(filters.states) do stateSet[s] = true end
 end
 local cursorAt, cursorId = nil, nil
-if ARGV[3] ~= "" then
-  local split = string.find(ARGV[3], ":", 1, true)
+if ARGV[5] ~= "" then
+  local split = string.find(ARGV[5], ":", 1, true)
   if split ~= nil then
-    cursorAt = tonumber(string.sub(ARGV[3], 1, split - 1))
-    cursorId = string.sub(ARGV[3], split + 1)
+    cursorAt = tonumber(string.sub(ARGV[5], 1, split - 1))
+    cursorId = string.sub(ARGV[5], split + 1)
   end
   if cursorAt == nil then cursorId = nil end
 end
-local limit = tonumber(ARGV[4])
+local limit = tonumber(ARGV[6])
+-- One buffered iterator per source. offset counts consumed members still in
+-- the zset — a self-healed orphan decrements it, because its ZREM shifts
+-- every later rank down by one — so refills stay exact under in-script
+-- removals. The score bound is the cursor score (inclusive; the per-item
+-- check below excludes ids at or before the cursor within that score).
+local iters = {}
+for i = 1, #sources do
+  iters[i] = { key = sources[i], offset = 0, buf = {}, pos = 1, exhausted = false }
+end
+local function head(it)
+  if it.pos > #it.buf then
+    if it.exhausted then return nil end
+    if desc then
+      it.buf = redis.call("ZREVRANGEBYSCORE", it.key, cursorAt == nil and "+inf" or fmt(cursorAt), "-inf",
+        "WITHSCORES", "LIMIT", it.offset, 100)
+    else
+      it.buf = redis.call("ZRANGEBYSCORE", it.key, cursorAt == nil and "-inf" or fmt(cursorAt), "+inf",
+        "WITHSCORES", "LIMIT", it.offset, 100)
+    end
+    it.pos = 1
+    if #it.buf == 0 then
+      it.exhausted = true
+      return nil
+    end
+  end
+  return it.buf[it.pos], tonumber(it.buf[it.pos + 1])
+end
 local items = {}
-local moreMatches = false
-local max = cursorAt == nil and "+inf" or fmt(cursorAt)
-local offset = 0
+local more = false
 while true do
-  local batch = redis.call("ZREVRANGEBYSCORE", prefix .. ":all", max, "-inf", "WITHSCORES", "LIMIT", offset, 100)
-  if #batch == 0 then break end
-  for i = 1, #batch, 2 do
-    local id = batch[i]
-    local at = tonumber(batch[i + 1])
-    -- Skip up to and including the cursor position within its score.
-    if cursorAt == nil or at < cursorAt or (at == cursorAt and id < cursorId) then
-      local jk = jobKey(id)
+  -- The best head across sources: (score, id) in the requested direction (a
+  -- score-tied range comes back in member-lex order, so ids line up too).
+  local best, bestId, bestAt = nil, nil, nil
+  for i = 1, #iters do
+    local id, at = head(iters[i])
+    if id ~= nil then
+      local wins = best == nil
+      if not wins then
+        if at ~= bestAt then
+          wins = (desc and at > bestAt) or (not desc and at < bestAt)
+        else
+          wins = (desc and id > bestId) or (not desc and id < bestId)
+        end
+      end
+      if wins then
+        best, bestId, bestAt = iters[i], id, at
+      end
+    end
+  end
+  if best == nil then break end
+  best.pos = best.pos + 2
+  best.offset = best.offset + 1
+  -- Exclusive keyset cursor: skip up to and including the cursor position.
+  local past = cursorAt == nil
+    or (desc and (bestAt < cursorAt or (bestAt == cursorAt and bestId < cursorId)))
+    or (not desc and (bestAt > cursorAt or (bestAt == cursorAt and bestId > cursorId)))
+  if past then
+    local jk = jobKey(bestId)
+    if redis.call("EXISTS", jk) == 0 then
+      -- Orphaned index member (hash removed out of band): self-heal.
+      redis.call("ZREM", best.key, bestId)
+      best.offset = best.offset - 1
+    else
       local matches = true
       if filters.queue ~= nil and redis.call("HGET", jk, "queue") ~= filters.queue then matches = false end
       if matches and filters.name ~= nil and redis.call("HGET", jk, "name") ~= filters.name then matches = false end
@@ -779,24 +900,76 @@ while true do
       end
       if matches then
         if #items >= limit then
-          moreMatches = true
+          more = true
           break
         end
         items[#items + 1] = redis.call("HGETALL", jk)
       end
     end
   end
-  if moreMatches then break end
-  offset = offset + 100
 end
 if #items == 0 then return '{"items":[],"more":false}' end
-return cjson.encode({ items = items, more = moreMatches })
+return cjson.encode({ items = items, more = more })
+`
+    }
+  ).withReturnType<string>()
+
+/**
+ * indexMembers(prefix, kind, idsJson) -> "1"
+ *
+ * Index one ZSCAN chunk of `p:all` members during a full rebuild. The driver
+ * owns the ZSCAN cursor loop (linear, tie-immune, guaranteed to terminate,
+ * and guaranteed to return every element present for the whole scan); this
+ * script only does the per-chunk work, so the single-threaded server is
+ * never held for the whole keyspace. Re-visited members and rows indexed
+ * live by insertJobRow mid-scan are idempotent ZADDs.
+ */
+export const indexMembers = (HELPERS: string) => Redis.script(
+  (prefix: string, kind: string, idsJson: string) => [prefix, kind, idsJson],
+  {
+    numberOfKeys: 0,
+    lua: `${HELPERS}
+local kind = ARGV[2]
+for _, id in ipairs(cjson.decode(ARGV[3])) do
+  indexInto(kind, id)
+end
+return "1"
+`
+  }
+).withReturnType<string>()
+
+/**
+ * indexTailPage(prefix, kind, min, offset, pageSize) -> scanned count
+ *
+ * One bounded page of the boot-time tail heal: index every `p:all` member
+ * with score >= min (the previous marker minus a safety margin). Plain
+ * LIMIT offset paging — tails are small, and a rank-shift skip from a
+ * concurrent delete is covered by the margin plus the next boot's heal.
+ */
+export const indexTailPage = (HELPERS: string) => Redis.script(
+  (prefix: string, kind: string, min: string, offset: number, pageSize: number) => [
+    prefix,
+    kind,
+    min,
+    offset,
+    pageSize
+  ],
+  {
+    numberOfKeys: 0,
+    lua: `${HELPERS}
+local kind = ARGV[2]
+local batch = redis.call("ZRANGEBYSCORE", prefix .. ":all", ARGV[3], "+inf",
+  "LIMIT", tonumber(ARGV[4]), tonumber(ARGV[5]))
+for _, id in ipairs(batch) do
+  indexInto(kind, id)
+end
+return tostring(#batch)
 `
   }
 ).withReturnType<string>()
 
 /** counts(prefix) -> HGETALL pairs of p:counts. */
-export const counts = Redis.script(
+export const counts = (HELPERS: string) => Redis.script(
   (prefix: string) => [prefix],
   {
     numberOfKeys: 0,
@@ -809,7 +982,7 @@ return cjson.encode(pairs_)
 ).withReturnType<string>()
 
 /** remove(prefix, id) -> removed boolean (active/waiting-children refused). */
-export const remove = Redis.script(
+export const remove = (HELPERS: string) => Redis.script(
   (prefix: string, id: string) => [prefix, id],
   {
     numberOfKeys: 0,
@@ -827,7 +1000,7 @@ return "1"
 ).withReturnType<string>()
 
 /** retry(prefix, id, now) — failed -> waiting with a fresh budget. */
-export const retry = Redis.script(
+export const retry = (HELPERS: string) => Redis.script(
   (prefix: string, id: string, now: number) => [prefix, id, now],
   {
     numberOfKeys: 0,
@@ -862,7 +1035,7 @@ return '{"ok":true,"queue":' .. cjson.encode(queue) .. '}'
  * handing them to the cascade sweep); active gets the cancel-request flag;
  * terminal states are refused.
  */
-export const cancel = Redis.script(
+export const cancel = (HELPERS: string) => Redis.script(
   (prefix: string, id: string, now: number) => [prefix, id, now],
   {
     numberOfKeys: 0,
@@ -902,7 +1075,7 @@ return '{"ok":true}'
 ).withReturnType<string>()
 
 /** promote(prefix, id, now) — delayed -> waiting now. */
-export const promote = Redis.script(
+export const promote = (HELPERS: string) => Redis.script(
   (prefix: string, id: string, now: number) => [prefix, id, now],
   {
     numberOfKeys: 0,
@@ -934,7 +1107,7 @@ return '{"ok":true,"queue":' .. cjson.encode(queue) .. '}'
  * digits) and empty arrays ({}). An unchanged cadence (cron/tz/everyMs)
  * preserves the stored nextRunAt.
  */
-export const upsertSchedule = Redis.script(
+export const upsertSchedule = (HELPERS: string) => Redis.script(
   (
     prefix: string,
     key: string,
@@ -999,7 +1172,7 @@ return '{"ok":true}'
 ).withReturnType<string>()
 
 /** removeSchedule(prefix, key) -> existed boolean. */
-export const removeSchedule = Redis.script(
+export const removeSchedule = (HELPERS: string) => Redis.script(
   (prefix: string, key: string) => [prefix, key],
   {
     numberOfKeys: 0,
@@ -1012,7 +1185,7 @@ return tostring(removed)
 ).withReturnType<string>()
 
 /** listSchedules(prefix, filtersJson) ordered by nextRunAt ascending. */
-export const listSchedules = Redis.script(
+export const listSchedules = (HELPERS: string) => Redis.script(
   (prefix: string, filtersJson: string) => [prefix, filtersJson],
   {
     numberOfKeys: 0,
@@ -1037,7 +1210,7 @@ return cjson.encode(out)
 ).withReturnType<string>()
 
 /** dueSchedules(prefix, now) ordered by nextRunAt ascending. */
-export const dueSchedules = Redis.script(
+export const dueSchedules = (HELPERS: string) => Redis.script(
   (prefix: string, now: number) => [prefix, now],
   {
     numberOfKeys: 0,
@@ -1054,7 +1227,7 @@ return cjson.encode(out)
 ).withReturnType<string>()
 
 /** advanceSchedule(prefix, key, expectedRunAt, nextRunAt) — conditional CAS. */
-export const advanceSchedule = Redis.script(
+export const advanceSchedule = (HELPERS: string) => Redis.script(
   (prefix: string, key: string, expectedRunAt: number, nextRunAt: number) => [prefix, key, expectedRunAt, nextRunAt],
   {
     numberOfKeys: 0,
@@ -1078,7 +1251,7 @@ return "1"
  * in one script, so a stale sweeper can never re-fire a slot — even after
  * retention pruned the previous slot's job row.
  */
-export const tickSchedule = Redis.script(
+export const tickSchedule = (HELPERS: string) => Redis.script(
   (
     prefix: string,
     key: string,
@@ -1145,7 +1318,7 @@ return "1"
  * backoffJson, keepJson, timeoutMs, traceJson, parentJson, delayMs. Plain
  * (non-dedup) items only — the caller routes dedup items through \`enqueue\`.
  */
-export const enqueueMany = Redis.script(
+export const enqueueMany = (HELPERS: string) => Redis.script(
   (prefix: string, now: number, count: number, items: ReadonlyArray<string>) => [prefix, now, count, ...items],
   {
     numberOfKeys: 0,
@@ -1200,7 +1373,7 @@ return "[" .. table.concat(out, ",") .. "]"
  * min(store ceiling, per-row keep.age). The caller advances the offset by
  * (scanned - deleted) and stops when a page comes back short.
  */
-export const sweepState = Redis.script(
+export const sweepState = (HELPERS: string) => Redis.script(
   (prefix: string, state: string, ttlMs: string, limit: number, offset: number, now: number) => [
     prefix,
     state,
@@ -1267,7 +1440,7 @@ return cjson.encode({ scanned = scanned, deleted = deleted })
  * caller loops until 0): expired windows, then pending pointers (+inf)
  * whose job is gone or terminal.
  */
-export const sweepDedupes = Redis.script(
+export const sweepDedupes = (HELPERS: string) => Redis.script(
   (prefix: string, limit: number, now: number) => [prefix, limit, now],
   {
     numberOfKeys: 0,
@@ -1329,7 +1502,7 @@ return tostring(migrated + #expired + removedPending)
  * raced cancelRequested wins: the parent settles cancelled and its pending
  * rows flip to cancelled (cascade work for the flow sweeper).
  */
-export const fanOut = Redis.script(
+export const fanOut = (HELPERS: string) => Redis.script(
   (
     prefix: string,
     id: string,
@@ -1443,7 +1616,7 @@ return '{"ok":true,"wake":true,"queue":' .. cjson.encode(queue) .. '}'
  * transition, so its own report goes to the outbox here), else pending==0
  * resumes the parent runnable at the flow's LAST applied report's index.
  */
-export const recordChildResults = Redis.script(
+export const recordChildResults = (HELPERS: string) => Redis.script(
   (prefix: string, now: number, count: number, items: ReadonlyArray<string>) => [prefix, now, count, ...items],
   {
     numberOfKeys: 0,
@@ -1550,7 +1723,7 @@ return '{"results":[' .. table.concat(out, ",") .. '],"wakes":' .. wakesJson .. 
  * Items are positional HMGET tuples (the field list must stay in lockstep
  * with the driver's `toChildRecord`) — the full spec JSON stays server-side.
  */
-export const listChildResults = Redis.script(
+export const listChildResults = (HELPERS: string) => Redis.script(
   (prefix: string, flowId: string, cursor: string, limit: number) => [prefix, flowId, cursor, limit],
   {
     numberOfKeys: 0,
@@ -1591,7 +1764,7 @@ return cjson.encode({ items = items, more = #keys > limit })
  * Spec JSON strings pass through untouched — the script never cjson-decodes
  * stored payloads (precision, lone surrogates).
  */
-export const flowSweepWork = Redis.script(
+export const flowSweepWork = (HELPERS: string) => Redis.script(
   (prefix: string, pendingAgeMs: number, limit: number, now: number) => [prefix, pendingAgeMs, limit, now],
   {
     numberOfKeys: 0,
@@ -1671,7 +1844,7 @@ return cjson.encode({ reconcile = reconcile, cascade = cascade })
  * markChildrenCascaded(prefix, flowId, childKeysJson) — idempotent; unknown
  * keys are ignored (their index members are still cleared).
  */
-export const markChildrenCascaded = Redis.script(
+export const markChildrenCascaded = (HELPERS: string) => Redis.script(
   (prefix: string, flowId: string, childKeysJson: string) => [prefix, flowId, childKeysJson],
   {
     numberOfKeys: 0,

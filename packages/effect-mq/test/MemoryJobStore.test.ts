@@ -2,6 +2,7 @@ import { jobStoreConformance } from "../src/testing/index.ts"
 import { JobStore, MemoryJobStore } from "../src/index.ts"
 import { assert, describe, expect, it } from "@effect/vitest"
 import { Effect } from "effect"
+import { TestClock } from "effect/testing"
 
 jobStoreConformance("MemoryJobStore", () => MemoryJobStore.layer)
 
@@ -23,6 +24,38 @@ const request = (overrides?: Partial<JobStore.EnqueueRequest>): JobStore.Enqueue
   parent: undefined,
   delayMs: 0,
   ...overrides
+})
+
+describe("MemoryJobStore list ordering beyond the required surface", () => {
+  // Redis constrains finishedAt ordering to terminal states; memory (like
+  // Postgres) serves the mixed case, with missing finishedAt sorting as 0.
+  it.effect("finishedAt ordering over mixed states sorts unfinished rows as 0", () =>
+    Effect.gen(function*() {
+      const store = yield* MemoryJobStore.makeWith()
+      // Delayed: never claimable here, so it stays without a finishedAt.
+      const pending = yield* store.enqueue(request({ payload: { n: 1 }, delayMs: 60_000 }))
+      const finish = (token: string) =>
+        Effect.gen(function*() {
+          yield* store.enqueue(request())
+          const claim = yield* store.claim({
+            queue: QueueName("default"),
+            names: ["TestJob"],
+            token,
+            lockDurationMs: 30_000
+          })
+          assert(claim._tag === "Claimed")
+          yield* store.ack(claim.job.id, token, { _tag: "Complete", exit: undefined })
+          yield* TestClock.adjust(1_000)
+          return claim.job.id
+        })
+      const older = yield* finish("t-1")
+      const newer = yield* finish("t-2")
+
+      const desc = yield* store.list({ orderBy: "finishedAt", order: "desc" })
+      expect(desc.items.map((job) => job.id)).toEqual([newer, older, pending.id])
+      const asc = yield* store.list({ orderBy: "finishedAt", order: "asc" })
+      expect(asc.items.map((job) => job.id)).toEqual([pending.id, older, newer])
+    }).pipe(Effect.scoped))
 })
 
 describe("MemoryJobStore idGenerator", () => {

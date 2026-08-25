@@ -118,6 +118,7 @@ Every driver accepts `idGenerator` (generator for store-assigned ids; default a 
 | --- | --- | --- | --- |
 | `idGenerator` / `historyTtl` / `historySweepInterval` | yes | yes | yes |
 | Table instances (`jobs`, `attempts`, `schedules`, `queues`, `dedupe`, `flowChildren`, `flowOutbox`) | no | required | no |
+| `indexes`: list-index opt-out (see [Redis](/storage/redis#list-indexes)) | no | no | yes |
 | `extraValues`: fill `extend`ed columns at enqueue | no | yes | no |
 | `store`: bind to a named store key | via `layerFor` | option | via `layerFor` |
 | `validate`: probe tables at startup (default `true`) | no | yes | no |
