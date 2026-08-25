@@ -1122,10 +1122,9 @@ const makeStoreUnsafe = (options?: MemoryJobStoreOptions | undefined): MemorySto
               reconcileGroup ??= []
               reconcileGroup.push({ childKey: row.childKey, storeKey: row.storeKey, request: row.spec })
               reconcileCount += 1
-              // Returned work defers its own re-eligibility by one age, so a
-              // full page rotates instead of pinning the head: healthy
-              // in-flight children stop occupying every sweep, and rows no
-              // sweeper can act on cannot starve the ones behind them.
+              // Re-arm eligibility: returned work waits another pendingAgeMs
+              // before it can come back, so a full page rotates (see the
+              // interface's rotation note).
               row.pendingSince = now
             }
             if (row.status === "cancelled" && !row.cascaded && cascadeCount < limit) {

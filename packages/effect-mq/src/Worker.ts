@@ -8,9 +8,10 @@
  *
  *   claim -> decode payload -> run handler -> ack (complete | retry | fail)
  *
- * plus two maintenance fibers: lock renewal for in-flight jobs, and stalled
- * job recovery. On scope close, in-flight handlers are interrupted and their
- * jobs released back to `waiting` without consuming an attempt.
+ * plus maintenance fibers: lock renewal for in-flight jobs, stalled job
+ * recovery, schedule sweeping — and, once flows are registered, the outbox
+ * relay and flow sweeper. On scope close, in-flight handlers are interrupted
+ * and their jobs released back to `waiting` without consuming an attempt.
  *
  * @since 0.1.0
  */
@@ -83,7 +84,7 @@ export interface JobDescriptor<
 
 /**
  * The structural shape of a flow definition the worker needs — for running
- * flow CHILDREN (result reports need the parent store) and, via
+ * flow CHILDREN (the outbox relay routes results by parent store) and, via
  * `FlowDescriptor`, for running the parent's two phases. `Flow.Flow`
  * satisfies this; the indirection avoids a module cycle.
  *
@@ -126,7 +127,7 @@ export interface FlowDescriptor extends FlowAny {
   ) => Effect.Effect<ReadonlyArray<FlowChildSpec>, unknown, unknown>
   readonly collect: (
     payload: JobRecord["payload"],
-    flow: FlowState,
+    flowState: FlowState,
     context: JobContext
   ) => Effect.Effect<unknown, unknown, unknown>
 }
@@ -290,11 +291,11 @@ export class Worker extends Context.Service<Worker, {
 }>()("effect-mq/Worker") {}
 
 interface HandlerEntry {
-  /** For flow parents this is the `collect` phase (`flow` carries its tallies). */
+  /** For flow parents this is the `collect` phase (`flowState` carries its tallies). */
   readonly run: (
     payload: JobRecord["payload"],
     context: JobContext,
-    flow: FlowState | undefined
+    flowState: FlowState | undefined
   ) => Effect.Effect<unknown, unknown>
   readonly encodeExit: (
     exit: Exit.Exit<unknown, unknown>
@@ -432,7 +433,8 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
 
     // Flow plumbing. `storesByKey` maps store-key strings to resolved
     // services — this worker's own store, every `flows` entry's parent
-    // store, and each registered flow's parent + child stores. The relay
+    // store, and each registered flow's child stores (a registered flow's
+    // parent store IS the worker's own store). The relay
     // routes outbox entries by `parentStoreKey` through it, and the sweeper
     // and post-fan-out enqueue resolve child stores through it.
     // `flowPolicies` carries each known flow's fail-fast bit for settle
@@ -551,7 +553,7 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
     // their parent stores in batches and deletes what it delivered.
     // Redelivery after a crash is safe (dependency rows dedup), so there
     // are no leases — peek, deliver, delete. A terminal ack nudges the
-    // relay for v1-fast-path latency; the periodic pass is the fallback.
+    // relay so results push immediately; the periodic pass is the fallback.
     let relayPulseVersion = 0
     let relayPulse = Deferred.makeUnsafe<void>()
     const fireRelayPulse = Effect.suspend(() => {
@@ -756,7 +758,7 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
           // twice.
           const flow = entry.flow
           const isFanOut = flow !== undefined && record.flow === undefined
-          const runEffect = flow !== undefined && record.flow === undefined
+          const runEffect = isFanOut
             ? flow.fanOut(record.payload, context, record.parent?.depth ?? 0)
             : entry.run(record.payload, context, record.flow)
           const withRunSpan = runEffect.pipe(
@@ -838,7 +840,7 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
               )
               : exit
 
-          if (isFanOut && flow !== undefined && Exit.isSuccess(effective)) {
+          if (isFanOut && Exit.isSuccess(effective)) {
             // SAFETY: the fan-out runner's success type is the built specs.
             const children = effective.value as ReadonlyArray<FlowChildSpec>
             const acked = yield* Effect.exit(
@@ -1442,9 +1444,6 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
             }
             storesByKey.set(key.key, service.value)
           }
-          // Running the parent phases makes this worker a relay target for
-          // its own store (nested parents report upward through it too).
-          storesByKey.set(flow.parent.store.key, store)
           flowPolicies.set(flow.name, { failFast: flow.failFast })
           const decodePayload = Schema.decodeUnknownEffect(flow.parent.payloadJsonSchema)
           const encodeExit = Schema.encodeEffect(flow.parent.exitSchema)

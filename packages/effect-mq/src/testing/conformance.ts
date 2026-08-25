@@ -14,6 +14,12 @@
  * Effect `Clock` (e.g. pass `now` into queries as a bind parameter) — never
  * from the database server's clock — so this works against real storage too.
  *
+ * Beyond the core queue contract, dedicated sections pin the flow contract:
+ * parent-side ownership (the FanOut ack, dependency rows, batched
+ * `recordChildResults`, every settle decision) and the child-side outbox
+ * (terminal transitions of envelope-carrying jobs staging reports for the
+ * relay to another store).
+ *
  * @since 0.1.0
  */
 import * as JobStore from "../JobStore.ts"
@@ -1737,6 +1743,17 @@ export const jobStoreConformance = (
     // here. `storeKey` strings are opaque to the store.
     // ----------------------------------------------------------------------
 
+    const parentEnvelope = (
+      flowId: JobStore.JobId,
+      key: string
+    ): JobStore.ParentEnvelope => ({
+      flowName: "test-flow",
+      flowId,
+      childKey: key,
+      parentStoreKey: "main",
+      depth: 1
+    })
+
     const childSpec = (
       flowId: JobStore.JobId,
       key: string,
@@ -1747,13 +1764,7 @@ export const jobStoreConformance = (
       request: baseRequest({
         id: JobId(`flow/main/${flowId}/${key}`),
         name: "ChildJob",
-        parent: {
-          flowName: "test-flow",
-          flowId,
-          childKey: key,
-          parentStoreKey: "main",
-          depth: 1
-        },
+        parent: parentEnvelope(flowId, key),
         ...overrides
       })
     })
@@ -2314,7 +2325,9 @@ export const jobStoreConformance = (
       ))
 
     // ----------------------------------------------------------------------
-    // Batched reports + the outbox (flows v2).
+    // Batched reports + the child-side outbox. The outbox is how a CHILD
+    // store reports terminal transitions to a parent living in another
+    // store: append on the transition, peek/delete from the relay.
     // ----------------------------------------------------------------------
 
     it.effect("recordChildResults applies a batch positionally and keeps counters exact", () =>
@@ -2419,13 +2432,7 @@ export const jobStoreConformance = (
           const enqueueChild = (key: string) =>
             Effect.gen(function*() {
               const { id } = yield* store.enqueue(baseRequest({
-                parent: {
-                  flowName: "test-flow",
-                  flowId: JobId("remote-flow-3"),
-                  childKey: key,
-                  parentStoreKey: "main",
-                  depth: 1
-                }
+                parent: parentEnvelope(JobId("remote-flow-3"), key)
               }))
               const claim = yield* store.claim(claimOptions({ token: `t-${key}` }))
               assert(claim._tag === "Claimed")
@@ -2449,16 +2456,10 @@ export const jobStoreConformance = (
         })
       ))
 
-    it.effect("cancels honoured by the stall sweep and retry acks land in the outbox", () =>
+    it.effect("cancels honoured by retry acks, the stall sweep, and on a parked parent land in the outbox", () =>
       withStore((store) =>
         Effect.gen(function*() {
-          const envelope = (key: string): JobStore.ParentEnvelope => ({
-            flowName: "test-flow",
-            flowId: JobId("remote-flow-4"),
-            childKey: key,
-            parentStoreKey: "main",
-            depth: 1
-          })
+          const envelope = (key: string) => parentEnvelope(JobId("remote-flow-4"), key)
           // A cancel honoured when a RETRY ack finds the flag set.
           const retried = yield* store.enqueue(baseRequest({ parent: envelope("retry-cancel") }))
           const claimA = yield* store.claim(claimOptions({ token: "t-a" }))
@@ -2497,13 +2498,7 @@ export const jobStoreConformance = (
     it.effect("terminal transitions of envelope-carrying jobs land in the outbox", () =>
       withStore((store) =>
         Effect.gen(function*() {
-          const envelope = (key: string): JobStore.ParentEnvelope => ({
-            flowName: "test-flow",
-            flowId: JobId("remote-flow-1"),
-            childKey: key,
-            parentStoreKey: "main",
-            depth: 1
-          })
+          const envelope = (key: string) => parentEnvelope(JobId("remote-flow-1"), key)
           // A plain job's terminal ack appends nothing.
           const plain = yield* store.enqueue(baseRequest())
           const plainClaim = yield* store.claim(claimOptions({ token: "t-plain" }))
@@ -2565,16 +2560,11 @@ export const jobStoreConformance = (
     it.effect("cancels honoured off the ack path still land in the outbox", () =>
       withStore((store) =>
         Effect.gen(function*() {
-          const envelope: JobStore.ParentEnvelope = {
-            flowName: "test-flow",
-            flowId: JobId("remote-flow-2"),
-            childKey: "released",
-            parentStoreKey: "main",
-            depth: 1
-          }
           // A cancel that arrives while the child runs, honoured when the
           // worker RELEASES the job (shutdown) instead of acking it.
-          const { id } = yield* store.enqueue(baseRequest({ parent: envelope }))
+          const { id } = yield* store.enqueue(baseRequest({
+            parent: parentEnvelope(JobId("remote-flow-2"), "released")
+          }))
           const claim = yield* store.claim(claimOptions({ token: "t-run" }))
           assert(claim._tag === "Claimed")
           yield* store.cancel(id)

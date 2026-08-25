@@ -750,7 +750,9 @@ if (!available) {
       })
       expect(DrizzleJobStore.isDeadlockError(wrapped)).toBe(true)
       expect(DrizzleJobStore.isDeadlockError(sqlError)).toBe(true)
-      // The old string-matching predicate never fired on this shape.
+      // String rendering hides both deadlock signals, so a substring
+      // predicate can never fire on this shape — the structural walk is
+      // load-bearing.
       expect(String(wrapped).includes("40P01")).toBe(false)
       expect(String(wrapped).includes("deadlock detected")).toBe(false)
 

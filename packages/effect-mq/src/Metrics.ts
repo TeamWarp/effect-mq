@@ -145,10 +145,10 @@ export const flowFanOuts = Metric.counter("effect_mq_flow_fanouts", {
 
 /**
  * Child results recorded into parent stores. Tags: `flow`, `outcome`
- * (completed | failed | cancelled), `source` (`report` = pushed by the
- * child's worker before its ack; `reconcile` = synthesized by the flow
- * sweeper from child-store state). Only applied reports count — duplicates
- * dropped by the dependency row do not.
+ * (completed | failed | cancelled), `source` (`report` = delivered by a
+ * worker's outbox relay; `reconcile` = synthesized by the flow sweeper from
+ * child-store state). Only applied reports count — duplicates dropped by
+ * the dependency row do not.
  *
  * @since 0.6.0
  */
@@ -157,7 +157,7 @@ export const flowChildReports = Metric.counter("effect_mq_flow_child_reports", {
 })
 
 /**
- * Cancels delivered into child stores after a flow settle. Tags: `flow`.
+ * Cancels delivered into child stores after a flow settle. Tags: none.
  *
  * @since 0.6.0
  */

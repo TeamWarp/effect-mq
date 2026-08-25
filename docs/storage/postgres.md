@@ -183,7 +183,7 @@ Ship layout changes through your normal migration flow: bump effect-mq, run `dri
 0.6.0 ([parent-child flows](/guide/flows)) is a bigger step, and it applies even if you never define a flow:
 
 1. The jobs table gains nullable columns: `parent` jsonb plus the flow bookkeeping (`flow_fail_fast` boolean and the `flow_pending`/`flow_completed`/`flow_failed`/`flow_cancelled` integers).
-2. There are two new tables — export `mqFlowChildren()` and `mqFlowOutbox()` from your schema as shown above.
+2. Two new tables arrive as schema factories: export `mqFlowChildren()` and `mqFlowOutbox()` from your schema as shown above.
 3. `DrizzleJobStore.layer` now **requires** the `flowChildren` and `flowOutbox` table options; upgrading without them is a compile error, which is the intended nudge to run the migration first.
 
 `drizzle-kit generate` emits all of it as one migration once the factory exports are in your schema; migrate before deploying 0.6.0.

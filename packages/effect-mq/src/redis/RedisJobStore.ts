@@ -967,7 +967,7 @@ export const make = (
           }
           const now = yield* Clock.currentTimeMillis
           const all: Array<{ applied: boolean; parentSettled: boolean }> = []
-          // One atomic batch per chunk of ~500 (ARGV headroom); the
+          // One atomic batch per chunk of 500 (ARGV headroom); the
           // contract's per-batch settle semantics then apply per chunk.
           for (let start = 0; start < reports.length; start += 500) {
             const chunk = reports.slice(start, start + 500)

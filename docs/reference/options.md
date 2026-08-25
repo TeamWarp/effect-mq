@@ -79,7 +79,7 @@ Cross-store parent-child flows; see [Parent-child flows](/guide/flows).
 | `children` | required | The closed set of child definitions `fanOut` may produce |
 | `onChildFailure` | `"continue"` | `"continue"` hands failures to `collect`; `"fail"` settles the parent as `failed` on the first one and cancels the rest |
 
-`Flow.children(job, items)` builds one fan-out group; each item takes `key` (unique within the flow; the idempotency mechanism), `payload`, and per-child `options` (`priority`, `attempts`, `backoff`, `keep`, `timeout`, `metadata` — no `delay`, children run immediately). `DigestFlow.toLayer({ fanOut, collect }, options?)` registers the two phases and accepts the same `concurrency`/`queue` options as `toLayer`.
+`Flow.children(job, items)` builds one fan-out group; each item takes `key` (unique within the flow; the idempotency mechanism), `payload`, and per-child `options` (`priority`, `attempts`, `backoff`, `keep`, `timeout`, `metadata`; no `delay`, children run immediately). `DigestFlow.toLayer({ fanOut, collect }, options?)` registers the two phases and accepts the same `concurrency`/`queue` options as a job's `toLayer`.
 
 ## `Worker.layer(options)`
 

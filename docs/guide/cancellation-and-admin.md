@@ -10,7 +10,7 @@ Every admin verb exists twice: typed on the job definition (`MyJob.cancel`, `MyJ
 | --- | --- |
 | `waiting` / `delayed` | terminal `cancelled` immediately, with a `cancelled` ledger entry |
 | `active` | the store flags `cancelRequested`; the owning worker interrupts the handler fiber on its next heartbeat |
-| `waiting-children` | terminal `cancelled` immediately; the remaining children are cancelled too (marked in the same atomic op, delivered into their stores by the [flow sweeper](/guide/flows#failure-policy)) |
+| `waiting-children` | terminal `cancelled` immediately; the settle marks the remaining children in the same atomic op, and the [flow sweeper](/guide/flows#failure-policy) delivers the cancels into their stores |
 | terminal | fails with `JobNotCancellableError` |
 
 Because handlers are Effect fibers, cancelling a *running* job interrupts real work: the worker interrupts the fiber, finalizers run, and the worker acks the job `Cancelled`. The flag rides on the lock heartbeat, so cancel latency for running jobs is at most one `lockRenewInterval` (default: half of `lockDuration`, so 15 seconds). Cancellation crosses processes: cancel from your API server, interrupt on the worker machine.

@@ -303,7 +303,7 @@ export interface SettledChildren<J extends MemberJob> {
 
 /**
  * What `collect` (and `Flow.childResults`) receives: `counts` for free,
- * `all` to materialize the v1-style buckets (one array — fine into the
+ * `all` to materialize the outcome buckets (one array — fine into the
  * tens of thousands), and `stream` to fold huge flows one page at a time.
  *
  * @since 0.6.0
@@ -319,7 +319,8 @@ export interface ChildResults<J extends MemberJob> {
  * dispatch — a resumed parent can never fan out twice) and returns the
  * children; `collect` runs after every child settled, with their results.
  * Both draw on the PARENT's attempt budget: a failing `fanOut` retries
- * until the manifest lands, a failing `collect` retries with what remains.
+ * against it until the manifest lands, a failing `collect` retries with
+ * what remains.
  *
  * @since 0.6.0
  */
@@ -676,7 +677,7 @@ export const make = <
                 : member.defaults.timeoutMs,
               // The child key is the idempotency mechanism; the member's
               // idempotencyKey/dedupe callbacks do NOT apply to flow
-              // children (documented loudly).
+              // children (see the module docs).
               dedupe: undefined,
               trace: span,
               parent: {

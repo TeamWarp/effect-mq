@@ -31,17 +31,17 @@
  * - `p:flowchild:<flowId>\0<childKey>`  HASH of one flow dependency row
  * - `p:flowchildren:<flowId>`  ZSET (score 0, member = childKey; ZRANGEBYLEX
  *                               gives child-key order + cursor pagination)
- * - `p:flowpending`             ZSET, member `<flowId>\0<childKey>`, score
- *                               pendingSince (flow-sweeper reconcile work)
+ * - `p:flowpending`             ZSET, member `<flowId>\0<childKey>`, score =
+ *                               sweep-eligibility timestamp (pendingSince at
+ *                               staging, re-armed on sweep return)
  * - `p:flowcascade`             ZSET, score 0, member `<flowId>\0<childKey>`
  *                               (cancels still owed to child stores)
  * - `p:flowoutbox`              ZSET, score = seq from `p:flowoutbox:seq`,
  *                               member `<seq>\0<report json>` — undelivered
- *                               child-result reports (see OutboxEntry). Peek
- *                               is ZRANGE oldest-first; its `after` cursor
- *                               parses the seq prefix from a prior id and
- *                               resumes via exclusive ZRANGEBYSCORE, so the
- *                               walk moves past deleted entries too
+ *                               child-result reports (see OutboxEntry). The
+ *                               seq prefix makes every member id a peek
+ *                               cursor that survives deletions (see
+ *                               peekOutbox in RedisJobStore)
  *
  * `waiting-children` parents live only in the job hash, `p:all`, and
  * `p:counts` — never in a pending zset, so `claim` can never return them.
@@ -1317,8 +1317,9 @@ return tostring(migrated + #expired + removedPending)
  *
  * Every chunk is lock-token-guarded. Non-final chunks ONLY stage dependency
  * rows; the final chunk stages its rows, appends the "fanned-out" ledger
- * entry (no attempt consumed), persists the manifest (flowFailFast +
- * flowPending = total), and transitions the parent: pending > 0 parks it in
+ * entry (no attempt consumed), persists the manifest (flowFailFast,
+ * flowPending = total, zeroed outcome counters), and transitions the parent:
+ * pending > 0 parks it in
  * waiting-children (no pending zset — never claimable), pending == 0 settles
  * it straight to runnable collect. A parent whose manifest already landed
  * keeps it untouched (rows are not re-created; the transition follows the
@@ -1432,9 +1433,8 @@ return '{"ok":true,"wake":true,"queue":' .. cjson.encode(queue) .. '}'
  * the queues of parents that resumed runnable. One atomic batch; reports may
  * span flows.
  *
- * Lock order (contract): dependency rows first, parents second. Phase 1
- * applies EVERY row update — idempotent, only while the row is still
- * pending; an applied report moves the child from the parent's `pending`
+ * Phase 1 applies EVERY row update — idempotent, only while the row is
+ * still pending; an applied report moves the child from the parent's `pending`
  * counter to its outcome counter and marks the row cascaded (the outcome
  * came FROM the child's store). Phase 2 settles each touched flow at most
  * once: the FIRST applied failed report in batch order under fail-fast
@@ -1548,7 +1548,7 @@ return '{"results":[' .. table.concat(out, ",") .. '],"wakes":' .. wakesJson .. 
  * listChildResults(prefix, flowId, cursor, limit) — child-key order via
  * ZRANGEBYLEX over the per-flow index; cursor = last childKey (exclusive).
  * Items are positional HMGET tuples (the field list must stay in lockstep
- * with the driver's CHILD_ROW_FIELDS) — the full spec JSON stays server-side.
+ * with the driver's `toChildRecord`) — the full spec JSON stays server-side.
  */
 export const listChildResults = Redis.script(
   (prefix: string, flowId: string, cursor: string, limit: number) => [prefix, flowId, cursor, limit],
@@ -1580,16 +1580,16 @@ return cjson.encode({ items = items, more = #keys > limit })
  * - parent missing, or terminal with NO manifest: a crashed fan-out's
  *   staged orphan — purge the row, its index member, and the flowpending
  *   member (left alone their old scores would head-pin every page forever);
- * - parent alive but not waiting-children (mid-staging): re-arm to $now so
+ * - parent alive but not waiting-children (mid-staging): re-arm to now so
  *   it rotates behind fresher work;
- * - returned rows: re-arm to $now (defer-on-return, per the contract) so a
+ * - returned rows: re-arm to now (defer-on-return, per the contract) so a
  *   full page rotates across sweeps;
  * - a non-pending row's membership is stale (rows never return to pending):
  *   self-heal by removing the member.
  *
  * Cascade lists flowcascade members (cancels still owed to child stores).
- * Spec/exit JSON strings pass through untouched — the script never
- * cjson-decodes stored payloads (precision, lone surrogates).
+ * Spec JSON strings pass through untouched — the script never cjson-decodes
+ * stored payloads (precision, lone surrogates).
  */
 export const flowSweepWork = Redis.script(
   (prefix: string, pendingAgeMs: number, limit: number, now: number) => [prefix, pendingAgeMs, limit, now],

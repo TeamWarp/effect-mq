@@ -390,7 +390,11 @@ export interface JobAttempt<A, E> {
   readonly startedAt: number | undefined
   readonly finishedAt: number
   readonly outcome: "completed" | "retried" | "failed" | "stalled" | "cancelled" | "fanned-out"
-  /** Absent for `stalled`, `cancelled`, and `fanned-out` entries. */
+  /**
+   * Absent for `stalled`, `cancelled`, and `fanned-out` entries — and for
+   * `failed` ones settled store-side without a handler exit (e.g. a
+   * fail-fast flow settle).
+   */
   readonly exit: Option.Option<Exit.Exit<A, E>>
 }
 

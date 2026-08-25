@@ -148,8 +148,8 @@ overdue slot once, then advances past `now`). Options mirror `enqueue`:
 
 A flow fans a parent job out into N children, parks the parent until every
 child settles, then resumes it with their typed results. Children can live
-on a **different store** than the parent — a cron parent in Postgres fanning
-out 10k idempotent sends into Redis and collecting the outcomes back:
+on a **different store** than the parent (a cron parent in Postgres fanning
+out 10k idempotent sends into Redis, collecting the outcomes back):
 
 ```ts
 import { Flow } from "effect-mq"
@@ -179,13 +179,13 @@ Worker.layer({ store: EmailStore, flows: [DigestFlow] })
 
 The parent's store owns the flow (manifest, per-child results, outcome
 counters), so "settle exactly once" is single-store atomic. Cross-store,
-every terminal child transition atomically appends its report to the child
-store's **outbox**; worker relays push those in batches (children keep
-completing through parent-store outages) and a reconciliation sweeper
-repairs anything the push path misses, from storage alone. Flows nest —
-a child can be another flow's parent — and `collect` reads results as
-plain `counts`, materialized buckets, or a paged `Stream`. Docs:
-[Parent-child flows](https://www.effect-mq.com/guide/flows).
+every terminal child transition appends its report to the child store's
+**outbox** in the same atomic operation; worker relays push those in
+batches (children keep completing through parent-store outages) and a
+reconciliation sweeper repairs anything the push path misses, from storage
+alone. Flows nest (a child can be another flow's parent), and `collect`
+reads results as plain `counts`, materialized buckets, or a paged `Stream`.
+Docs: [Parent-child flows](https://www.effect-mq.com/guide/flows).
 
 ## Timeouts, cancellation, and unrecoverable errors
 

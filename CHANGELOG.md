@@ -7,7 +7,7 @@ bumps are additive.
 ## 0.6.0 — unreleased
 
 - **Parent-child flows, cross-store, nestable** — the new `Flow` module: a
-  parent job fans out N children (each bound to its own store — a Postgres
+  parent job fans out N children (each bound to its own store: a Postgres
   cron parent can fan 10k idempotent sends into Redis), parks in the new
   `waiting-children` state, and resumes with their typed results.
   `Flow.make({ parent, children, onChildFailure })` +
@@ -17,19 +17,19 @@ bumps are additive.
   delegates to the parent job. `collect` reads results three ways:
   `counts` (plain numbers off the parent record), `all` (materialized
   typed buckets), or `stream` (paged, for flows too large to hold).
-  Flows nest — a child may be another flow's parent — with a depth cap
+  Flows nest (a child may be another flow's parent), with a depth cap
   of 8 as the cycle guard. Child keys are the idempotency mechanism
-  (deterministic ids `flow/<parentStore>/<flowId>/<key>`; the child's
-  `idempotencyKey`/`dedupe` do not apply); duplicate keys and
+  (deterministic ids derived from parent store + flow id + key; the
+  child's `idempotencyKey`/`dedupe` do not apply); duplicate keys and
   payload-validation bugs fail the fan-out unrecoverably.
 - **The outbox: reports that cannot be lost** — every terminal child
   transition (ack, cancel, stall exhaustion, a nested parent's store-side
   settle) appends the child's report to its own store's outbox in the
   same atomic operation. Worker relays (`Worker.layer({ flows })`) drain
-  outboxes into the parent stores in batches — instantly on each ack,
-  periodically as fallback — so children keep completing through
-  parent-store outages and per-flow report throughput amortizes across
-  batches. A parent-side flow sweeper (`flowSweepInterval`, default 30s)
+  outboxes into the parent stores in batches (on each ack, and on a
+  fallback cadence), so children keep completing through parent-store
+  outages and per-flow report throughput amortizes across batches. A
+  parent-side flow sweeper (`flowSweepInterval`, default 30s)
   reconciles anything the push path misses, from storage alone, and
   cascades cancels after fail-fast/cancel settles. New metrics:
   `effect_mq_flow_fanouts`, `effect_mq_flow_child_reports` (by
@@ -43,9 +43,9 @@ bumps are additive.
   integers); two new tables ship via the `mqFlowChildren()` and
   `mqFlowOutbox()` schema factories; and `DrizzleJobStore.layer` now
   **requires** the `flowChildren` and `flowOutbox` table options (a
-  compile error until you add them — run `drizzle-kit generate`/`migrate`
+  compile error until you add them; run `drizzle-kit generate`/`migrate`
   before deploying). The Redis driver needs no migration: old hashes
-  simply decode without the new fields.
+  decode without the new fields.
 - **Store contract (breaking for driver authors)** — `JobState` gains
   `"waiting-children"` (counts bucket included; never claimable;
   promote/retry reject it; cancel settles it and marks its children);
@@ -54,7 +54,7 @@ bumps are additive.
   counters); `AckOutcome` gains `FanOut`; new ops `recordChildResults`
   (idempotent batches, apply-all-rows-then-settle, fail-fast wins ties,
   dependency-rows-then-parent lock order), `listChildResults`,
-  `flowSweepWork` (returned rows re-arm — pages rotate),
+  `flowSweepWork` (returned rows re-arm, so pages rotate),
   `markChildrenCascaded`, and the outbox pair `peekOutbox`/`deleteOutbox`
   with the terminal-transition append invariant; `AttemptRecord.outcome`
   gains `"fanned-out"`; automatic retention must skip settled parents

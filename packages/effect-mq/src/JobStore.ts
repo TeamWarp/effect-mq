@@ -209,7 +209,11 @@ export interface AttemptRecord {
   /** Ack/recovery time of this run (epoch millis). */
   readonly finishedAt: number
   readonly outcome: "completed" | "retried" | "failed" | "stalled" | "cancelled" | "fanned-out"
-  /** Schema-encoded `Exit`; undefined for `stalled` and `fanned-out`. */
+  /**
+   * Schema-encoded `Exit`; undefined for `stalled`, `cancelled`, and
+   * `fanned-out` entries, and for `failed` entries written by a store-side
+   * settle (a fail-fast flow parent) rather than a handler run.
+   */
   readonly exit: unknown
 }
 
@@ -313,9 +317,10 @@ export interface TraceContext {
 
 /**
  * The persisted link from a flow child job to its parent flow. Attached by
- * the flow runtime at fan-out (never by producers); an opaque envelope to the
- * child's store, like `trace`. A worker claiming a job that carries one must
- * report the job's terminal outcome into the parent's store (see
+ * the flow runtime at fan-out (never by producers). Its presence puts the
+ * job under the outbox invariant: the child's store appends its report to
+ * the outbox with every terminal transition (see `OutboxEntry`), and a
+ * worker's relay delivers it into the parent's store (see
  * `Worker.layer({ flows })`).
  *
  * @since 0.6.0
@@ -365,9 +370,9 @@ export interface FlowState {
 /**
  * One child of a flow fan-out, persisted on its dependency row so the flow
  * sweeper can (re-)enqueue the child from storage alone after any crash.
- * `request.id` is the deterministic flow child id
- * (`flow/<parentStoreKey>/<flowId>/<childKey>`) and `request.parent` carries
- * the envelope.
+ * `request.id` is the deterministic flow child id — derived from the parent
+ * store key, flow id, and child key, so re-enqueues are idempotent — and
+ * `request.parent` carries the envelope.
  *
  * @since 0.6.0
  */
@@ -382,9 +387,10 @@ export interface FlowChildSpec {
  * A dependency row: one child's status and result as recorded in the PARENT
  * store. `exit` is the child's schema-encoded exit; `failedReason` carries
  * store-side child failures (stall exhaustion, a nested parent's fail-fast
- * settle) that never produced an exit. `cascaded` marks that a cancel no longer needs to
- * be delivered into the child's store (set by `markChildrenCascaded`, or
- * immediately when the recorded outcome came FROM the child's store).
+ * settle) that never produced an exit. `cascaded` marks that a cancel no
+ * longer needs to be delivered into the child's store (set by
+ * `markChildrenCascaded`, or immediately when the recorded outcome came
+ * FROM the child's store).
  *
  * @since 0.6.0
  */
@@ -427,10 +433,10 @@ export interface FlowChildReport {
  * a waiting/delayed child, a cancel honoured during release or stall
  * recovery, or a fail-fast settle of a NESTED flow parent (its terminal
  * transition happens store-side, with no ack) — the same atomic operation
- * appends the corresponding report here. The worker's relay then drains the outbox into the parent store in
- * batches and deletes what it delivered. Because dependency rows dedup
- * redelivery, the relay needs no leases: crash anywhere and the entries are
- * simply delivered again.
+ * appends the corresponding report here. The worker's relay then drains
+ * the outbox into the parent store in batches and deletes what it
+ * delivered. Because dependency rows dedup redelivery, the relay needs no
+ * leases: crash anywhere and the entries are simply delivered again.
  *
  * `remove` appends nothing (an operator override), and a `FanOut` ack
  * appends nothing (`waiting-children` is not terminal).
