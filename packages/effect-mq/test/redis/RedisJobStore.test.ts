@@ -30,12 +30,15 @@ if (!available) {
           defaults: { attempts: 2 }
         }) {}
         let attempt = 0
-        const handlers = Report.toLayer((payload, ctx) => {
-          attempt = ctx.attempt
-          return ctx.attempt === 1
-            ? Effect.fail("flaky")
-            : Effect.succeed(`report ${payload.month} sent`)
-        })
+        const handlers = Report.toLayer((payload) =>
+          Effect.gen(function*() {
+            const current = yield* Worker.CurrentJob
+            attempt = current.attempt
+            return current.attempt === 1
+              ? yield* Effect.fail("flaky")
+              : `report ${payload.month} sent`
+          })
+        )
 
         const store = yield* RedisJobStore.make({ prefix: freshPrefix() })
         const storeLayer = Layer.succeed(JobStore.JobStore, store)

@@ -11,10 +11,11 @@ import { Worker, MemoryJobStore } from "effect-mq"
 import { Effect, Layer } from "effect"
 
 const SendEmailWorker = SendEmail.toLayer(
-  (payload, ctx) =>
+  (payload) =>
     Effect.gen(function*() {
-      yield* Effect.log(`run ${ctx.attempt}/${ctx.attemptsMax} of ${ctx.jobId}`)
-      return `message-${ctx.jobId}`
+      const { attempt, attemptsMax, jobId } = yield* Worker.CurrentJob
+      yield* Effect.log(`run ${attempt}/${attemptsMax} of ${jobId}`)
+      return `message-${jobId}`
     }),
   { concurrency: 5 }
 )
@@ -25,7 +26,7 @@ const RunnerLive = SendEmailWorker.pipe(
 )
 ```
 
-The payload arrives decoded through the job's schema. The second argument is the `JobContext` for this run:
+The payload arrives decoded through the job's schema. `Worker.CurrentJob` is a service the worker provides around every run, so anything the handler calls, however deeply nested, can read it without threading a parameter:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -35,7 +36,9 @@ The payload arrives decoded through the job's schema. The second argument is the
 | `attempt` | `number` | 1-based attempt number |
 | `attemptsMax` | `number` | total attempts allowed for this job |
 
-Anything the handler requires (`R`) surfaces on the layer: provide your services to the handler layer and the worker captures them at registration time, so taker fibers never leak one job's locally provided services into another's. Registering two handlers for the same job name is a defect.
+Code that declares `Worker.CurrentJob` in its requirements can only run inside a job, and the type system enforces it: `toLayer` subtracts the service (the worker supplies it per run), while calling the same code from anywhere else demands an explicit `Effect.provideService(Worker.CurrentJob, {...})`. The worker also annotates every log line a handler writes with `effectMqJobId`/`effectMqQueue`/`effectMqAttempt`, so log-based tooling can group by job with no setup.
+
+Anything else the handler requires (`R`) surfaces on the layer: provide your services to the handler layer and the worker captures them at registration time, so taker fibers never leak one job's locally provided services into another's. Registering two handlers for the same job name is a defect.
 
 The registration options are `concurrency` (taker fibers for this job's queue; the first registration for a queue decides, and the worker ignores later values for the same queue) and `queue` (consume from a different queue than the definition's).
 

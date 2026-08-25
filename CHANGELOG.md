@@ -62,6 +62,17 @@ bumps are additive.
   grew ~26 flow tests, including the settle-race, fail-fast-tie,
   batch-semantics, outbox-invariant, cancel-racing-fan-out, and
   retention-exemption pins).
+- **`Worker.CurrentJob` replaces the handler context parameter** — handlers
+  are now `(payload) => Effect<...>`; the running attempt (`jobId`, `name`,
+  `queue`, `attempt`, `attemptsMax`) comes from the `Worker.CurrentJob`
+  service, readable at any depth of the handler's call graph without
+  threading a parameter. `toLayer` (and `Flow.toLayer`, whose `fanOut`/
+  `collect` drop their context arguments the same way) subtracts the
+  service from the handler's requirements, so declaring it makes "this
+  code only runs inside a job" a compile-time fact. Breaking for handlers
+  that used the second argument; payload-only handlers compile unchanged.
+  Workers also annotate every handler log line with
+  `effectMqJobId`/`effectMqQueue`/`effectMqAttempt`.
 - Also fixed while under review: the Postgres driver's `list()` had been
   omitting `dedupeKey` and `trace` from listed records (now
   conformance-pinned via a list/getJob parity check).

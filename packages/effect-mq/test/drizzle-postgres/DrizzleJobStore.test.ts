@@ -104,12 +104,13 @@ if (!available) {
         }) {}
 
         let attempt = 0
-        const handlers = SendReport.toLayer((payload, context) =>
-          Effect.suspend(() => {
+        const handlers = SendReport.toLayer((payload) =>
+          Effect.gen(function*() {
             attempt++
-            return context.attempt === 1
-              ? Effect.die("transient failure")
-              : Effect.succeed(`report ${payload.month} sent`)
+            const current = yield* Worker.CurrentJob
+            return current.attempt === 1
+              ? yield* Effect.die("transient failure")
+              : `report ${payload.month} sent`
           })
         )
 

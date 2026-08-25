@@ -38,8 +38,8 @@ import {
 import * as Metrics from "./Metrics.ts"
 
 /**
- * Information about the currently running attempt, passed to handlers as the
- * second argument.
+ * Information about the currently running attempt. Handlers (and anything
+ * they call, however deeply nested) read it from the `CurrentJob` service.
  *
  * @since 0.1.0
  */
@@ -52,6 +52,28 @@ export interface JobContext {
   /** Total attempts allowed for this job. */
   readonly attemptsMax: number
 }
+
+/**
+ * The currently running attempt, provided by the worker around every
+ * handler run (plain jobs and both flow phases). Declaring it as a
+ * requirement makes "this code only runs inside a job" a compile-time
+ * fact — `toLayer` subtracts it, since the worker supplies it per run:
+ *
+ * ```ts
+ * const notify = Effect.gen(function*() {
+ *   const { jobId, attempt } = yield* Worker.CurrentJob
+ *   // ... use them however deep in the call graph this runs
+ * })
+ * ```
+ *
+ * Outside a worker (unit tests calling such code directly), provide a
+ * value with `Effect.provideService(Worker.CurrentJob, {...})`.
+ *
+ * @since 0.6.0
+ */
+export class CurrentJob extends Context.Service<CurrentJob, JobContext>()(
+  "effect-mq/Worker/CurrentJob"
+) {}
 
 /**
  * The structural shape of a job definition the worker needs for
@@ -264,15 +286,15 @@ export class Worker extends Context.Service<Worker, {
   >(
     job: JobDescriptor<Payload, Success, Error>,
     handler: (
-      payload: Payload["Type"],
-      context: JobContext
+      payload: Payload["Type"]
     ) => Effect.Effect<Success["Type"], Error["Type"], R>,
     options?: RegisterOptions | undefined
   ) => Effect.Effect<
     void,
     never,
     | Scope.Scope
-    | R
+    // The worker provides CurrentJob around every run.
+    | Exclude<R, CurrentJob>
     | Payload["DecodingServices"]
     | Success["EncodingServices"]
     | Error["EncodingServices"]
@@ -758,9 +780,17 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
           // twice.
           const flow = entry.flow
           const isFanOut = flow !== undefined && record.flow === undefined
-          const runEffect = isFanOut
+          const runEffect = (isFanOut
             ? flow.fanOut(record.payload, context, record.parent?.depth ?? 0)
-            : entry.run(record.payload, context, record.flow)
+            : entry.run(record.payload, context, record.flow)).pipe(
+              // Every log line a handler writes carries the job identity —
+              // log-based alerting needs no per-handler setup.
+              Effect.annotateLogs({
+                effectMqJobId: record.id,
+                effectMqQueue: record.queue,
+                effectMqAttempt: context.attempt
+              })
+            )
           const withRunSpan = runEffect.pipe(
             Effect.withSpan(
               options?.handlerSpanName?.(context) ?? `${record.name}.run`,
@@ -1365,7 +1395,7 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
           // registration layer; capture it, minus runtime-ambient keys that
           // must always come from the executing fiber.
           const services = (yield* Effect.context<never>()).pipe(
-            Context.omit(Scope_.Scope, Tracer.ParentSpan)
+            Context.omit(Scope_.Scope, Tracer.ParentSpan, CurrentJob)
           )
           const decodePayload = Schema.decodeUnknownEffect(job.payloadJsonSchema)
           const encodeExit = Schema.encodeEffect(job.exitSchema)
@@ -1384,7 +1414,10 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
               provideCaptured(
                 decodePayload(payload).pipe(
                   Effect.orDie,
-                  Effect.flatMap((decoded) => handler(decoded, context))
+                  Effect.flatMap((decoded) => handler(decoded)),
+                  // Innermost, so neither the captured registration context
+                  // nor the worker's own can shadow the running attempt.
+                  Effect.provideService(CurrentJob, context)
                 )
               ),
             encodeExit: (exit) => provideCaptured(encodeExit(exit)),
@@ -1428,7 +1461,7 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
             )
           }
           const services = (yield* Effect.context<never>()).pipe(
-            Context.omit(Scope_.Scope, Tracer.ParentSpan)
+            Context.omit(Scope_.Scope, Tracer.ParentSpan, CurrentJob)
           )
           // Resolve every child store from the registration context (declared
           // on Flow.toLayer's signature) — this worker is the one process
@@ -1471,7 +1504,8 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
                     // collect dispatch requires a persisted manifest, so the
                     // fallback is defensive only.
                     flow.collect(decoded, flowState ?? emptyFlow, context)
-                  )
+                  ),
+                  Effect.provideService(CurrentJob, context)
                 )
               ),
             encodeExit: (exit) => provideCaptured(encodeExit(exit)),
@@ -1483,7 +1517,8 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
                 provideCaptured(
                   decodePayload(payload).pipe(
                     Effect.orDie,
-                    Effect.flatMap((decoded) => flow.fanOut(decoded, context, parentDepth))
+                    Effect.flatMap((decoded) => flow.fanOut(decoded, context, parentDepth)),
+                    Effect.provideService(CurrentJob, context)
                   )
                 ),
               enqueueChildren: (children) =>

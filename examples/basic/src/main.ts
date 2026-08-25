@@ -17,16 +17,17 @@ class SendEmail extends Job.make("SendEmail", {
 }) {}
 
 const SendEmailWorker = SendEmail.toLayer(
-  (payload, context) =>
+  (payload) =>
     Effect.gen(function*() {
+      const { attempt, jobId } = yield* Worker.CurrentJob
       // Fail the first attempt to demonstrate retries with backoff.
-      if (context.attempt === 1 && payload.to === "flaky@example.com") {
+      if (attempt === 1 && payload.to === "flaky@example.com") {
         return yield* Effect.die("smtp connection reset")
       }
       yield* Console.log(
-        `[worker] sending "${payload.subject}" to ${payload.to} (attempt ${context.attempt})`
+        `[worker] sending "${payload.subject}" to ${payload.to} (attempt ${attempt})`
       )
-      return `message-id-${context.jobId}`
+      return `message-id-${jobId}`
     }),
   { concurrency: 2 }
 )
