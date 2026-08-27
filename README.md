@@ -9,6 +9,9 @@ drizzle schema. Built on Effect v4; inspired by BullMQ's semantics and
 README ([`packages/effect-mq`](./packages/effect-mq/README.md), also shown on
 npm) covers the same ground in one page.
 
+Maintained by [Warp](https://www.warp.co).
+We're [hiring](https://www.warp.co/careers#open-roles).
+
 ```ts
 import { Job } from "effect-mq"
 import { Effect, Schema } from "effect"
