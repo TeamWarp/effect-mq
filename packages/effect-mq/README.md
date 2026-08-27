@@ -7,6 +7,9 @@ Built on Effect v4.
 
 **Documentation: [effect-mq.com](https://www.effect-mq.com)**
 
+Maintained by [Warp](https://www.warp.co).
+We're [hiring](https://www.warp.co/careers#open-roles).
+
 ```
 bun add effect-mq effect            # or npm / pnpm / yarn
 ```
