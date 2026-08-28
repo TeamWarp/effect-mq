@@ -1,5 +1,5 @@
 import { assert, describe, expect, it } from "@effect/vitest"
-import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Logger, Option, Redacted, References, Schedule, Schema } from "effect"
+import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Logger, Option, Redacted, References, Result, Schedule, Schema } from "effect"
 import { TestClock } from "effect/testing"
 import { Job, JobStore, MemoryJobStore, Worker } from "../src/index.ts"
 
@@ -841,6 +841,39 @@ describe("Worker hardening", () => {
         concurrency: 3,
         queues: { q: { concurrency: 2 } }
       })))
+    }))
+
+  it.effect("dies at layer build when queue concurrency resolves to NaN", () =>
+    Effect.gen(function*() {
+      const BadConcurrency = Job.make("BadConcurrency", {
+        payload: {},
+        queue: "bad-concurrency"
+      })
+
+      const bad = BadConcurrency.toLayer(() => Effect.void).pipe(
+        Layer.provideMerge(
+          Worker.layer({
+            queues: {
+              "bad-concurrency": {
+                concurrency: Number.NaN
+              }
+            }
+          })
+        ),
+        Layer.provideMerge(MemoryJobStore.layer)
+      )
+
+      const result = yield* Effect.exit(Effect.provide(Effect.void, bad))
+
+      assert(Exit.isFailure(result))
+
+      const defect = Cause.findDefect(result.cause)
+      assert(Result.isSuccess(defect))
+      assert(defect.success instanceof Error)
+
+      expect(defect.success.message).toBe(
+        'effect-mq: concurrency for queue "bad-concurrency" must not be NaN'
+      )
     }))
 
   it.effect("duplicate handler registration dies at layer build", () =>
