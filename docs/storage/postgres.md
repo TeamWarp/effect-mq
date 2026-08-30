@@ -154,7 +154,7 @@ The generator only runs for store-assigned ids: `idempotencyKey` ids and repeata
 Three mechanics worth knowing when you operate this store:
 
 - **Claims use `FOR UPDATE SKIP LOCKED`**: any number of worker processes claim concurrently without lock contention; a partial index on `(queue, priority desc, seq)` serves the claim path.
-- **Wake-ups use LISTEN/NOTIFY, queue-filtered**: the NOTIFY payload names the queue, so an enqueue wakes only the takers watching that queue; many queues don't amplify into many claims. The worker's `pollInterval` is the fallback (the 5s default is fine). If the LISTEN subscription drops, wake-ups degrade to polling until it resubscribes.
+- **Wake-ups use LISTEN/NOTIFY, queue-filtered**: the NOTIFY payload names the queue, so an enqueue wakes only the takers watching that queue; many queues don't amplify into many claims. The worker's `pollInterval` is the fallback (the 5s default is fine). If the LISTEN subscription drops, wake-ups degrade to polling until it resubscribes — the retry backs off from a second up to 30 seconds while attempts keep failing, and only the first failure of a streak logs at warning level. That matters on a connection that can never support `LISTEN` at all: PgBouncer in transaction mode cannot pin a session to a connection, and a pooled Neon endpoint is exactly that, so every attempt fails the same way. The queue keeps working on `pollInterval`; point the store at a direct (session-mode) endpoint if you want NOTIFY wake-ups.
 - **All time arrives as bind parameters from the Effect Clock**, never SQL `now()`, so the [conformance suite](/storage/writing-a-driver) runs against real Postgres under `TestClock`.
 
 ## Reads yes, writes no

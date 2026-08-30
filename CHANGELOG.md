@@ -4,6 +4,21 @@ All notable changes to `effect-mq`. Versions follow 0.x semver: **minor
 bumps may break** (the `JobStore` driver contract in particular); patch
 bumps are additive.
 
+## 0.7.1 — unreleased
+
+- **LISTEN resubscribe backs off** — the Postgres store retried the wake
+  channel on a flat one-second loop and logged every failure at warning
+  level. On a connection that cannot support `LISTEN` at all — PgBouncer
+  in transaction mode, which is what a pooled Neon endpoint is — every
+  attempt fails the same way, so that was one warning per second for the
+  life of the process. The retry now doubles from a second up to 30
+  seconds while a streak of failures runs, and only the failure that
+  opens a streak logs at warning level (the rest are debug); an attempt
+  that stayed up past the cap counts as a healthy subscription and starts
+  the next streak over. Nothing changes where `LISTEN` works: the
+  subscription still comes up on the first attempt, a transient drop
+  still retries a second later, and wake-up latency is unchanged.
+
 ## 0.7.0 — 2026-08-25
 
 - **List ordering** — `list` gains `orderBy` (`enqueuedAt` | `runAt` |
