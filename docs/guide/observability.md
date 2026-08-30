@@ -55,7 +55,7 @@ The *durable* analogues stay in the store: `store.counts()` for live depth and t
 | Instrument | Metric name | Type | Tags |
 | --- | --- | --- | --- |
 | `jobsEnqueued` | `effect_mq_jobs_enqueued` | counter | `name`, `queue`, `duplicate` |
-| `jobRuns` | `effect_mq_job_runs` | counter | `name`, `queue`, `outcome` (completed \| retried \| failed \| cancelled \| released \| fanned-out) |
+| `jobRuns` | `effect_mq_job_runs` | counter | `name`, `queue`, `outcome` (completed \| retried \| failed \| cancelled \| released \| fanned-out \| lock-lost) |
 | `jobRunDuration` | `effect_mq_job_run_duration_ms` | histogram | `name`, `queue`, `outcome` |
 | `jobWaitDuration` | `effect_mq_job_wait_duration_ms` | histogram | `name`, `queue` |
 | `claims` | `effect_mq_claims` | counter | `queue`, `result` (claimed \| empty) |
@@ -78,6 +78,7 @@ A few of these deserve reading notes:
 - `job_run_duration_ms` measures claim to ack for a single run, so it includes payload decode and the ack round trip on top of handler time.
 - `job_runs{outcome="released"}` counts jobs handed back on graceful shutdown; they consumed no attempt.
 - `locks_lost` counts locks found gone at heartbeat renewal; each one means a job may run twice, so a nonzero rate is worth an alert.
+- `job_runs{outcome="lock-lost"}` counts runs stopped because their lock was gone, which only happens under `Worker.layer({ onLockLost: "interrupt" })`; they consumed no attempt.
 - A high `claims{result="empty"}` ratio means takers outnumber work: lower `concurrency` or consolidate workers.
 
 ## Queue depth is opt-in

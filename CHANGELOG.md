@@ -4,6 +4,21 @@ All notable changes to `effect-mq`. Versions follow 0.x semver: **minor
 bumps may break** (the `JobStore` driver contract in particular); patch
 bumps are additive.
 
+## 0.7.1 — unreleased
+
+- **`Worker.layer({ onLockLost })`** — decide what happens to a running
+  handler whose lock the heartbeat found gone. The default `"ignore"` is
+  today's behaviour: the run continues to its natural end, holds its taker
+  slot until then, has its ack refused with `LockLostError`, and can no
+  longer be cancelled (cancel requests only reach jobs the worker still
+  counts as in-flight). `"interrupt"` stops it instead, the same way a
+  cancel request is delivered — finalizers run, nothing is acked, and no
+  attempt is spent, so the interrupt-only exit is never mistaken for a
+  failed attempt and `onJobFailure` is not called for it. Latency is one
+  `lockRenewInterval`, and such runs show up as
+  `effect_mq_job_runs{outcome="lock-lost"}`. Delivery stays at-least-once
+  either way; this only decides whether the losing run keeps going.
+
 ## 0.7.0 — 2026-08-25
 
 - **List ordering** — `list` gains `orderBy` (`enqueuedAt` | `runAt` |

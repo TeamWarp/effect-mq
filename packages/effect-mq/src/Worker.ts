@@ -190,6 +190,20 @@ export interface WorkerOptions<StoreId = JobStore> {
   readonly stalledInterval?: Duration.Input | undefined
   /** Stalls tolerated before a job is failed outright (default 1). */
   readonly maxStalledCount?: number | undefined
+  /**
+   * What to do with a running handler whose lock the heartbeat found gone:
+   * - `"ignore"` (default): the run continues to its natural end, its ack is
+   *   refused with `LockLostError`, and it holds its taker slot until then.
+   * - `"interrupt"`: interrupt the handler, the same way a cancel request is
+   *   delivered. Nothing is acked (another worker owns the job now) and no
+   *   attempt is spent. Latency is one `lockRenewInterval`.
+   *
+   * Either way the job runs twice — delivery is at-least-once and handlers
+   * must be idempotent. This only decides whether the losing run keeps going.
+   *
+   * @since 0.7.1
+   */
+  readonly onLockLost?: "ignore" | "interrupt" | undefined
   /** Fallback polling interval when idle and no wake-up arrives (default 5s). */
   readonly pollInterval?: Duration.Input | undefined
   /** How often to tick due repeatable-job schedules (default 15s). */
@@ -439,6 +453,7 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
     const scheduleSweepMs = Duration.toMillis(options?.scheduleSweepInterval ?? 15_000)
     const flowSweepMs = Duration.toMillis(options?.flowSweepInterval ?? 30_000)
     const maxStalledCount = options?.maxStalledCount ?? 1
+    const interruptOnLockLost = options?.onLockLost === "interrupt"
     const pollMs = Duration.toMillis(options?.pollInterval ?? 5_000)
     const workerId = options?.id ?? `worker-${Math.random().toString(36).slice(2, 10)}`
 
@@ -452,6 +467,10 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
     // Jobs this worker is interrupting because of a cancel request; their
     // interrupt-only exits ack as Cancelled instead of shutdown-release.
     const cancelling = new Set<JobId>()
+    // Jobs this worker is interrupting because their lock is gone
+    // (`onLockLost: "interrupt"`); their interrupt-only exits are dropped —
+    // no ack, no attempt spent.
+    const lostLocks = new Set<JobId>()
 
     // Flow plumbing. `storesByKey` maps store-key strings to resolved
     // services — this worker's own store, every `flows` entry's parent
@@ -833,11 +852,19 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
           const exit = yield* Effect.exit(restore(Fiber.join(fiber)))
           yield* Metric.modify(busy, -1)
           inflight.delete(record.id)
+          // Both sets are drained on every run, whatever the exit turns out to
+          // be, so a finished job never leaves an id behind. `wasCancelled` is
+          // read just below; `lostLock` waits until after the shutdown check.
           const wasCancelled = cancelling.delete(record.id)
+          const lostLock = lostLocks.delete(record.id)
+          // An exit with nothing in it but interrupts. Which of the three
+          // branches below claims it says who did the interrupting: the
+          // heartbeat, worker shutdown, or the handler itself.
+          const interruptedOnly = Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)
 
           // A cancel-request interrupt is terminal: ack Cancelled (even if a
           // shutdown races it — cancellation wins, the job must not revive).
-          if (wasCancelled && Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)) {
+          if (wasCancelled && interruptedOnly) {
             const landed = yield* ackLanded(store.ack(record.id, token, { _tag: "Cancelled" }), "ack")
             if (landed && record.parent !== undefined) {
               // The ack appended this child's report to the outbox; drain now
@@ -861,14 +888,30 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
             return yield* Effect.interrupt
           }
 
+          // The heartbeat stopped this run because its lock was gone. Another
+          // worker owns the job now, so there is nothing to ack and no attempt
+          // to spend. Below the shutdown check, because a shutdown still has to
+          // unwind the taker; above everything after it, because the rest of
+          // this function reads an interrupt-only exit as a handler that killed
+          // itself and turns it into a failed attempt.
+          if (lostLock && interruptedOnly) {
+            yield* Effect.logWarning(
+              `effect-mq: job "${record.name}" interrupted after its lock was lost`
+            ).pipe(Effect.annotateLogs({
+              effectMqJobId: record.id,
+              effectMqQueue: record.queue,
+              effectMqAttempt: context.attempt
+            }))
+            return yield* recordRun("lock-lost")
+          }
+
           // A handler that interrupted itself is a failed attempt, not a
           // shutdown — otherwise the job would hot-loop forever.
-          const effective: Exit.Exit<unknown, unknown> =
-            Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)
-              ? Exit.die(
-                new Error(`effect-mq: handler for job "${record.name}" interrupted itself`)
-              )
-              : exit
+          const effective: Exit.Exit<unknown, unknown> = interruptedOnly
+            ? Exit.die(
+              new Error(`effect-mq: handler for job "${record.name}" interrupted itself`)
+            )
+            : exit
 
           if (isFanOut && Exit.isSuccess(effective)) {
             // SAFETY: the fan-out runner's success type is the built specs.
@@ -1080,9 +1123,18 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
         )
         // A lost lock stays lost: drop the flight so we neither renew nor
         // recount it every heartbeat (the run's eventual ack surfaces
-        // LockLostError on its own).
+        // LockLostError on its own). Under `onLockLost: "interrupt"` we also
+        // stop the run, since its ack is going to be refused anyway.
         for (const id of result.lost) {
+          const flight = inflight.get(id)
           inflight.delete(id)
+          if (interruptOnLockLost && flight !== undefined) {
+            lostLocks.add(id)
+            // Delivery only, like the cancel branch below: waiting for the
+            // exit here would park the heartbeat behind the handler's
+            // finalizers. processJob's join observes the exit and drops it.
+            yield* Effect.sync(() => flight.fiber.interruptUnsafe())
+          }
         }
       }
       // Honour cross-process cancel requests: interrupt the handler fiber;
