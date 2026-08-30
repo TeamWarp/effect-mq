@@ -1,5 +1,5 @@
 import { assert, describe, expect, it } from "@effect/vitest"
-import { Effect, Layer, Logger, Metric, Option, Ref, Schema } from "effect"
+import { Clock, Effect, Exit, Fiber, Layer, Logger, Metric, Option, Ref, Schema, Scope } from "effect"
 import { TestClock } from "effect/testing"
 import { Flow, Job, JobStore, MemoryJobStore, Metrics, Worker } from "../src/index.ts"
 
@@ -60,10 +60,21 @@ const stealingStore = (
 }
 
 /**
- * A handler that works for ten simulated seconds and records a tick every
- * second, labelled by run — so how far each run got is directly readable.
+ * A store the heartbeat can never reach: a partition rather than a hand-off,
+ * so nothing ever reports the locks lost. The deadlines run out regardless.
  */
-const tickingJob = (name: string) => {
+const unreachableHeartbeat = (base: JobStore.Service): JobStore.Service =>
+  JobStore.JobStore.of({
+    ...base,
+    extendLocks: () => Effect.fail(new JobStore.JobStoreError({ message: "partitioned" }))
+  })
+
+/**
+ * A handler that works for `seconds` simulated seconds and records a tick
+ * every second, labelled by run — so how far each run got is directly
+ * readable.
+ */
+const tickingJob = (name: string, seconds = 10) => {
   class Ticking extends Job.make(name, { payload: {}, defaults: { attempts: 3 } }) {}
   const ticks: Array<string> = []
   const interruptedRuns: Array<number> = []
@@ -72,7 +83,7 @@ const tickingJob = (name: string) => {
     Effect.suspend(() => {
       const run = ++runs
       return Effect.gen(function*() {
-        for (let i = 0; i < 10; i++) {
+        for (let i = 0; i < seconds; i++) {
           yield* Effect.sleep("1 second")
           ticks.push(`run${run}-tick${i}`)
         }
@@ -362,6 +373,118 @@ describe("lost locks: onLockLost \"interrupt\"", () => {
     }))
 })
 
+describe("lost locks: the heartbeat cannot reach the store", () => {
+  it.effect("an expired deadline is reported even though nothing said the locks were lost", () =>
+    Effect.gen(function*() {
+      const logs: Array<string> = []
+      const base = yield* MemoryJobStore.make
+      // Long enough to still be running when the sweep fires, so there is a
+      // flight left to report.
+      const { handlers, interruptedRuns, ticks, Ticking } = tickingJob("PartitionIgnore", 30)
+      const before = (yield* Metric.value(Metrics.locksLost)).count
+
+      yield* Effect.gen(function*() {
+        yield* Ticking.enqueue({})
+        // The lock runs out at 10s. The first heartbeat is at 2.5s and spends
+        // its retry budget failing, so the sweep on the next one is what
+        // notices — nothing else ever will.
+        yield* walk(20)
+
+        expect(logs.some((line) => line.includes("lock renewal failed"))).toBe(true)
+        expect(
+          logs.some((line) =>
+            line.includes("locks expired before the heartbeat could reach the store; jobs may run twice")
+          )
+        ).toBe(true)
+        // Default is still default: the run itself is left alone and keeps
+        // ticking well past the moment its lock was declared gone.
+        expect(interruptedRuns).toEqual([])
+        expect(ticks).toContain("run1-tick18")
+      }).pipe(
+        Effect.provide(harness(handlers, unreachableHeartbeat(base), options("ignore"))),
+        Effect.provide(collectLogs(logs))
+      )
+
+      // Other tests in this file may add to this untagged counter too.
+      expect((yield* Metric.value(Metrics.locksLost)).count - before).toBeGreaterThanOrEqual(1)
+    }))
+
+  it.effect("under \"interrupt\" the run is stopped once its deadline has passed", () =>
+    Effect.gen(function*() {
+      const queue = "mq-lost-lock-partition"
+      class Stranded extends Job.make("LostLockStranded", { payload: {}, queue }) {}
+      const base = yield* MemoryJobStore.make
+      const interrupted = yield* Ref.make(false)
+      const failures: Array<Worker.JobFailure> = []
+      const handlers = Stranded.toLayer(() =>
+        Effect.never.pipe(Effect.onInterrupt(() => Ref.set(interrupted, true)))
+      )
+      const lockLost = Metric.value(Metrics.jobRuns.pipe(
+        Metric.withAttributes({ name: "LostLockStranded", queue, outcome: "lock-lost" })
+      ))
+      const before = (yield* lockLost).count
+
+      yield* Effect.gen(function*() {
+        yield* Stranded.enqueue({})
+        yield* walk(20)
+        expect(yield* Ref.get(interrupted)).toBe(true)
+      }).pipe(
+        Effect.provide(harness(handlers, unreachableHeartbeat(base), {
+          ...options("interrupt"),
+          onJobFailure: (failure) => Effect.sync(() => void failures.push(failure))
+        }))
+      )
+
+      // Same treatment as a store-reported loss: dropped, not failed.
+      expect((yield* lockLost).count - before).toBe(1)
+      expect(failures).toEqual([])
+    }))
+
+  it.effect("under \"ignore\" a run that outlives the partition keeps its lock: renewal resumes and the job is not re-run", () =>
+    Effect.gen(function*() {
+      const logs: Array<string> = []
+      const base = yield* MemoryJobStore.make
+      // The heartbeat cannot reach the store until 14s, then it is healthy.
+      const healing = JobStore.JobStore.of({
+        ...base,
+        extendLocks: (locks, durationMs) =>
+          Effect.gen(function*() {
+            if ((yield* Clock.currentTimeMillis) < 14_000) {
+              return yield* Effect.fail(new JobStore.JobStoreError({ message: "partitioned" }))
+            }
+            return yield* base.extendLocks(locks, durationMs)
+          })
+      })
+      const { handlers, ticks, Ticking } = tickingJob("PartitionHeals", 40)
+
+      yield* Effect.gen(function*() {
+        const id = yield* Ticking.enqueue({})
+        // The lock runs out at 10s and the 15s heartbeat reports it, but that
+        // same heartbeat reaches the store and renews it, so the stall sweep
+        // at 20s finds nothing expired. The second taker is free, so a re-run
+        // would show up as run2 ticks.
+        yield* walk(45)
+
+        expect(
+          logs.filter((line) => line.includes("locks expired before the heartbeat could reach the store"))
+        ).toHaveLength(1)
+        expect(logs.some((line) => line.includes("failed to renew locks"))).toBe(false)
+        expect(ticks.filter((tick) => tick.startsWith("run2-"))).toEqual([])
+        expect(ticks).toContain("run1-tick39")
+        const record = yield* base.getJob(id)
+        assert(Option.isSome(record))
+        expect(record.value.state).toBe("completed")
+      }).pipe(
+        Effect.provide(harness(handlers, healing, {
+          ...options("ignore"),
+          stalledInterval: "20 seconds",
+          concurrency: 2
+        })),
+        Effect.provide(collectLogs(logs))
+      )
+    }))
+})
+
 describe("lost locks: races with the handler's own exit", () => {
   it.effect("a run inside an uninterruptible region is dropped when it leaves it", () =>
     Effect.gen(function*() {
@@ -443,6 +566,92 @@ describe("lost locks: races with the handler's own exit", () => {
       // swallowed: the branch only claims interrupt-only exits.
       expect(failures).toHaveLength(1)
       expect(failures[0]?.willRetry).toBe(true)
+    }))
+
+  it.effect("a lost report for a run that just finished touches nothing", () =>
+    Effect.gen(function*() {
+      const queue = "mq-lost-lock-stale"
+      class Brief extends Job.make("LostLockBrief", { payload: {}, queue }) {}
+      const base = yield* MemoryJobStore.make
+      const interrupted = yield* Ref.make(false)
+      const handlers = Brief.toLayer(() =>
+        Effect.sleep("3 seconds").pipe(Effect.onInterrupt(() => Ref.set(interrupted, true)))
+      )
+      // The heartbeat asks at 2.5s and takes a second to answer. The run ends
+      // at 3s, inside that window, so the report names a flight the worker no
+      // longer holds — the one case where there is nothing left to interrupt.
+      let reported = false
+      const slowLoser = JobStore.JobStore.of({
+        ...base,
+        extendLocks: (locks, durationMs) =>
+          Effect.gen(function*() {
+            if (reported || locks.length === 0) return yield* base.extendLocks(locks, durationMs)
+            reported = true
+            yield* Effect.sleep("1 second")
+            return { lost: locks.map((lock) => lock.id), cancelRequested: [] }
+          })
+      })
+
+      const runs = (outcome: string) =>
+        Metric.value(Metrics.jobRuns.pipe(
+          Metric.withAttributes({ name: "LostLockBrief", queue, outcome })
+        ))
+      const before = { lost: (yield* runs("lock-lost")).count, completed: (yield* runs("completed")).count }
+
+      yield* Effect.gen(function*() {
+        const id = yield* Brief.enqueue({})
+        yield* walk(6)
+
+        // The run finished on its own and acked before the report landed.
+        const record = yield* base.getJob(id)
+        assert(Option.isSome(record))
+        expect(record.value.state).toBe("completed")
+        expect(yield* Ref.get(interrupted)).toBe(false)
+      }).pipe(Effect.provide(harness(handlers, slowLoser, options("interrupt"))))
+
+      expect((yield* runs("completed")).count - before.completed).toBe(1)
+      expect((yield* runs("lock-lost")).count - before.lost).toBe(0)
+    }))
+
+  it.effect("worker shutdown wins over a lost lock: the job is released, not dropped", () =>
+    Effect.gen(function*() {
+      const queue = "mq-lost-lock-shutdown"
+      class Held extends Job.make("LostLockHeld", { payload: {}, queue }) {}
+      const logs: Array<string> = []
+      const base = yield* MemoryJobStore.make
+      // The interrupt finalizer outlives the heartbeat's delivery, so the run
+      // is still unwinding when the worker is shut down underneath it.
+      const handlers = Held.toLayer(() =>
+        Effect.never.pipe(Effect.onInterrupt(() => Effect.sleep("5 seconds")))
+      )
+
+      const runs = (outcome: string) =>
+        Metric.value(Metrics.jobRuns.pipe(
+          Metric.withAttributes({ name: "LostLockHeld", queue, outcome })
+        ))
+      const before = { lost: (yield* runs("lock-lost")).count, released: (yield* runs("released")).count }
+
+      yield* Effect.gen(function*() {
+        // An explicit scope, so the worker can be shut down mid-run and the
+        // clock can still be driven while it unwinds.
+        const scope = yield* Scope.make()
+        const context = yield* Layer.buildWithScope(
+          harness(handlers, stealingStore(base), options("interrupt")),
+          scope
+        )
+        yield* Held.enqueue({}).pipe(Effect.provide(context))
+        // The lock goes at 2.5s and the finalizer starts; shut down inside it.
+        yield* walk(3)
+        const closing = yield* Effect.forkChild(Scope.close(scope, Exit.void))
+        yield* walk(8)
+        yield* Fiber.join(closing)
+      }).pipe(Effect.provide(collectLogs(logs)))
+
+      // Shutdown is checked first, so the taker still unwinds through the
+      // release path instead of returning normally into another claim.
+      expect((yield* runs("released")).count - before.released).toBe(1)
+      expect((yield* runs("lock-lost")).count - before.lost).toBe(0)
+      expect(logs.some((line) => line.includes("release dropped (LockLostError)"))).toBe(true)
     }))
 
   it.effect("positive control: a cancel request still interrupts and acks cancelled", () =>

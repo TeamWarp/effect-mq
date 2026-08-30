@@ -198,10 +198,11 @@ export interface WorkerOptions<StoreId = JobStore> {
    *   delivered. Nothing is acked (another worker owns the job now) and no
    *   attempt is spent. Latency is one `lockRenewInterval`.
    *
+   * Applies both to a lock the store reports lost and to one this worker can
+   * prove expired because its heartbeat could not reach the store at all.
+   *
    * Either way the job runs twice — delivery is at-least-once and handlers
    * must be idempotent. This only decides whether the losing run keeps going.
-   *
-   * @since 0.7.1
    */
   readonly onLockLost?: "ignore" | "interrupt" | undefined
   /** Fallback polling interval when idle and no wake-up arrives (default 5s). */
@@ -462,7 +463,24 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
     const startedQueues = new Set<QueueName>()
     const inflight = new Map<
       JobId,
-      { readonly id: JobId; readonly token: string; readonly fiber: Fiber.Fiber<unknown, unknown> }
+      {
+        readonly id: JobId
+        readonly token: string
+        readonly fiber: Fiber.Fiber<unknown, unknown>
+        /**
+         * When this lock runs out, on the same clock the store was given.
+         * Every successful renewal pushes it forward; once it passes with no
+         * renewal behind it, the job is gone whether or not the store was
+         * reachable to say so.
+         */
+        lockedUntil: number
+        /**
+         * Whether the sweep in the renewal loop has already reported this
+         * lock as expired, so a partition is one incident, not one per
+         * heartbeat. Cleared by the next renewal that lands.
+         */
+        expiredReported: boolean
+      }
     >()
     // Jobs this worker is interrupting because of a cancel request; their
     // interrupt-only exits ack as Cancelled instead of shutdown-release.
@@ -846,7 +864,16 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
           // interrupt THIS job without killing the taker loop; `restore`
           // keeps the child interruptible while the fork itself is masked.
           const fiber = yield* Effect.forkChild(restore(handlerEffect))
-          inflight.set(record.id, { id: record.id, token, fiber })
+          // The store stamped the claim, so the lock runs from there rather
+          // than from now: decoding and span setup already spent some of it.
+          const claimedAt = record.processedAt ?? (yield* Clock.currentTimeMillis)
+          inflight.set(record.id, {
+            id: record.id,
+            token,
+            fiber,
+            lockedUntil: claimedAt + lockDurationMs,
+            expiredReported: false
+          })
           const busy = Metrics.jobsInFlight.pipe(Metric.withAttributes({ queue: record.queue }))
           yield* Metric.modify(busy, 1)
           const exit = yield* Effect.exit(restore(Fiber.join(fiber)))
@@ -1107,34 +1134,96 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
         )
       })
 
+    // Locks this worker no longer holds: the metric and the "may run twice"
+    // warning, once per loss.
+    const reportLost = (ids: ReadonlyArray<JobId>, what: string) =>
+      Effect.gen(function*() {
+        if (ids.length === 0) return
+        yield* Metric.update(Metrics.locksLost, ids.length)
+        yield* Effect.logWarning(`effect-mq: ${what}; jobs may run twice`, ids)
+      })
+
+    // A lost lock stays lost: forget the flight so we neither renew nor
+    // recount it every heartbeat (the run's eventual ack surfaces
+    // LockLostError on its own). Under `onLockLost: "interrupt"` also stop
+    // the run, since its ack is going to be refused anyway.
+    const dropFlight = (id: JobId) =>
+      Effect.sync(() => {
+        const flight = inflight.get(id)
+        inflight.delete(id)
+        if (interruptOnLockLost && flight !== undefined) {
+          lostLocks.add(id)
+          // Delivery only, like the cancel branch below: waiting for the exit
+          // here would park the heartbeat behind the handler's finalizers.
+          // processJob's join observes the exit and drops it.
+          flight.fiber.interruptUnsafe()
+        }
+      })
+
+    // Whether the last heartbeat reached the store at all. While it did not,
+    // no deadline is being pushed forward, so the sweep below is the only
+    // thing that can notice a lock running out.
+    let renewalReachedStore = true
+
     const renewalLoop = Effect.gen(function*() {
       yield* Effect.sleep(lockRenewMs)
+      if (!renewalReachedStore) {
+        // A partition, not a hand-off: nobody is going to tell us these locks
+        // are gone, but once the deadline passes any worker's stall sweep may
+        // take the job. Gated on a failed heartbeat so a misconfigured
+        // `lockRenewInterval > lockDuration` cannot mass-expire healthy runs.
+        const now = yield* Clock.currentTimeMillis
+        const expired = Array.from(inflight.values())
+          .filter((flight) => flight.lockedUntil <= now && !flight.expiredReported)
+        yield* reportLost(
+          expired.map((flight) => flight.id),
+          "locks expired before the heartbeat could reach the store"
+        )
+        for (const flight of expired) {
+          if (interruptOnLockLost) {
+            yield* dropFlight(flight.id)
+          } else {
+            // Under "ignore" the run keeps going anyway, so keep renewing it.
+            // The store has not said the lock is gone, and extendLocks does
+            // not check expiry, so a run that outlives the partition keeps
+            // its lock if the store comes back before a stall sweep takes
+            // the job. Dropping it here would turn the re-run the warning
+            // says is possible into a certainty.
+            flight.expiredReported = true
+          }
+        }
+      }
       const entries = Array.from(inflight.values())
       if (entries.length === 0) return
-      const result = yield* retryStore(store.extendLocks(
+      const renewed = yield* Effect.exit(retryStore(store.extendLocks(
         entries.map((entry) => ({ id: entry.id, token: entry.token })),
         lockDurationMs
-      ))
-      if (result.lost.length > 0) {
-        yield* Metric.update(Metrics.locksLost, result.lost.length)
-        yield* Effect.logWarning(
-          "effect-mq: failed to renew locks; jobs may run twice",
-          result.lost
-        )
-        // A lost lock stays lost: drop the flight so we neither renew nor
-        // recount it every heartbeat (the run's eventual ack surfaces
-        // LockLostError on its own). Under `onLockLost: "interrupt"` we also
-        // stop the run, since its ack is going to be refused anyway.
-        for (const id of result.lost) {
-          const flight = inflight.get(id)
-          inflight.delete(id)
-          if (interruptOnLockLost && flight !== undefined) {
-            lostLocks.add(id)
-            // Delivery only, like the cancel branch below: waiting for the
-            // exit here would park the heartbeat behind the handler's
-            // finalizers. processJob's join observes the exit and drops it.
-            yield* Effect.sync(() => flight.fiber.interruptUnsafe())
-          }
+      )))
+      if (Exit.isFailure(renewed)) {
+        // Nothing was renewed. Say so, and let the next heartbeat's sweep be
+        // what reacts once the deadlines actually run out.
+        renewalReachedStore = false
+        return yield* Effect.logError("effect-mq: lock renewal failed", renewed.cause)
+      }
+      renewalReachedStore = true
+      const result = renewed.value
+      const lost = new Set(result.lost)
+      // A loss the sweep above already reported is not a second incident.
+      yield* reportLost(
+        result.lost.filter((id) => inflight.get(id)?.expiredReported !== true),
+        "failed to renew locks"
+      )
+      for (const id of result.lost) {
+        yield* dropFlight(id)
+      }
+      // Push the surviving deadlines forward. Read after the call landed, so
+      // this can only ever trail the deadline the store itself recorded. A
+      // renewed lock is held again, so a later expiry is a fresh incident.
+      const renewedAt = yield* Clock.currentTimeMillis
+      for (const entry of entries) {
+        if (!lost.has(entry.id)) {
+          entry.lockedUntil = renewedAt + lockDurationMs
+          entry.expiredReported = false
         }
       }
       // Honour cross-process cancel requests: interrupt the handler fiber;

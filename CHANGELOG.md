@@ -18,6 +18,23 @@ bumps are additive.
   `lockRenewInterval`, and such runs show up as
   `effect_mq_job_runs{outcome="lock-lost"}`. Delivery stays at-least-once
   either way; this only decides whether the losing run keeps going.
+- **Lock loss is noticed even when the store cannot be reached** — the
+  heartbeat used to learn about a lost lock only from `extendLocks`'
+  `lost` list, so a partition (the call itself failing, over and over)
+  went entirely unreported: the job stayed in the worker's in-flight map,
+  `effect_mq_locks_lost` never moved, and the "may run twice" warning
+  never fired. Every in-flight job now carries the deadline its lock was
+  claimed under, pushed forward by each successful renewal; once a
+  deadline passes with no renewal behind it, the worker reports that lock
+  lost itself — same metric, same warning, once per incident — and under
+  `"interrupt"` stops the run as it would for a store-reported loss. Under
+  the default `"ignore"` the worker keeps renewing the lock, since the
+  store has not said it is gone and a run that outlives the partition
+  keeps it if the store comes back before a stall sweep takes the job, so
+  no job outcome changes; the gap this closes is observability. The check
+  runs only after a heartbeat has actually failed, so a misconfigured
+  `lockRenewInterval` longer than `lockDuration` cannot mass-expire
+  healthy runs.
 
 ## 0.7.0 — 2026-08-25
 
