@@ -8,16 +8,19 @@ bumps are additive.
 
 - **LISTEN resubscribe backs off** — the Postgres store retried the wake
   channel on a flat one-second loop and logged every failure at warning
-  level. On a connection that cannot support `LISTEN` at all — PgBouncer
-  in transaction mode, which is what a pooled Neon endpoint is — every
-  attempt fails the same way, so that was one warning per second for the
-  life of the process. The retry now doubles from a second up to 30
-  seconds while a streak of failures runs, and only the failure that
-  opens a streak logs at warning level (the rest are debug); an attempt
-  that stayed up past the cap counts as a healthy subscription and starts
-  the next streak over. Nothing changes where `LISTEN` works: the
-  subscription still comes up on the first attempt, a transient drop
-  still retries a second later, and wake-up latency is unchanged.
+  level. On a pooled endpoint whose pooler rejects `LISTEN` (PgBouncer in
+  transaction mode cannot pin a session to a connection, and a pooled Neon
+  endpoint is exactly that) every attempt fails the same way, so that was
+  one warning per second for the life of the process. The retry now
+  doubles from a second up to 30 seconds while failures are consecutive,
+  and only the failure that opens a streak logs at warning level (the rest
+  are debug); an attempt that does not fail clears the streak, so the next
+  failure warns and retries at a second again. Nothing changes where
+  `LISTEN` works: the subscription still comes up on the first attempt, a
+  transient drop still retries a second later, and wake-up latency is
+  unchanged. A pooler that accepts `LISTEN` and silently drops
+  notifications never fails the subscription at all; the queue runs on
+  `pollInterval` there, as before.
 
 ## 0.7.0 — 2026-08-25
 

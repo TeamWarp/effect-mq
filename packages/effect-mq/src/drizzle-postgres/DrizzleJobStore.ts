@@ -17,11 +17,12 @@
  * @since 0.1.0
  */
 import * as JobStore from "../JobStore.ts"
+import { resubscribeForever } from "./resubscribe.ts"
 import type { PgClient } from "@effect/sql-pg"
 import { asc, eq, getTableColumns, type SQL, sql } from "drizzle-orm"
 import * as PgDrizzle from "drizzle-orm/effect-postgres"
 import { getTableConfig } from "drizzle-orm/pg-core"
-import { Cause, Clock, type Context, Deferred, Duration, Effect, Exit, Layer, Option, Predicate, type Scope, Stream } from "effect"
+import { Cause, Clock, type Context, Deferred, Duration, Effect, Layer, Option, Predicate, type Scope, Stream } from "effect"
 import type {
   MqDedupeTable,
   MqFlowChildrenTable,
@@ -282,60 +283,6 @@ const toFlowChildRecord = (row: FlowChildRow): JobStore.FlowChildRecord => ({
 })
 
 /**
- * Wake-channel resubscribe backoff. The first retry is still a second out,
- * so a dropped subscription recovers exactly as fast as it always did; only
- * a streak of failures walks the delay up to the cap.
- */
-const LISTEN_RETRY_BASE_MS = 1_000
-const LISTEN_RETRY_MAX_MS = 30_000
-
-/**
- * Resubscribe to the wake channel forever, backing off while attempts keep
- * failing.
- *
- * A transient drop is a streak of one: the next attempt runs a second later
- * and says so at warning level. A connection that can never support `LISTEN`
- * is a different animal — PgBouncer in transaction mode cannot pin a session
- * to a connection, and a pooled Neon endpoint is exactly that, so every
- * attempt fails the same way for the life of the process. A flat one-second
- * loop logs once a second forever, which is the whole cost of the situation:
- * the queue keeps working, wake-ups just fall back to the worker's
- * `pollInterval`.
- *
- * So the delay doubles up to `LISTEN_RETRY_MAX_MS` while a streak runs, and
- * only the failure that opens the streak logs at warning level — that one is
- * the actionable event, the ten-thousandth is not. An attempt that stayed up
- * for at least the cap counts as a healthy subscription, so the next drop
- * opens a fresh streak: full-speed retry, warning of its own.
- *
- * @internal
- */
-export const resubscribeForever = <E>(subscribe: Effect.Effect<void, E>): Effect.Effect<never> =>
-  Effect.gen(function*() {
-    let failures = 0
-    while (true) {
-      const startedAt = yield* Clock.currentTimeMillis
-      const exit = yield* Effect.exit(subscribe)
-      if ((yield* Clock.currentTimeMillis) - startedAt >= LISTEN_RETRY_MAX_MS) {
-        failures = 0
-      }
-      if (Exit.isFailure(exit)) {
-        yield* failures === 0
-          ? Effect.logWarning(
-            "effect-mq: LISTEN subscription failed; wake-ups degraded to polling until resubscribe",
-            exit.cause
-          )
-          : Effect.logDebug(
-            "effect-mq: LISTEN resubscribe failed; wake-ups still degraded to polling",
-            exit.cause
-          )
-      }
-      failures += 1
-      yield* Effect.sleep(Math.min(LISTEN_RETRY_MAX_MS, LISTEN_RETRY_BASE_MS * 2 ** (failures - 1)))
-    }
-  })
-
-/**
  * Build the store implementation. Requires `PgClient` and a `Scope` (for the
  * LISTEN subscription).
  *
@@ -470,8 +417,8 @@ export const make = (
         Deferred.doneUnsafe(waiter.deferred, Effect.void)
       }
     }
-    // Resubscribe forever: if the LISTEN stream ends or fails, wake-ups
-    // degrade to the worker's pollInterval until the next attempt succeeds.
+    // Wake-ups degrade to the worker's pollInterval whenever this is not
+    // subscribed; see `resubscribeForever` for the retry and log policy.
     yield* resubscribeForever(
       client.listen(wakeChannel).pipe(
         Stream.runForEach((payload) =>
