@@ -38,8 +38,8 @@ const levels = (lines: ReadonlyArray<Line>) => lines.map((line) => line.level)
 interface Attempt {
   /** How long the attempt runs before it settles. */
   readonly upFor: number
-  /** How it settles: fail, die, or return normally. */
-  readonly outcome: "fail" | "die" | "succeed"
+  /** How it settles: fail, die, return normally, or fail as a subscription that had been working. */
+  readonly outcome: "fail" | "die" | "succeed" | "fail-healthy"
 }
 
 /**
@@ -57,16 +57,24 @@ const scripted = (script: ReadonlyArray<Attempt>, startedAt: Array<number> = [])
     yield* Effect.sleep(step.upFor)
     if (step.outcome === "fail") return yield* Effect.fail("LISTEN not supported by this connection")
     if (step.outcome === "die") return yield* Effect.die(new Error("listen client blew up"))
+    if (step.outcome === "fail-healthy") return yield* Effect.fail(LOST_AFTER_ECHOING)
   })
 }
 
+const LOST_AFTER_ECHOING = "lost after echoing"
+
 const fails = (upFor = 0): Attempt => ({ upFor, outcome: "fail" })
 const succeeds = (upFor = 0): Attempt => ({ upFor, outcome: "succeed" })
+const failsHealthy = (upFor = 0): Attempt => ({ upFor, outcome: "fail-healthy" })
 
 /** Run the loop for `window`, then interrupt it. */
-const runFor = <E>(subscribe: Effect.Effect<void, E>, window: Duration.Input) =>
+const runFor = <E>(
+  subscribe: Effect.Effect<void, E>,
+  window: Duration.Input,
+  options?: { readonly wasHealthy?: ((error: E) => boolean) | undefined }
+) =>
   Effect.gen(function*() {
-    const fiber = yield* Effect.forkChild(resubscribeForever(subscribe))
+    const fiber = yield* Effect.forkChild(resubscribeForever(subscribe, options))
     yield* settle
     yield* TestClock.adjust(window)
     yield* settle
@@ -211,6 +219,41 @@ describe("resubscribeForever", () => {
         const gaps = at.slice(1).map((t, i) => t - at[i])
         expect(new Set(gaps)).toEqual(new Set([1_000]))
       }))
+  })
+
+  describe("wasHealthy", () => {
+    // The liveness probe fails a subscription that had been echoing. That is
+    // a new incident, not the next step of the streak it interrupted.
+    it.effect("a failure of a working subscription opens a new streak: warns and retries at a second", () => {
+      const lines: Array<Line> = []
+      const at: Array<number> = []
+      return Effect.gen(function*() {
+        // Two setup failures, then a subscription that lives a minute and is
+        // then declared dead, then setup failures again.
+        yield* runFor(
+          scripted([fails(), fails(), failsHealthy(60_000), fails()], at),
+          "5 minutes",
+          { wasHealthy: (error) => error === LOST_AFTER_ECHOING }
+        )
+
+        // 0, +1s, +2s reaches the healthy attempt at 3s; it dies at 63s and
+        // is retried a second later, not four; the streak walks up from
+        // there.
+        expect(at.slice(0, 6)).toEqual([0, 1_000, 3_000, 64_000, 66_000, 70_000])
+        expect(levels(lines).slice(0, 5)).toEqual(["Warn", "Debug", "Warn", "Debug", "Debug"])
+      }).pipe(captureInto(lines))
+    })
+
+    it.effect("without wasHealthy the same failure continues the streak", () => {
+      const lines: Array<Line> = []
+      const at: Array<number> = []
+      return Effect.gen(function*() {
+        yield* runFor(scripted([fails(), fails(), failsHealthy(60_000), fails()], at), "5 minutes")
+
+        expect(at.slice(0, 5)).toEqual([0, 1_000, 3_000, 67_000, 75_000])
+        expect(levels(lines).slice(0, 4)).toEqual(["Warn", "Debug", "Debug", "Debug"])
+      }).pipe(captureInto(lines))
+    })
   })
 
   describe("shutdown", () => {

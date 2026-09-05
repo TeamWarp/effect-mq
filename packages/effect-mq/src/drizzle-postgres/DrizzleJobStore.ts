@@ -17,6 +17,7 @@
  * @since 0.1.0
  */
 import * as JobStore from "../JobStore.ts"
+import { PROBE_PAYLOAD, probed } from "./listenProbe.ts"
 import { resubscribeForever } from "./resubscribe.ts"
 import type { PgClient } from "@effect/sql-pg"
 import { asc, eq, getTableColumns, type SQL, sql } from "drizzle-orm"
@@ -83,6 +84,19 @@ export interface DrizzleJobStoreOptions<StoreId = JobStore.JobStore> {
    * (default true). Migrations are owned by your drizzle-kit pipeline.
    */
   readonly validate?: boolean | undefined
+  /**
+   * Liveness probe for the LISTEN wake channel (default: every 30 seconds
+   * with a 10 second timeout; `false` disables it). The store NOTIFYs a
+   * reserved payload through the pool and expects to hear it back on the
+   * subscription; when it does not, the subscription is torn down and
+   * resubscribed. Without it a dropped listen connection is never noticed —
+   * `@effect/sql-pg`'s stream only fails during setup — and a pooler that
+   * accepts `LISTEN` but drops notifications is never reported.
+   */
+  readonly listenProbe?:
+    | { readonly interval?: Duration.Input | undefined; readonly timeout?: Duration.Input | undefined }
+    | false
+    | undefined
 }
 
 type Db = PgDrizzle.EffectPgDatabase & { readonly $client: PgClient.PgClient }
@@ -417,15 +431,27 @@ export const make = (
         Deferred.doneUnsafe(waiter.deferred, Effect.void)
       }
     }
+    const onWake = (payload: string) => signalWake(payload === "*" ? undefined : JobStore.QueueName(payload))
+    const subscribe = (onPayload: (payload: string) => void) =>
+      client.listen(wakeChannel).pipe(Stream.runForEach((payload) => Effect.sync(() => onPayload(payload))))
     // Wake-ups degrade to the worker's pollInterval whenever this is not
-    // subscribed; see `resubscribeForever` for the retry and log policy.
-    yield* resubscribeForever(
-      client.listen(wakeChannel).pipe(
-        Stream.runForEach((payload) =>
-          Effect.sync(() => signalWake(payload === "*" ? undefined : JobStore.QueueName(payload)))
-        )
-      )
-    ).pipe(Effect.forkScoped)
+    // subscribed; see `resubscribeForever` for the retry and log policy and
+    // `probed` for how a subscription that stopped delivering is noticed at
+    // all.
+    yield* (options.listenProbe === false
+      ? resubscribeForever(subscribe(onWake))
+      : resubscribeForever(
+        probed({
+          subscribe,
+          onWake,
+          ping: client.notify(wakeChannel, PROBE_PAYLOAD),
+          intervalMs: Duration.toMillis(options.listenProbe?.interval ?? "30 seconds"),
+          timeoutMs: Duration.toMillis(options.listenProbe?.timeout ?? "10 seconds")
+        }),
+        // A probe that had echoed before means the subscription was working;
+        // losing it is a new incident, not the next step of a streak.
+        { wasHealthy: (error) => error._tag === "ListenProbeTimeout" && error.echoes > 0 }
+      )).pipe(Effect.forkScoped)
     // Automatic retention (the store-level sweep and per-job `keep`) never
     // prunes a flow parent that still owes cascade cancels: its dependency
     // rows marked `cancelled` and not `cascaded` are the only record that
