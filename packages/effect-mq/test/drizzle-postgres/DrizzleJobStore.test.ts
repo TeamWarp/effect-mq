@@ -4,7 +4,7 @@ import { jobStoreConformance } from "../../src/testing/index.ts"
 import { assert, describe, expect, it } from "@effect/vitest"
 import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
 import { getTableConfig, index, text } from "drizzle-orm/pg-core"
-import { Cause, Effect, Exit, Fiber, Layer, Option, Schedule, Schema } from "effect"
+import { Cause, Effect, Exit, Fiber, Layer, Logger, Option, Schedule, Schema } from "effect"
 import { TestClock } from "effect/testing"
 import { DeadlockError, SqlError, UnknownError } from "effect/unstable/sql/SqlError"
 import {
@@ -186,6 +186,84 @@ if (!available) {
 
         const ledger = yield* store.getAttempts(record.id)
         expect(ledger.map((entry) => entry.outcome)).toEqual(["retried", "completed"])
+      }).pipe(Effect.scoped, Effect.provide(pgClientLive())))
+
+    // The liveness probe is the only thing that can notice this: sql-pg's
+    // listen stream never fails once it is up, so without the probe the
+    // store would sit on a dead socket forever and wake-ups would silently
+    // run on pollInterval.
+    it.live("a LISTEN connection that dies is noticed by the probe and resubscribed", () =>
+      Effect.gen(function*() {
+        const client = yield* PgClient.PgClient
+        const names = freshTableNames()
+        const jobs = mqJobs(names.jobs)
+        const attempts = mqJobAttempts(jobs, names.attempts)
+        const schedules = mqSchedules(names.schedules)
+        const queues = mqQueueControl(names.queues)
+        const dedupe = mqDedupe(names.dedupe)
+        const flowChildren = mqFlowChildren(names.flowChildren)
+        const flowOutbox = mqFlowOutbox(names.flowOutbox)
+        for (const statement of createTablesSql(names)) {
+          yield* client.unsafe(statement).pipe(Effect.orDie)
+        }
+        yield* Effect.addFinalizer(() => client.unsafe(dropTablesSql(names)).pipe(Effect.ignore))
+        const logs: Array<string> = []
+        const store = yield* DrizzleJobStore.make({
+          jobs,
+          attempts,
+          schedules,
+          queues,
+          dedupe,
+          flowChildren,
+          flowOutbox,
+          listenProbe: { interval: "200 millis", timeout: "500 millis" }
+        }).pipe(
+          Effect.orDie,
+          Effect.provide(Logger.layer([
+            Logger.make((options) => {
+              logs.push(String(options.message))
+            })
+          ]))
+        )
+
+        const channel = `effect_mq_wake_${names.jobs}`
+        const queue = JobStore.QueueName("probe-wake")
+        // A NOTIFY from a pooled connection reaches the store only through
+        // its LISTEN client, so a wake here proves the subscription is live.
+        const wakeArrives = Effect.gen(function*() {
+          const claimed = yield* store.claim({ queue, names: ["nothing"], token: "t", lockDurationMs: 30_000 })
+          assert(claimed._tag === "Empty")
+          yield* client.notify(channel, queue)
+          const woke = yield* store.awaitWake([queue], claimed.wakeToken).pipe(Effect.timeoutOption("300 millis"))
+          return Option.isSome(woke)
+        })
+        const eventuallyWakes = Effect.gen(function*() {
+          for (let i = 0; i < 60; i++) {
+            if (yield* wakeArrives) return true
+            yield* Effect.sleep("100 millis")
+          }
+          return false
+        })
+        const listenBackends = client.unsafe<{ pid: number }>(
+          "SELECT pid FROM pg_stat_activity WHERE query ILIKE $1",
+          [`LISTEN %${names.jobs}%`]
+        )
+
+        expect(yield* eventuallyWakes).toBe(true)
+        const [before] = yield* listenBackends
+        assert(before !== undefined)
+
+        // Kill the listen backend from the outside, the way a network blip
+        // would. The pg client sees an error the stream never hears about.
+        yield* client.unsafe("SELECT pg_terminate_backend($1)", [before.pid])
+
+        // The probe misses within 700ms, the loop warns once and resubscribes
+        // a second later on a fresh connection.
+        expect(yield* eventuallyWakes).toBe(true)
+        expect(logs.filter((line) => line.includes("LISTEN subscription failed"))).toHaveLength(1)
+        const [after] = yield* listenBackends
+        assert(after !== undefined)
+        expect(after.pid).not.toBe(before.pid)
       }).pipe(Effect.scoped, Effect.provide(pgClientLive())))
 
     it.effect("two named stores can live in one database as separate table pairs", () =>

@@ -98,6 +98,7 @@ const JobStoreLive = DrizzleJobStore.layer({
 | `idGenerator` | `j-<seq>` | generator for store-assigned job ids |
 | `extraValues` | metadata convention | override values for `extend`ed columns |
 | `validate` | `true` | probe the tables at startup, fail fast if migrations haven't run |
+| `listenProbe` | 30s interval, 10s timeout | liveness probe for the LISTEN wake channel: NOTIFY a reserved payload through the pool, expect it back on the subscription, resubscribe when it does not arrive; `false` disables it |
 
 The startup probe fails with a clear message when the tables are missing or mismatched; `validate: false` defers that to first use.
 
@@ -154,7 +155,7 @@ The generator only runs for store-assigned ids: `idempotencyKey` ids and repeata
 Three mechanics worth knowing when you operate this store:
 
 - **Claims use `FOR UPDATE SKIP LOCKED`**: any number of worker processes claim concurrently without lock contention; a partial index on `(queue, priority desc, seq)` serves the claim path.
-- **Wake-ups use LISTEN/NOTIFY, queue-filtered**: the NOTIFY payload names the queue, so an enqueue wakes only the takers watching that queue; many queues don't amplify into many claims. The worker's `pollInterval` is the fallback (the 5s default is fine). If the LISTEN subscription drops, wake-ups degrade to polling until it resubscribes.
+- **Wake-ups use LISTEN/NOTIFY, queue-filtered**: the NOTIFY payload names the queue, so an enqueue wakes only the takers watching that queue; many queues don't amplify into many claims. The worker's `pollInterval` is the fallback (the 5s default is fine). If the LISTEN subscription drops, wake-ups degrade to polling until it resubscribes — the retry backs off from a second up to 30 seconds while attempts keep failing, and only the first failure of a streak logs at warning level. A dropped connection is noticed by the liveness probe (`listenProbe`, every 30s with a 10s timeout): the store NOTIFYs a reserved payload through the pool and expects to hear it back on the subscription, because `@effect/sql-pg`'s stream itself never fails once it is up. The payloads `*` and `effect-mq:probe` are reserved, so no queue may use those names. That matters on a connection that can never support `LISTEN` at all: PgBouncer in transaction mode cannot pin a session to a connection, and a pooled Neon endpoint is exactly that. Depending on the pooler, `LISTEN` either fails on every attempt or is accepted and simply never delivers a notification — stock PgBouncer does the latter, silently, and the probe turns it into the same single warning and backed-off retry as the former. Either way the queue keeps working on `pollInterval`; point the store at a direct (session-mode) endpoint if you want NOTIFY wake-ups.
 - **All time arrives as bind parameters from the Effect Clock**, never SQL `now()`, so the [conformance suite](/storage/writing-a-driver) runs against real Postgres under `TestClock`.
 
 ## Reads yes, writes no
