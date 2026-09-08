@@ -78,7 +78,7 @@ export const PgStoreLive: Layer.Layer<JobStore.JobStore, never, PgClient.PgClien
  * so the dashboard process sees the same keys; `resetRedis` clears it at
  * the start of every demo run.
  */
-const demoPrefix = "podcast-demo"
+const demoPrefix = "effect-mq-tour"
 
 export const RedisStoreLive = RedisJobStore.layerFor(EmailStore, {
   prefix: demoPrefix

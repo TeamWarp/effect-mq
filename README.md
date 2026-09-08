@@ -75,7 +75,11 @@ const producer = Effect.gen(function*() {
 ```
 packages/effect-mq        the published package (src + tests, incl. the
                           Postgres and Redis suites under test/)
-examples/basic            runnable end-to-end demo: bun src/main.ts
+examples/tour             THE demo: four scenes against real Postgres +
+                          Redis (kill -9 durability, dedup, a paused
+                          cross-store flow) plus a live dashboard —
+                          see examples/tour/README.md
+examples/basic            minimal in-memory end-to-end: bun src/main.ts
 docker-compose.yml        Postgres 17 (5433) + Redis 8 (6380) for the
                           storage test suites
 tools/oxlint/anti-slop    local lint plugin enforcing honest types

@@ -1,6 +1,10 @@
-# effect-mq podcast demo
+# The effect-mq tour
 
-Four scenes, ~15 seconds of runtime, against real Postgres and Redis.
+The canonical demo: four scenes, ~15 seconds of runtime, against real
+Postgres and Redis. Everything the library claims, shown live — typed
+idempotent jobs, durability you can kill -9, queue control, and a
+cross-store parent-child flow — with a one-file dashboard to watch it move.
+Screen-share friendly by design.
 
 ```sh
 # from the repo root
@@ -9,7 +13,7 @@ cd examples/podcast-demo
 
 bun src/main.ts                          # the four scenes (terminal)
 bun src/dashboard.ts                     # live UI → http://localhost:4400
-DEMO_PAUSE_SECONDS=15 bun src/main.ts    # linger on the paused flow for the camera
+DEMO_PAUSE_SECONDS=15 bun src/main.ts    # linger on the paused flow while presenting
 
 # rerun as often as you like — the script resets its tables and Redis keys
 # each run. docker compose down -v wipes everything.

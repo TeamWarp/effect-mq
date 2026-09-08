@@ -1,5 +1,5 @@
 /**
- * The effect-mq podcast demo: four scenes against real Postgres + Redis.
+ * The effect-mq tour: four scenes against real Postgres + Redis.
  *
  *   1. Typed jobs + idempotency        (Postgres)
  *   2. kill -9 a worker mid-job        (stall recovery + the attempts ledger)

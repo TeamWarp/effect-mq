@@ -27,8 +27,8 @@
         "typescript": "catalog:",
       },
     },
-    "examples/podcast-demo": {
-      "name": "@effect-mq/example-podcast-demo",
+    "examples/tour": {
+      "name": "@effect-mq/example-tour",
       "version": "0.0.0",
       "dependencies": {
         "@effect/platform-node": "catalog:",
@@ -141,7 +141,7 @@
 
     "@effect-mq/example-basic": ["@effect-mq/example-basic@workspace:examples/basic"],
 
-    "@effect-mq/example-podcast-demo": ["@effect-mq/example-podcast-demo@workspace:examples/podcast-demo"],
+    "@effect-mq/example-tour": ["@effect-mq/example-tour@workspace:examples/tour"],
 
     "@effect/platform-node": ["@effect/platform-node@4.0.0-rc.111", "", { "dependencies": { "@effect/platform-node-shared": "^4.0.0-rc.111", "mime": "^4.1.0", "undici": "^8.10.0" }, "peerDependencies": { "effect": "^4.0.0-rc.111", "redis": ">=5.0.0 <7.0.0" } }, "sha512-oy1i7HsOGg/5r+DuBe5+ddmnUhnXmyZFPFPXZCBdO/RQpHK3PIFe1/2UMGxZE+ngDymrSksuQTSgQLF6P+MLqw=="],
 
