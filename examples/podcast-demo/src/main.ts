@@ -179,7 +179,9 @@ const program = Effect.gen(function*() {
   yield* Console.log(`\n${rule}\n  fin — durable, typed, and queryable. docker compose down -v to reset.\n${rule}`)
 })
 
-console.log("  (live view: `bun src/dashboard.ts` → http://localhost:4400)")
+await Effect.runPromise(
+  Console.log("  (live view: `bun src/dashboard.ts` → http://localhost:4400)")
+)
 await Effect.runPromise(
   Effect.all([
     resetTables.pipe(Effect.provide(PgLive)),
