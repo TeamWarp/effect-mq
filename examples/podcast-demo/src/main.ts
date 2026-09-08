@@ -17,7 +17,7 @@ import { Flow, JobStore, Worker } from "effect-mq"
 
 const { QueueName } = JobStore
 import { DigestFlow, GenerateInvoice, RefreshCache, RenderReport, SendBounced, SendEmail } from "./jobs.ts"
-import { EmailStore, PgLive, PgStoreLive, RedisStoreLive, resetTables } from "./stores.ts"
+import { EmailStore, PgLive, PgStoreLive, RedisLive, RedisStoreLive, resetRedis, resetTables } from "./stores.ts"
 
 const rule = "─".repeat(64)
 const scene = (n: number, title: string) => Console.log(`\n${rule}\n  SCENE ${n}  ${title}\n${rule}`)
@@ -159,7 +159,11 @@ const program = Effect.gen(function*() {
   const parentState = Option.isSome(parked) ? parked.value.state : "?"
   yield* Console.log(`  redis     counts("email")     → ${waiting} waiting, 0 running`)
   yield* Console.log(`  postgres  poll(parent).state  → "${parentState}"`)
-  yield* Console.log(`  two databases, one flow, all of it durable state. resuming…`)
+  const holdSeconds = Number(process.env.DEMO_PAUSE_SECONDS ?? "2")
+  yield* Console.log(
+    `  two databases, one flow, all of it durable state. resuming in ${holdSeconds}s…`
+  )
+  yield* Effect.sleep(`${holdSeconds} seconds`)
 
   yield* emails.resume(QueueName("email"))
   const digest = yield* DigestFlow.awaitResult(flowId)
@@ -175,8 +179,12 @@ const program = Effect.gen(function*() {
   yield* Console.log(`\n${rule}\n  fin — durable, typed, and queryable. docker compose down -v to reset.\n${rule}`)
 })
 
+console.log("  (live view: `bun src/dashboard.ts` → http://localhost:4400)")
 await Effect.runPromise(
-  resetTables.pipe(Effect.provide(PgLive))
+  Effect.all([
+    resetTables.pipe(Effect.provide(PgLive)),
+    resetRedis.pipe(Effect.provide(RedisLive))
+  ])
 )
 await Effect.runPromise(
   program.pipe(Effect.provide(AppLayer))

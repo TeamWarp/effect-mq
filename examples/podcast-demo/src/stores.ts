@@ -6,6 +6,7 @@
  * schema-drift test) and drop/creates the default-named tables at startup.
  */
 import { NodeRedis } from "@effect/platform-node"
+import { Redis } from "effect/unstable/persistence"
 import { PgClient } from "@effect/sql-pg"
 import { Effect, Layer, Redacted } from "effect"
 import { JobStore } from "effect-mq"
@@ -73,9 +74,32 @@ export const PgStoreLive: Layer.Layer<JobStore.JobStore, never, PgClient.PgClien
 )
 
 /**
- * Disposable email jobs: Redis, under the named store. A fresh key prefix
- * per run keeps reruns clean without flushing the container.
+ * Disposable email jobs: Redis, under the named store. The prefix is fixed
+ * so the dashboard process sees the same keys; `resetRedis` clears it at
+ * the start of every demo run.
  */
+const demoPrefix = "podcast-demo"
+
 export const RedisStoreLive = RedisJobStore.layerFor(EmailStore, {
-  prefix: `demo-${Date.now().toString(36)}`
+  prefix: demoPrefix
 }).pipe(Layer.provide(RedisLive))
+
+/** Demo-only: wipe the previous run's Redis keys. */
+export const resetRedis = Effect.gen(function*() {
+  const redis = yield* Redis.Redis
+  let cursor = "0"
+  do {
+    const [next, keys] = yield* redis.send<[string, Array<string>]>(
+      "SCAN",
+      cursor,
+      "MATCH",
+      `${demoPrefix}:*`,
+      "COUNT",
+      "500"
+    )
+    if (keys.length > 0) {
+      yield* redis.send("DEL", ...keys)
+    }
+    cursor = next
+  } while (cursor !== "0")
+}).pipe(Effect.orDie)

@@ -6,11 +6,24 @@ Four scenes, ~15 seconds of runtime, against real Postgres and Redis.
 # from the repo root
 docker compose up -d --wait
 cd examples/podcast-demo
-bun src/main.ts
 
-# rerun as often as you like — the script resets its tables and uses a
-# fresh Redis prefix each run. docker compose down -v wipes everything.
+bun src/main.ts                          # the four scenes (terminal)
+bun src/dashboard.ts                     # live UI → http://localhost:4400
+DEMO_PAUSE_SECONDS=15 bun src/main.ts    # linger on the paused flow for the camera
+
+# rerun as often as you like — the script resets its tables and Redis keys
+# each run. docker compose down -v wipes everything.
 ```
+
+## The dashboard
+
+`src/dashboard.ts` is one file: `Bun.serve` polling both stores through the
+public read APIs (`counts`, `list`, `pausedQueues`) — the dashboard data
+layer, rendered. Postgres and Redis side by side; during scene 4 it shows
+the parent bold in `waiting-children · flow 12 pending` on the left while
+the right panel shows `12 waiting` under a `paused queues: email` callout.
+Start it before `main.ts` and leave it up across reruns; it holds the last
+snapshot through table resets.
 
 ## What each scene shows
 
