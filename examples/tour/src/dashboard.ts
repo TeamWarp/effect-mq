@@ -240,6 +240,111 @@ const panel = (store: JobStore.Service) =>
     }
   })
 
+/**
+ * The code behind each section, curated to what matters. Served as JSON so
+ * the page template never has to escape backticks.
+ */
+const SNIPPETS = {
+  stores: `import { JobStore } from "effect-mq"
+import { DrizzleJobStore, mqJobs, mqJobAttempts, /* ... */ } from "effect-mq/drizzle-postgres"
+import { RedisJobStore } from "effect-mq/redis"
+
+// Two stores, one contract. Postgres is the DEFAULT JobStore; disposable
+// email jobs live in Redis under a named store key. Producers that enqueue
+// an email REQUIRE this key in context — wiring enforced at compile time.
+export const EmailStore = JobStore.named("emails")
+
+// The tables live in YOUR drizzle schema; drizzle-kit owns the migrations.
+const jobs = mqJobs("effect_mq_jobs", {
+  // customizable: tenant columns filled from job metadata at enqueue...
+  extend: { companyId: text("company_id").notNull() },
+  // ...and your own indexes over them
+  extraConfig: (table) => [index("jobs_company_idx").on(table.companyId, table.state)]
+})
+
+export const PgStoreLive = DrizzleJobStore.layer({
+  jobs, attempts, schedules, queues, dedupe, flowChildren, flowOutbox,
+  idGenerator: ({ name }) => \`\${name}_\${ulid()}\`,           // your id scheme
+  historyTtl: { completed: "7 days", failed: "90 days" }   // retention ceiling
+})
+
+export const RedisStoreLive = RedisJobStore.layerFor(EmailStore, {
+  prefix: "effect-mq-tour",
+  historyTtl: "1 day"
+})`,
+
+  jobs: `class GenerateInvoice extends Job.make("generate-invoice", {
+  payload: { invoiceId: Schema.String, amountCents: Schema.Number },
+  success: Schema.String,
+  idempotencyKey: ({ invoiceId }) => invoiceId,    // same input -> same job id
+  metadata: ({ invoiceId }) => ({ invoiceId }),    // indexed, queryable
+  defaults: { attempts: 3, backoff: { type: "exponential", delay: "250 millis" } }
+}) {}
+
+class RefreshCache extends Job.make("refresh-cache", {
+  payload: { accountId: Schema.String },
+  dedupe: ({ accountId }) => ({ key: accountId, ttl: "30 seconds" })   // throttle
+}) {}
+
+// the buttons run exactly this:
+yield* GenerateInvoice.enqueue({ invoiceId: "inv_1042", amountCents: 129_900 })
+yield* RefreshCache.enqueue({ accountId: "acct_9" })   // x5 -> 1 job
+yield* RefreshCache.cancelByKey("acct_9")              // no job-id bookkeeping`,
+
+  durability: `// Handlers are Effects registered on a Worker layer. A claim holds a
+// lock the worker heartbeats; these knobs are tightened for demo pacing.
+const InvoiceWorker = GenerateInvoice.toLayer(({ invoiceId }) =>
+  Effect.succeed(\`pdf/\${invoiceId}\`)
+)
+Worker.layer({ lockDuration: "4 seconds", lockRenewInterval: "1 second" })
+
+// kill -9 a worker: no release happens, the lock just expires. The stall
+// sweeper recovers the job and the ledger shows it:
+yield* RenderReport.attempts(id)   // -> #1 stalled -> #2 completed
+
+// cancel reaches a RUNNING fiber cross-process via the heartbeat:
+yield* CrunchNumbers.cancel(id)
+
+// a terminal failure keeps its ledger; retry grants a fresh budget:
+yield* FlakyImport.retry(id)`,
+
+  scheduling: `// Relative delays or absolute instants (delay/at are mutually exclusive
+// at the type level); promote runs a delayed job now.
+yield* GenerateInvoice.enqueue(payload, { delay: "1 hour" })
+yield* GenerateInvoice.promote(id)
+
+// Durable schedules are rows in the store, not process timers. Each
+// occurrence is claimed atomically: exactly-once per tick, no matter how
+// many workers sweep. Here the scheduled job is a whole cross-store flow:
+yield* DigestFlow.schedule("tour", {
+  every: "15 seconds",             // or cron: "0 9 * * *", tz: "America/New_York"
+  payload: { tenant: "acme", audience: 5 }
+})
+yield* DigestFlow.unschedule("tour")`,
+
+  flows: `// A flow: the parent lives in Postgres (which owns the manifest, the
+// per-child results, and the settle), the children run in Redis.
+export const DigestFlow = Flow.make("daily-digest", {
+  parent: SendDigest,
+  children: [SendEmail],
+  onChildFailure: "continue"       // or "fail" to fail fast + cancel siblings
+})
+
+const DigestWorker = DigestFlow.toLayer({
+  fanOut: ({ tenant, audience }) =>
+    Effect.succeed(Flow.children(SendEmail, users.map((user) => ({
+      key: user.id,                // the idempotency mechanism for children
+      payload: { userId: user.id }
+    })))),
+  collect: (_payload, results) =>
+    Effect.succeed({ sent: results.counts.completed, bounced: results.counts.failed })
+})
+
+// pause/resume are store-level queue controls:
+yield* emails.pause(QueueName("email"))
+yield* emails.resume(QueueName("email"))`
+} satisfies Record<string, string>
+
 let latest = JSON.stringify({ ready: false })
 
 const refresh = Effect.gen(function*() {
@@ -264,6 +369,9 @@ Bun.serve({
     const { pathname } = new URL(request.url)
     if (pathname === "/api/state") {
       return new Response(latest, { headers: { "content-type": "application/json" } })
+    }
+    if (pathname === "/api/snippets") {
+      return Response.json(SNIPPETS)
     }
     if (pathname.startsWith("/api/action/") && request.method === "POST") {
       const name = pathname.slice("/api/action/".length)
@@ -349,12 +457,25 @@ const PAGE = `<!doctype html>
   .st-failed { font-weight: 700; text-decoration: underline; text-underline-offset: 3px; }
   .st-cancelled { color: var(--dim); text-decoration: line-through; }
   .empty { color: var(--dim); padding: 20px 0; }
+  button.code-toggle { border-color: var(--line); color: var(--dim); }
+  button.code-toggle:hover { border-color: var(--ink); color: var(--ink); background: transparent; }
+  button.code-toggle.open { border-color: var(--ink); color: var(--ink); }
+  pre.code { display: none; background: var(--panel); border: 1px solid var(--line);
+             padding: 12px 14px; margin: 6px 0 0; overflow-x: auto;
+             font-size: 12px; line-height: 1.55; max-width: 100ch; }
+  pre.code.open { display: block; }
+  .code .k { color: #cf222e; }
+  .code .s { color: #0a3069; }
+  .code .c { color: #6e7781; font-style: italic; }
+  .code .t { color: #953800; }
+  .code .n { color: #0550ae; }
 </style>
 </head>
 <body>
 <nav>
   <div class="brand">effect-mq tour</div>
-  <a data-section="jobs" class="current">1. Jobs<small>typed, idempotent, deduplicated</small></a>
+  <a data-section="stores" class="current">0. Stores<small>postgres + redis, one contract</small></a>
+  <a data-section="jobs">1. Jobs<small>typed, idempotent, deduplicated</small></a>
   <a data-section="durability">2. Durability<small>kill, cancel, retry</small></a>
   <a data-section="scheduling">3. Scheduling<small>delayed, promoted, recurring</small></a>
   <a data-section="flows">4. Flows &amp; queue control<small>cross-store fan-out, pause</small></a>
@@ -364,7 +485,19 @@ const PAGE = `<!doctype html>
 <div class="content">
 <header><span id="meta">connecting…</span></header>
 <div class="stage">
-  <div class="section current" data-section="jobs">
+  <div class="section current" data-section="stores">
+    <h1>0. Stores</h1>
+    <p>Everything below runs against two real stores through one contract:
+       business-critical jobs in Postgres (tables that live in your own
+       drizzle schema — extend them with tenant columns, your indexes, your
+       id scheme, your retention), and disposable sends in Redis under a
+       named store key the type system makes producers provide. Swap either
+       for the in-memory store in tests; the same conformance suite keeps
+       all three honest.</p>
+    <button class="code-toggle" data-code="stores">view code</button>
+    <pre class="code" data-code="stores"></pre>
+  </div>
+  <div class="section" data-section="jobs">
     <h1>1. Jobs</h1>
     <p>Payloads are schemas, and the idempotency key derives the job id from
        business data: click the invoice twice and the same id comes back with
@@ -373,6 +506,8 @@ const PAGE = `<!doctype html>
     <button data-action="invoice">enqueue invoice #1042</button>
     <button data-action="burst">5× throttled refresh</button>
     <button data-action="cancel-key">cancel by key</button>
+    <button class="code-toggle" data-code="jobs">view code</button>
+    <pre class="code" data-code="jobs"></pre>
   </div>
   <div class="section" data-section="durability">
     <h1>2. Durability</h1>
@@ -384,6 +519,8 @@ const PAGE = `<!doctype html>
     <button data-action="cancel-running">cancel a RUNNING job</button>
     <button data-action="flaky">fail an import</button>
     <button data-action="retry">retry it</button>
+    <button class="code-toggle" data-code="durability">view code</button>
+    <pre class="code" data-code="durability"></pre>
   </div>
   <div class="section" data-section="scheduling">
     <h1>3. Scheduling</h1>
@@ -394,6 +531,8 @@ const PAGE = `<!doctype html>
     <button data-action="promote">promote it</button>
     <button data-action="schedule">flow every 15s</button>
     <button data-action="unschedule">unschedule</button>
+    <button class="code-toggle" data-code="scheduling">view code</button>
+    <pre class="code" data-code="scheduling"></pre>
   </div>
   <div class="section" data-section="flows">
     <h1>4. Flows &amp; queue control</h1>
@@ -404,6 +543,8 @@ const PAGE = `<!doctype html>
     <button data-action="pause">pause email</button>
     <button data-action="flow">run digest flow (12)</button>
     <button data-action="resume">resume email</button>
+    <button class="code-toggle" data-code="flows">view code</button>
+    <pre class="code" data-code="flows"></pre>
   </div>
 </div>
 <div id="log"><div>click a button — every one runs the same producer API your app would</div></div>
@@ -486,6 +627,41 @@ document.querySelectorAll("button[data-action]").forEach((button) => {
     } finally {
       button.disabled = false
     }
+  })
+})
+// One-pass highlighter over ESCAPED text: each alternative is disjoint, so
+// nothing ever re-scans injected markup. Curated snippets only — not a
+// general TS parser.
+const highlight = (code) =>
+  esc(code).replace(
+    /(\\/\\/[^\\n]*)|(&quot;(?:[^&]|&(?!quot;))*&quot;|\`[^\`]*\`)|\\b(import|from|export|const|class|extends|new|return|yield|function|type)\\b|\\b([A-Z][A-Za-z0-9]*)\\b|\\b(\\d[\\d_]*)\\b/g,
+    (match, comment, string, keyword, typeName, number) =>
+      comment !== undefined
+        ? '<span class="c">' + comment + "</span>"
+        : string !== undefined
+        ? '<span class="s">' + string + "</span>"
+        : keyword !== undefined
+        ? '<span class="k">' + keyword + "</span>"
+        : typeName !== undefined
+        ? '<span class="t">' + typeName + "</span>"
+        : '<span class="n">' + number + "</span>"
+  )
+fetch("/api/snippets").then((response) => response.json()).then((snippets) => {
+  document.querySelectorAll("pre.code").forEach((pre) => {
+    const code = snippets[pre.dataset.code]
+    if (code) pre.innerHTML = highlight(code)
+  })
+  // ?code=open pre-opens every block (handy when presenting).
+  if (new URLSearchParams(location.search).get("code") === "open") {
+    document.querySelectorAll("button.code-toggle").forEach((button) => button.click())
+  }
+})
+document.querySelectorAll("button.code-toggle").forEach((button) => {
+  button.addEventListener("click", () => {
+    const pre = document.querySelector('pre.code[data-code="' + button.dataset.code + '"]')
+    const open = pre.classList.toggle("open")
+    button.classList.toggle("open", open)
+    button.textContent = open ? "hide code" : "view code"
   })
 })
 const refresh = async () => {

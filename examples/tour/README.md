@@ -35,6 +35,12 @@ application would:
 | 3. scheduling | enqueue delayed 1h → promote it, flow every 15s (a recurring cross-store fan-out, exactly-once per tick) → unschedule |
 | 4. flows · queue control | run digest flow (12), pause email, resume email |
 
+Every section has a **view code** toggle showing the code that matters for
+it (job definitions, the flow, the store layers with their customization
+knobs) with syntax highlighting; `?code=open` in the URL pre-opens all of
+them. The sidebar starts on **0. Stores**, an intro to the two-store
+architecture.
+
 A good live sequence: pause email → run digest flow → point at both panels
 (Postgres `waiting-children · flow 12 pending`, Redis `12 waiting` under the
 paused callout) → resume → watch it drain and collect. Then "flow every 15s"
