@@ -229,6 +229,10 @@ const panel = (store: JobStore.Service) =>
         queue: job.queue,
         state: job.state,
         attempts: `${job.attemptsMade}/${job.attemptsMax}`,
+        enqueuedAt: job.enqueuedAt,
+        runAt: job.runAt,
+        processedAt: job.processedAt,
+        finishedAt: job.finishedAt,
         flow: job.flow === undefined
           ? undefined
           : { pending: job.flow.pending, completed: job.flow.completed, failed: job.flow.failed }
@@ -297,8 +301,8 @@ const PAGE = `<!doctype html>
   nav a { display: block; padding: 10px 16px; color: var(--ink); text-decoration: none;
           border-bottom: 1px solid var(--line); cursor: pointer; }
   nav a small { display: block; color: var(--dim); font-size: 11px; }
-  nav a.current { background: var(--ink); color: var(--paper); }
-  nav a.current small { color: var(--paper); opacity: 0.7; }
+  nav a.current { background: var(--panel); border-left: 3px solid var(--ink);
+                  padding-left: 13px; font-weight: 700; }
   nav .spacer { flex: 1; }
   nav button.clear { margin: 16px; width: calc(100% - 32px); }
 
@@ -322,7 +326,7 @@ const PAGE = `<!doctype html>
   #log div { color: var(--dim); } #log div:first-child { color: var(--ink); }
 
   main { display: grid; grid-template-columns: 1fr 1fr; flex: 1; }
-  section.store { padding: 16px 20px; min-width: 0; }
+  section.store { padding: 16px 20px; min-width: 0; overflow-x: auto; }
   section.store + section.store { border-left: 1px solid var(--line); }
   h2 { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em;
        margin: 0 0 12px; display: flex; gap: 10px; align-items: baseline; }
@@ -338,7 +342,8 @@ const PAGE = `<!doctype html>
   table { width: 100%; border-collapse: collapse; }
   th, td { border: 1px solid var(--line); padding: 4px 8px; text-align: left; font-size: 12px; }
   th { background: var(--panel); font-weight: 600; }
-  td.id { color: var(--dim); max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  td.id { color: var(--dim); max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  td.time { color: var(--dim); white-space: nowrap; }
   .st-active, .st-waiting-children { font-weight: 700; }
   .st-completed { color: var(--dim); }
   .st-failed { font-weight: 700; text-decoration: underline; text-underline-offset: 3px; }
@@ -410,6 +415,20 @@ const PAGE = `<!doctype html>
 <script>
 const STATES = ["waiting", "delayed", "active", "waiting-children", "completed", "failed", "cancelled"]
 const esc = (value) => String(value).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]))
+const clock = (ms) => ms == null ? "" : new Date(ms).toLocaleTimeString([], { hour12: false })
+// When it ran (claim time), or when it is due to.
+const ranOrDue = (job) =>
+  job.state === "delayed"
+    ? "due " + clock(job.runAt)
+    : job.processedAt != null
+    ? clock(job.processedAt)
+    : "enq " + clock(job.enqueuedAt)
+const took = (job) => {
+  if (job.state === "active" && job.processedAt != null) return ((Date.now() - job.processedAt) / 1000).toFixed(1) + "s…"
+  if (job.processedAt == null || job.finishedAt == null) return ""
+  const ms = job.finishedAt - job.processedAt
+  return ms < 1000 ? ms + "ms" : (ms / 1000).toFixed(1) + "s"
+}
 const renderPanel = (panel) => {
   const counts = STATES
     .filter((state) => state in panel.counts)
@@ -432,10 +451,12 @@ const renderPanel = (panel) => {
       <td>\${esc(job.queue)}</td>
       <td class="st-\${esc(job.state)}">\${esc(job.state)}\${flow}</td>
       <td>\${esc(job.attempts)}</td>
+      <td class="time">\${esc(ranOrDue(job))}</td>
+      <td class="time">\${esc(took(job))}</td>
     </tr>\`
   }).join("")
   const table = panel.jobs.length > 0
-    ? \`<table><tr><th>job</th><th>id</th><th>queue</th><th>state</th><th>att</th></tr>\${rows}</table>\`
+    ? \`<table><tr><th>job</th><th>id</th><th>queue</th><th>state</th><th>att</th><th>when</th><th>took</th></tr>\${rows}</table>\`
     : \`<div class="empty">no jobs yet</div>\`
   return \`<div class="counts">\${counts}</div>\${paused}\${sched}\${table}\`
 }
