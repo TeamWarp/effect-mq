@@ -4,6 +4,36 @@ All notable changes to `effect-mq`. Versions follow 0.x semver: **minor
 bumps may break** (the `JobStore` driver contract in particular); patch
 bumps are additive.
 
+## 0.7.1 — unreleased
+
+- **LISTEN resubscribe backs off** — the Postgres store retried the wake
+  channel on a flat one-second loop and logged every failure at warning
+  level. On a pooled endpoint whose pooler rejects `LISTEN` (PgBouncer in
+  transaction mode cannot pin a session to a connection, and a pooled Neon
+  endpoint is exactly that) every attempt fails the same way, so that was
+  one warning per second for the life of the process. The retry now
+  doubles from a second up to 30 seconds while failures are consecutive,
+  and only the failure that opens a streak logs at warning level (the rest
+  are debug); an attempt that does not fail clears the streak, so the next
+  failure warns and retries at a second again. Nothing changes where
+  `LISTEN` works: the subscription still comes up on the first attempt, a
+  transient drop still retries a second later, and wake-up latency is
+  unchanged. A pooler that accepts `LISTEN` and silently drops
+  notifications never fails the subscription at all; the queue runs on
+  `pollInterval` there, as before.
+- **LISTEN liveness probe** — a dropped listen connection was never
+  noticed: `@effect/sql-pg`'s stream only fails during setup, so once the
+  socket died the subscription sat open delivering nothing and wake-ups
+  silently ran on `pollInterval` for the life of the process. The Postgres
+  store now NOTIFYs a reserved payload (`effect-mq:probe`) through the
+  pool every 30 seconds and expects to hear it back within 10; when it
+  does not, the subscription is torn down and the resubscribe loop takes
+  over — one warning, then a fresh `LISTEN` on a fresh connection. A
+  pooler that accepts `LISTEN` and drops notifications (stock PgBouncer in
+  transaction mode) surfaces the same way instead of not at all.
+  `DrizzleJobStore.layer({ listenProbe })` sets the interval and timeout,
+  or `false` disables it.
+
 ## 0.7.0 — 2026-08-25
 
 - **List ordering** — `list` gains `orderBy` (`enqueuedAt` | `runAt` |
