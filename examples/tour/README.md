@@ -11,23 +11,35 @@ Screen-share friendly by design.
 docker compose up -d --wait
 cd examples/podcast-demo
 
-bun src/main.ts                          # the four scenes (terminal)
-bun src/dashboard.ts                     # live UI → http://localhost:4400
-DEMO_PAUSE_SECONDS=15 bun src/main.ts    # linger on the paused flow while presenting
+bun src/dashboard.ts                     # interactive tour → http://localhost:4400
+bun src/main.ts                          # or: the scripted four scenes (terminal)
+DEMO_PAUSE_SECONDS=15 bun src/main.ts    # linger on the scripted paused flow
 
 # rerun as often as you like — the script resets its tables and Redis keys
 # each run. docker compose down -v wipes everything.
 ```
 
-## The dashboard
+## The interactive tour (dashboard + buttons)
 
-`src/dashboard.ts` is one file: `Bun.serve` polling both stores through the
-public read APIs (`counts`, `list`, `pausedQueues`) — the dashboard data
-layer, rendered. Postgres and Redis side by side; during scene 4 it shows
-the parent bold in `waiting-children · flow 12 pending` on the left while
-the right panel shows `12 waiting` under a `paused queues: email` callout.
-Start it before `main.ts` and leave it up across reruns; it holds the last
-snapshot through table resets.
+`src/dashboard.ts` is one process: the workers, a live view of both stores
+through the public read APIs (`counts`, `list`, `pausedQueues`,
+`listSchedules`), and a button for every scenario — each one runs the same
+producer API an application would:
+
+| card | buttons |
+| --- | --- |
+| jobs | enqueue invoice #1042 (click twice: same id), 5× throttled refresh, cancel by key |
+| durability | kill a worker mid-job (spawns + SIGKILLs a real process, reports the ledger), cancel a RUNNING job (heartbeat interrupt), fail an import → retry it |
+| scheduling | enqueue delayed 1h → promote it, flow every 15s (a recurring cross-store fan-out, exactly-once per tick) → unschedule |
+| flows · queue control | run digest flow (12), pause email, resume email |
+
+A good live sequence: pause email → run digest flow → point at both panels
+(Postgres `waiting-children · flow 12 pending`, Redis `12 waiting` under the
+paused callout) → resume → watch it drain and collect. Then "flow every 15s"
+and let it breathe while you talk.
+
+The scripted `main.ts` covers the same ground in ~15 seconds of terminal
+output if you prefer a hands-free run.
 
 ## What each scene shows
 
