@@ -55,6 +55,7 @@ The registration options are `concurrency` (taker fibers for this job's queue; t
 | `lockRenewInterval` | half of `lockDuration` | heartbeat cadence (also delivers cross-process cancels) |
 | `stalledInterval` | 30s | how often to sweep for stalled jobs |
 | `maxStalledCount` | 1 | stalls tolerated before a job is failed outright |
+| `onLockLost` | `ignore` | whether to interrupt a running handler whose lock was lost; see [Locks and heartbeats](#locks-and-heartbeats) |
 | `pollInterval` | 5s | idle fallback when no wake-up arrives |
 | `scheduleSweepInterval` | 15s | how often to tick due [repeatable-job schedules](/guide/repeatable-jobs) |
 | `queueMetricsInterval` | off | sample `store.counts()` per queue into the depth gauge |
@@ -82,6 +83,16 @@ Wake-ups are push-based, so the 5s `pollInterval` default is fine even on Postgr
 Every `lockRenewInterval` the worker extends the locks of all in-flight jobs in one store call. A lock that fails to renew was lost: stall recovery or another worker owns the job now. The worker logs a warning (the job may run twice; delivery is at-least-once), and the run's eventual ack surfaces the lost lock instead of overwriting the new owner's state.
 
 The heartbeat also delivers cross-process [cancellation](/guide/cancellation-and-admin): when a cancel request is flagged on an in-flight job, the worker interrupts that handler fiber and acks the job as cancelled, without blocking the heartbeat on the handler's finalizers.
+
+By default the run that lost its lock is left alone. It keeps going to its natural end, holds its taker slot until then, has its ack refused, and — because cancel requests only reach jobs the worker still counts as in-flight — can no longer be cancelled. That is usually fine for short handlers. For long or expensive ones, stop it at the moment the lock is known gone:
+
+```ts
+Worker.layer({ onLockLost: "interrupt" }) // default: "ignore"
+```
+
+Under `"interrupt"` the worker interrupts the handler the same way it delivers a cancel: finalizers run, nothing is acked (another worker owns the job now), and no attempt is spent. Latency is one `lockRenewInterval`. Either setting leaves delivery at-least-once — the job still runs again elsewhere — so handlers must stay idempotent regardless; the option only decides whether the losing run keeps burning time and money.
+
+A lock can also go without anyone being able to say so. If the heartbeat cannot reach the store at all — a partition rather than a hand-off — no `lost` list ever comes back, and the worker only knows its own calls are failing. So every in-flight job carries the deadline its lock was claimed under, and once a deadline passes with no successful renewal behind it, the worker reports that lock as lost on its own: `effect_mq_locks_lost` and the "may run twice" warning fire once, and under `"interrupt"` the run is stopped just as it would be for a store-reported loss. Under `"ignore"` the worker keeps renewing the lock regardless — the store has not said it is gone, and a run that outlives the partition keeps its lock if the store comes back before a stall sweep takes the job — so the default changes no job outcome, only what gets reported. The check runs only after a heartbeat has actually failed, so a misconfigured `lockRenewInterval` longer than `lockDuration` cannot mass-expire healthy runs. Detection here is one heartbeat plus the store-retry budget behind the deadline, rather than immediate.
 
 ::: warning
 `lockDuration` is the crash-detection window rather than a run-time limit: the heartbeat keeps long handlers locked indefinitely. But anything that stops the heartbeat for longer than `lockDuration` (a blocked event loop, a long process pause) makes the job count as stalled and another worker will re-run it. Keep handlers idempotent.

@@ -15,6 +15,8 @@ Every admin verb exists twice: typed on the job definition (`MyJob.cancel`, `MyJ
 
 Because handlers are Effect fibers, cancelling a *running* job interrupts real work: the worker interrupts the fiber, finalizers run, and the worker acks the job `Cancelled`. The flag rides on the lock heartbeat, so cancel latency for running jobs is at most one `lockRenewInterval` (default: half of `lockDuration`, so 15 seconds). Cancellation crosses processes: cancel from your API server, interrupt on the worker machine.
 
+One run is out of reach: a handler whose lock was already lost is no longer tracked by its worker, so no cancel can be delivered to it, and the row is settled `cancelled` by whoever owns it now. Set [`onLockLost: "interrupt"`](/guide/workers#locks-and-heartbeats) if such a run should be stopped when its lock goes rather than left running.
+
 ```ts
 import { Effect } from "effect"
 

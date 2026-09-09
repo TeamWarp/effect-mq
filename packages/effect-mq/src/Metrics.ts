@@ -36,7 +36,8 @@ export const jobsEnqueued = Metric.counter("effect_mq_jobs_enqueued", {
 
 /**
  * Finished runs, one per handler attempt. Tags: `name`, `queue`, `outcome`
- * (completed | retried | failed | cancelled | released).
+ * (completed | retried | failed | cancelled | released | fanned-out |
+ * lock-lost).
  *
  * @since 0.3.1
  */
