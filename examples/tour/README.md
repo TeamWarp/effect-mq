@@ -23,15 +23,17 @@ DEMO_PAUSE_SECONDS=15 bun src/main.ts    # linger on the scripted paused flow
 
 `src/dashboard.ts` is one process: the workers, a live view of both stores
 through the public read APIs (`counts`, `list`, `pausedQueues`,
-`listSchedules`), and a button for every scenario — each one runs the same
-producer API an application would:
+`listSchedules`), and a numbered sidebar — one section per demo, each with a
+presenter blurb and its buttons, plus a **clear** button that resets both
+stores between takes. Every button runs the same producer API an
+application would:
 
-| card | buttons |
+| section | buttons |
 | --- | --- |
-| jobs | enqueue invoice #1042 (click twice: same id), 5× throttled refresh, cancel by key |
-| durability | kill a worker mid-job (spawns + SIGKILLs a real process, reports the ledger), cancel a RUNNING job (heartbeat interrupt), fail an import → retry it |
-| scheduling | enqueue delayed 1h → promote it, flow every 15s (a recurring cross-store fan-out, exactly-once per tick) → unschedule |
-| flows · queue control | run digest flow (12), pause email, resume email |
+| 1. jobs | enqueue invoice #1042 (click twice: same id), 5× throttled refresh, cancel by key |
+| 2. durability | kill a worker mid-job (spawns + SIGKILLs a real process, reports the ledger), cancel a RUNNING job (heartbeat interrupt), fail an import → retry it |
+| 3. scheduling | enqueue delayed 1h → promote it, flow every 15s (a recurring cross-store fan-out, exactly-once per tick) → unschedule |
+| 4. flows · queue control | run digest flow (12), pause email, resume email |
 
 A good live sequence: pause email → run digest flow → point at both panels
 (Postgres `waiting-children · flow 12 pending`, Redis `12 waiting` under the

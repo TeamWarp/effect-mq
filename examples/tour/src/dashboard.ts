@@ -11,7 +11,9 @@
  * `listSchedules`), and every button is a POST running the same producer
  * code an app would. main.ts remains the scripted, terminal-only tour.
  */
+import { PgClient } from "@effect/sql-pg"
 import { Console, Effect, Layer, ManagedRuntime, Schema } from "effect"
+import type { Redis } from "effect/unstable/persistence"
 import { Flow, Job, JobStore, Worker } from "effect-mq"
 import { DigestFlow, GenerateInvoice, RefreshCache, RenderReport, SendBounced, SendEmail } from "./jobs.ts"
 import { EmailStore, PgLive, PgStoreLive, RedisLive, RedisStoreLive, resetRedis, resetTables } from "./stores.ts"
@@ -105,7 +107,7 @@ const runtime = ManagedRuntime.make(AppLayer)
 let lastDelayedId: string | undefined
 let lastFlakyId: string | undefined
 
-type ActionServices = JobStore.JobStore | JobStore.Named<"emails">
+type ActionServices = JobStore.JobStore | JobStore.Named<"emails"> | PgClient.PgClient | Redis.Redis
 
 const actions = {
   invoice: GenerateInvoice.enqueue({ invoiceId: "inv_1042", amountCents: 129_900 }).pipe(
@@ -198,7 +200,15 @@ const actions = {
 
   unschedule: DigestFlow.unschedule("tour").pipe(
     Effect.map((existed) => `unschedule("tour") → ${existed}`)
-  )
+  ),
+
+  clear: Effect.gen(function*() {
+    yield* Effect.all([resetTables, resetRedis])
+    failedOnce.clear()
+    lastDelayedId = undefined
+    lastFlakyId = undefined
+    return "cleared — tables recreated, Redis prefix wiped, schedules gone"
+  })
 } satisfies Record<string, Effect.Effect<string, JobStore.JobStoreError, ActionServices>>
 
 // ── State polling for the panels ────────────────────────────────────────
@@ -278,28 +288,42 @@ const PAGE = `<!doctype html>
 <style>
   :root { --ink: #16161d; --paper: #faf9f5; --panel: #f3f1ea; --line: #dedbd0; --dim: #757575; }
   * { box-sizing: border-box; border-radius: 0 !important; }
-  body { margin: 0; background: var(--paper); color: var(--ink);
+  body { margin: 0; background: var(--paper); color: var(--ink); display: grid;
+         grid-template-columns: 220px 1fr; min-height: 100vh;
          font: 13px/1.6 ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace; }
-  header { display: flex; justify-content: space-between; align-items: baseline;
-           padding: 14px 20px; border-bottom: 1px solid var(--line); }
-  header b { font-size: 15px; letter-spacing: -0.01em; }
-  header span { color: var(--dim); font-size: 12px; }
-  .actions { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0;
-             border-bottom: 1px solid var(--line); }
-  .card { padding: 12px 16px; border-right: 1px solid var(--line); }
-  .card:last-child { border-right: none; }
-  .card h3 { margin: 0 0 8px; font-size: 11px; font-weight: 600; text-transform: uppercase;
-             letter-spacing: 0.08em; color: var(--dim); }
+
+  nav { border-right: 1px solid var(--line); display: flex; flex-direction: column; }
+  nav .brand { padding: 14px 16px; border-bottom: 1px solid var(--line); font-weight: 700; font-size: 15px; }
+  nav a { display: block; padding: 10px 16px; color: var(--ink); text-decoration: none;
+          border-bottom: 1px solid var(--line); cursor: pointer; }
+  nav a small { display: block; color: var(--dim); font-size: 11px; }
+  nav a.current { background: var(--ink); color: var(--paper); }
+  nav a.current small { color: var(--paper); opacity: 0.7; }
+  nav .spacer { flex: 1; }
+  nav button.clear { margin: 16px; width: calc(100% - 32px); }
+
+  .content { display: flex; flex-direction: column; min-width: 0; }
+  header { display: flex; justify-content: flex-end; padding: 14px 20px;
+           border-bottom: 1px solid var(--line); color: var(--dim); font-size: 12px; }
+
+  .stage { padding: 16px 20px; border-bottom: 1px solid var(--line); }
+  .stage h1 { margin: 0 0 6px; font-size: 15px; }
+  .stage p { margin: 0 0 12px; color: var(--dim); max-width: 76ch; }
+  .stage .section { display: none; }
+  .stage .section.current { display: block; }
+
   button { font: inherit; font-size: 12px; background: transparent; color: var(--ink);
-           border: 1px solid var(--ink); padding: 4px 10px; margin: 0 6px 6px 0; cursor: pointer; }
+           border: 1px solid var(--ink); padding: 5px 12px; margin: 0 8px 8px 0; cursor: pointer; }
   button:hover { background: var(--ink); color: var(--paper); }
   button:disabled { opacity: 0.4; cursor: wait; }
+
   #log { padding: 8px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
          min-height: 34px; font-size: 12px; }
   #log div { color: var(--dim); } #log div:first-child { color: var(--ink); }
-  main { display: grid; grid-template-columns: 1fr 1fr; min-height: 40vh; }
-  section { padding: 16px 20px; }
-  section + section { border-left: 1px solid var(--line); }
+
+  main { display: grid; grid-template-columns: 1fr 1fr; flex: 1; }
+  section.store { padding: 16px 20px; min-width: 0; }
+  section.store + section.store { border-left: 1px solid var(--line); }
   h2 { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em;
        margin: 0 0 12px; display: flex; gap: 10px; align-items: baseline; }
   h2 small { color: var(--dim); text-transform: none; letter-spacing: 0; font-weight: 400; }
@@ -323,36 +347,66 @@ const PAGE = `<!doctype html>
 </style>
 </head>
 <body>
-<header><b>effect-mq tour</b><span id="meta">connecting…</span></header>
-<div class="actions">
-  <div class="card"><h3>jobs</h3>
+<nav>
+  <div class="brand">effect-mq tour</div>
+  <a data-section="jobs" class="current">1. Jobs<small>typed, idempotent, deduplicated</small></a>
+  <a data-section="durability">2. Durability<small>kill, cancel, retry</small></a>
+  <a data-section="scheduling">3. Scheduling<small>delayed, promoted, recurring</small></a>
+  <a data-section="flows">4. Flows &amp; queue control<small>cross-store fan-out, pause</small></a>
+  <div class="spacer"></div>
+  <button class="clear" data-action="clear">clear — reset both stores</button>
+</nav>
+<div class="content">
+<header><span id="meta">connecting…</span></header>
+<div class="stage">
+  <div class="section current" data-section="jobs">
+    <h1>1. Jobs</h1>
+    <p>Payloads are schemas, and the idempotency key derives the job id from
+       business data: click the invoice twice and the same id comes back with
+       no second job. Dedup keys throttle without touching ids, and
+       cancelByKey needs no job-id bookkeeping.</p>
     <button data-action="invoice">enqueue invoice #1042</button>
     <button data-action="burst">5× throttled refresh</button>
     <button data-action="cancel-key">cancel by key</button>
   </div>
-  <div class="card"><h3>durability</h3>
+  <div class="section" data-section="durability">
+    <h1>2. Durability</h1>
+    <p>Kill-a-worker spawns a real process, lets it claim the job, and
+       SIGKILLs it: the lock expires, the stall sweeper recovers the job, and
+       the response is the attempts ledger. Cancel reaches a RUNNING fiber
+       through the heartbeat; a failed import retries with its ledger intact.</p>
     <button data-action="kill-worker">kill a worker mid-job</button>
     <button data-action="cancel-running">cancel a RUNNING job</button>
     <button data-action="flaky">fail an import</button>
     <button data-action="retry">retry it</button>
   </div>
-  <div class="card"><h3>scheduling</h3>
+  <div class="section" data-section="scheduling">
+    <h1>3. Scheduling</h1>
+    <p>Delayed jobs sit in the store until due (promote runs one now). The
+       recurring schedule is the headline: a full cross-store flow every 15
+       seconds, claimed exactly-once per tick no matter how many workers run.</p>
     <button data-action="delayed">enqueue delayed 1h</button>
     <button data-action="promote">promote it</button>
     <button data-action="schedule">flow every 15s</button>
     <button data-action="unschedule">unschedule</button>
   </div>
-  <div class="card"><h3>flows · queue control</h3>
-    <button data-action="flow">run digest flow (12)</button>
+  <div class="section" data-section="flows">
+    <h1>4. Flows &amp; queue control</h1>
+    <p>Pause email first, then run the flow: the Postgres parent parks in
+       waiting-children while 12 children wait in Redis under the paused
+       queue. Resume drains them (u7 bounces), the reports collect back into
+       Postgres, and the parent row carries the flow counters.</p>
     <button data-action="pause">pause email</button>
+    <button data-action="flow">run digest flow (12)</button>
     <button data-action="resume">resume email</button>
   </div>
 </div>
 <div id="log"><div>click a button — every one runs the same producer API your app would</div></div>
 <main>
-  <section><h2>postgres <small>business-critical · drizzle tables</small></h2><div id="postgres"></div></section>
-  <section><h2>redis <small>disposable sends · lua scripts</small></h2><div id="redis"></div></section>
+  <section class="store"><h2>postgres <small>business-critical · drizzle tables</small></h2><div id="postgres"></div></section>
+  <section class="store"><h2>redis <small>disposable sends · lua scripts</small></h2><div id="redis"></div></section>
 </main>
+</div>
 <script>
 const STATES = ["waiting", "delayed", "active", "waiting-children", "completed", "failed", "cancelled"]
 const esc = (value) => String(value).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]))
@@ -392,6 +446,14 @@ const log = (message) => {
   el.prepend(line)
   while (el.children.length > 3) el.removeChild(el.lastChild)
 }
+document.querySelectorAll("nav a[data-section]").forEach((item) => {
+  item.addEventListener("click", () => {
+    document.querySelectorAll("nav a[data-section]").forEach((other) =>
+      other.classList.toggle("current", other === item))
+    document.querySelectorAll(".stage .section").forEach((section) =>
+      section.classList.toggle("current", section.dataset.section === item.dataset.section))
+  })
+})
 document.querySelectorAll("button[data-action]").forEach((button) => {
   button.addEventListener("click", async () => {
     button.disabled = true
