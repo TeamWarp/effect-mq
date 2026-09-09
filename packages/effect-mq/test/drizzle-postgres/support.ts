@@ -84,7 +84,7 @@ export const createTablesSql = (names: TableNames): ReadonlyArray<string> => [
     lock_token text,
     lock_expires_at timestamptz
   )`,
-  `CREATE INDEX "${names.jobs}_ready_idx" ON "${names.jobs}" (queue, priority DESC, seq ASC) WHERE state = 'waiting'`,
+  `CREATE INDEX "${names.jobs}_ready_idx" ON "${names.jobs}" (queue, priority DESC NULLS FIRST, seq ASC) WHERE state = 'waiting'`,
   `CREATE INDEX "${names.jobs}_delayed_idx" ON "${names.jobs}" (queue, run_at) WHERE state = 'delayed'`,
   `CREATE INDEX "${names.jobs}_active_idx" ON "${names.jobs}" (lock_expires_at) WHERE state = 'active'`,
   `CREATE INDEX "${names.jobs}_history_idx" ON "${names.jobs}" (name, state, finished_at)`,
