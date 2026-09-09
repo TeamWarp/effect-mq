@@ -11,7 +11,7 @@
  * `listSchedules`), and every button is a POST running the same producer
  * code an app would. main.ts remains the scripted, terminal-only tour.
  */
-import { PgClient } from "@effect/sql-pg"
+import type { PgClient } from "@effect/sql-pg"
 import { Console, Effect, Layer, ManagedRuntime, Schema } from "effect"
 import type { Redis } from "effect/unstable/persistence"
 import { Flow, Job, JobStore, Worker } from "effect-mq"
