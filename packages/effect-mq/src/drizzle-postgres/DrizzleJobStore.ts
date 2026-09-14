@@ -17,6 +17,7 @@
  * @since 0.1.0
  */
 import * as JobStore from "../JobStore.ts"
+import { resubscribeForever } from "./resubscribe.ts"
 import type { PgClient } from "@effect/sql-pg"
 import { asc, eq, getTableColumns, type SQL, sql } from "drizzle-orm"
 import * as PgDrizzle from "drizzle-orm/effect-postgres"
@@ -416,22 +417,15 @@ export const make = (
         Deferred.doneUnsafe(waiter.deferred, Effect.void)
       }
     }
-    // Resubscribe forever: if the LISTEN stream ends or fails, wake-ups
-    // degrade to the worker's pollInterval until the next attempt succeeds.
-    yield* client.listen(wakeChannel).pipe(
-      Stream.runForEach((payload) =>
-        Effect.sync(() => signalWake(payload === "*" ? undefined : JobStore.QueueName(payload)))
-      ),
-      Effect.catchCause((cause) =>
-        Effect.logWarning(
-          "effect-mq: LISTEN subscription failed; wake-ups degraded to polling until resubscribe",
-          cause
+    // Wake-ups degrade to the worker's pollInterval whenever this is not
+    // subscribed; see `resubscribeForever` for the retry and log policy.
+    yield* resubscribeForever(
+      client.listen(wakeChannel).pipe(
+        Stream.runForEach((payload) =>
+          Effect.sync(() => signalWake(payload === "*" ? undefined : JobStore.QueueName(payload)))
         )
-      ),
-      Effect.andThen(Effect.sleep("1 second")),
-      Effect.forever,
-      Effect.forkScoped
-    )
+      )
+    ).pipe(Effect.forkScoped)
     // Automatic retention (the store-level sweep and per-job `keep`) never
     // prunes a flow parent that still owes cascade cancels: its dependency
     // rows marked `cancelled` and not `cascaded` are the only record that
