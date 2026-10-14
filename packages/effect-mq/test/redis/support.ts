@@ -1,6 +1,6 @@
 import { NodeRedis } from "@effect/platform-node"
 import { Layer } from "effect"
-import type { Redis } from "effect/unstable/persistence"
+import type { Redis } from "effect/persistence"
 import * as net from "node:net"
 
 export const redisUrl = process.env.EFFECT_MQ_REDIS_URL ?? "redis://localhost:6380"

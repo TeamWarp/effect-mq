@@ -5,13 +5,13 @@ The Postgres store (`effect-mq/drizzle-postgres`) runs on drizzle v1's Effect dr
 Install the optional peers:
 
 ```sh
-bun add drizzle-orm@rc @effect/sql-pg@rc
+bun add drizzle-orm@rc @effect/sql-pg@^4.0.4
 ```
 
 | Peer | Range |
 | --- | --- |
 | `drizzle-orm` | `>=1.0.0-rc <2` |
-| `@effect/sql-pg` | `>=4.0.0-rc <5` |
+| `@effect/sql-pg` | `^4.0.4` |
 
 ## 1. Put the tables in your drizzle schema
 

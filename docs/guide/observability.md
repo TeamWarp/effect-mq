@@ -48,7 +48,7 @@ Failed runs also reach your logs: the worker emits `logWarning` for attempts tha
 
 ## Metrics
 
-Workers and producers emit Effect `Metric` instruments, exported as the `Metrics` module from `effect-mq`. They are **process-local operational signal, not persisted state**: they live in the emitting process's metric registry, and you export them with whatever your app already runs (the Otlp modules from `effect/unstable/observability`, `@effect/opentelemetry`, a Prometheus scraper). Retention lives in that backend.
+Workers and producers emit Effect `Metric` instruments, exported as the `Metrics` module from `effect-mq`. They are **process-local operational signal, not persisted state**: they live in the emitting process's metric registry, and you export them with whatever your app already runs (the Otlp modules from `effect/observability`, `@effect/opentelemetry`, a Prometheus scraper). Retention lives in that backend.
 
 The *durable* analogues stay in the store: `store.counts()` for live depth and the [attempts ledger](/guide/retries-and-timeouts) for per-run history, both queryable forever.
 

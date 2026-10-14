@@ -1,5 +1,5 @@
 /**
- * The Redis-backed `JobStore`, built on `effect/unstable/persistence`'s
+ * The Redis-backed `JobStore`, built on `effect/persistence`'s
  * `Redis` service (provide it via `NodeRedis.layer`, `BunRedis.layer`, or
  * `Redis.make` over any client).
  *
