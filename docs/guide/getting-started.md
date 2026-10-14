@@ -6,7 +6,7 @@ Install the package:
 bun add effect-mq        # or npm install / pnpm add / yarn add
 ```
 
-`effect-mq` targets **Effect v4** (`effect@4.0.0-rc`). The Postgres and Redis stores have optional peer dependencies; you'll add those in the storage step.
+`effect-mq` targets **Effect v4** (`effect@^4.0.4`). The Postgres and Redis stores have optional peer dependencies; you'll add those in the storage step.
 
 ## 1. Define a job
 

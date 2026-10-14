@@ -13,7 +13,7 @@
  */
 import type { PgClient } from "@effect/sql-pg"
 import { Console, Effect, Layer, ManagedRuntime, Schema } from "effect"
-import type { Redis } from "effect/unstable/persistence"
+import type { Redis } from "effect/persistence"
 import { Flow, Job, JobStore, Worker } from "effect-mq"
 import { DigestFlow, GenerateInvoice, RefreshCache, RenderReport, SendBounced, SendEmail } from "./jobs.ts"
 import { EmailStore, PgLive, PgStoreLive, RedisLive, RedisStoreLive, resetRedis, resetTables } from "./stores.ts"

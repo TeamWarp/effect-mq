@@ -4,6 +4,20 @@ All notable changes to `effect-mq`. Versions follow 0.x semver: **minor
 bumps may break** (the `JobStore` driver contract in particular); patch
 bumps are additive.
 
+## Unreleased
+
+- **Effect 4.0.4** — requires `effect`, `@effect/sql-pg` (Postgres), and
+  `@effect/vitest` (testing) 4.0.4 or later in the v4 line. The testing
+  integration uses Vitest 5. Redis imports use the stable persistence path.
+- **Postgres notifications** — consume the scoped notification queue and its
+  payloads, release failed subscriptions before reconnecting, and release
+  listeners on store shutdown. Worker polling remains available during
+  notification outages.
+- **Native PostgreSQL parameters** — explicitly type text arrays so empty
+  state filters and empty claim-name lists keep matching no jobs.
+- Queue tables, Redis keys, encoded jobs, dedupe keys, and notification
+  payloads are unchanged; no storage migration is required.
+
 ## 0.7.0 — 2026-08-25
 
 - **List ordering** — `list` gains `orderBy` (`enqueuedAt` | `runAt` |

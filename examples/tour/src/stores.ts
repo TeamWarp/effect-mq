@@ -6,7 +6,7 @@
  * schema-drift test) and drop/creates the default-named tables at startup.
  */
 import { NodeRedis } from "@effect/platform-node"
-import { Redis } from "effect/unstable/persistence"
+import { Redis } from "effect/persistence"
 import { PgClient } from "@effect/sql-pg"
 import { Effect, Layer, Redacted } from "effect"
 import { JobStore } from "effect-mq"

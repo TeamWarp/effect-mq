@@ -6,7 +6,7 @@ import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
 import { getTableConfig, index, text } from "drizzle-orm/pg-core"
 import { Cause, Effect, Exit, Fiber, Layer, Option, Schedule, Schema } from "effect"
 import { TestClock } from "effect/testing"
-import { DeadlockError, SqlError, UnknownError } from "effect/unstable/sql/SqlError"
+import { DeadlockError, SqlError, UnknownError } from "effect/sql/SqlError"
 import {
   DrizzleJobStore,
   mqDedupe,

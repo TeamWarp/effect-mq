@@ -280,7 +280,7 @@ run is the meaningful trace unit; per-claim spans would flood your backend.
 Workers and producers emit Effect `Metric` instruments (exported as the
 `Metrics` module). They are **process-local operational signal, not
 persisted state** — wire up any Effect-compatible exporter (the Otlp modules
-from `effect/unstable/observability`, `@effect/opentelemetry`, Prometheus)
+from `effect/observability`, `@effect/opentelemetry`, Prometheus)
 and retention lives in your metrics backend. The *durable* analogues stay in
 the store: `store.counts()` for live depth, the attempt ledger for per-run
 history — both queryable forever.
