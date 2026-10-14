@@ -1,5 +1,5 @@
 /**
- * A Redis-backed `JobStore` built on `effect/unstable/persistence`'s `Redis`
+ * A Redis-backed `JobStore` built on `effect/persistence`'s `Redis`
  * service. Every mutation is a single Lua script (see `scripts.ts`), so all
  * `JobStore` operations are atomic on the server and safe across processes.
  *
@@ -26,7 +26,7 @@ import {
   Schedule,
   type Scope
 } from "effect"
-import { Redis } from "effect/unstable/persistence"
+import { Redis } from "effect/persistence"
 import * as JobStore from "../JobStore.ts"
 import * as scripts from "./scripts.ts"
 

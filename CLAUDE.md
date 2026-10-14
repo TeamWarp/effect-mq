@@ -108,7 +108,7 @@ For more information, read the Bun API docs in `node_modules/bun-types/docs/**.m
 ## effect-mq project notes
 
 This is a bun monorepo (workspaces: `packages/*`, `examples/*`) building an
-Effect-native background job library on **Effect v4** (`effect@4.0.0-rc.x`,
+Effect-native background job library on **Effect v4** (`effect@4.0.4`,
 pinned in the root `catalog`).
 
 - Architecture: ONE published package, `packages/effect-mq`, with subpath
@@ -120,7 +120,7 @@ pinned in the root `catalog`).
   runner; `src/drizzle-postgres/` the Postgres store (drizzle 1.0 effect driver over
   `@effect/sql-pg`; schema factories owned by the user's drizzle-kit
   migrations); `src/redis/` the Redis store (atomic Lua scripts over
-  `effect/unstable/persistence`'s `Redis` service; provide it via
+  `effect/persistence`'s `Redis` service; provide it via
   `@effect/platform-node` `NodeRedis` or `-bun` `BunRedis`); `src/testing/`
   the conformance suite every driver must pass.
 - Publishing: `npm publish` from `packages/effect-mq` (CI does this on `v*`
@@ -143,7 +143,7 @@ pinned in the root `catalog`).
   modules. Verify APIs against `node_modules/effect/src` — do not trust v3
   memory. Reference repos are cloned in `.repos/` (effect, bullmq,
   effect-agent).
-- Testing: this repo uses **vitest 4 + @effect/vitest** (`bun run test`), NOT
+- Testing: this repo uses **vitest 5 + @effect/vitest** (`bun run test`), NOT
   `bun test` — TestClock-based `it.effect` tests need the vitest integration.
   Typecheck with `bun run check` (TypeScript 7), lint with `bun run lint`
   (oxlint), everything with `bun run ready`.

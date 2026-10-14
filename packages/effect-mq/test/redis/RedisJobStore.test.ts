@@ -1,9 +1,9 @@
 import { Job, JobStore, Worker } from "../../src/index.ts"
 import { jobStoreConformance } from "../../src/testing/index.ts"
 import { assert, describe, expect, it } from "@effect/vitest"
-import { Cause, Effect, Exit, Fiber, Layer, Option, Schedule, Schema } from "effect"
+import { Cause, Effect, Exit, Fiber, Layer, Option, Schedule, Schema, Scope } from "effect"
 import { TestClock } from "effect/testing"
-import { Redis } from "effect/unstable/persistence"
+import { Redis } from "effect/persistence"
 import { RedisJobStore } from "../../src/redis/index.ts"
 import { freshPrefix, redisAvailable, redisLive, redisUrl } from "./support.ts"
 
@@ -65,6 +65,27 @@ if (!available) {
 
         const ledger = yield* store.getAttempts(record.id)
         expect(ledger.map((entry) => entry.outcome)).toEqual(["retried", "completed"])
+      }).pipe(Effect.scoped, Effect.provide(redisLive())))
+
+    it.live("closing a store scope releases its Redis subscription", () =>
+      Effect.gen(function*() {
+        const redis = yield* Redis.Redis
+        const prefix = freshPrefix()
+        const channel = `${prefix}:wake`
+        for (let attempt = 0; attempt < 3; attempt++) {
+          const scope = yield* Scope.fork(yield* Scope.Scope)
+          yield* Scope.provide(RedisJobStore.make({ prefix }), scope)
+          yield* redis.send<ReadonlyArray<string | number>>("PUBSUB", "NUMSUB", channel).pipe(
+            Effect.repeat({ schedule: Schedule.spaced("20 millis"), until: (reply) => reply[1] === 1 }),
+            Effect.timeout("2 seconds")
+          )
+          yield* Scope.close(scope, Exit.void).pipe(Effect.timeout("2 seconds"))
+          const reply = yield* redis.send<ReadonlyArray<string | number>>("PUBSUB", "NUMSUB", channel).pipe(
+            Effect.repeat({ schedule: Schedule.spaced("20 millis"), until: (reply) => reply[1] === 0 }),
+            Effect.timeout("2 seconds")
+          )
+          expect(reply).toEqual([channel, 0])
+        }
       }).pipe(Effect.scoped, Effect.provide(redisLive())))
 
     it.live("a pub/sub wake reaches a waiter in another store instance", () =>

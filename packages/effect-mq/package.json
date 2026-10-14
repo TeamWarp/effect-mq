@@ -47,10 +47,10 @@
     "postpack": "node scripts/postpack.mjs"
   },
   "peerDependencies": {
-    "@effect/sql-pg": ">=4.0.0-rc <5",
-    "@effect/vitest": ">=4.0.0-rc <5",
+    "@effect/sql-pg": "^4.0.4",
+    "@effect/vitest": "^4.0.4",
     "drizzle-orm": ">=1.0.0-rc <2",
-    "effect": ">=4.0.0-rc <5"
+    "effect": "^4.0.4"
   },
   "peerDependenciesMeta": {
     "@effect/sql-pg": {
