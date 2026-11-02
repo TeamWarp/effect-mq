@@ -41,7 +41,7 @@
     "@types/node": "26.1.2",
     "effect": "4.0.0-rc.111",
     "typescript": "7.0.2",
-    "vitest": "4.1.11",
+    "vitest": "4.1.12",
     "drizzle-orm": "1.0.0-rc.5-169397b",
     "drizzle-kit": "1.0.0-rc.5-ab785fc",
     "pg": "8.23.0",
