@@ -7,8 +7,10 @@ bumps are additive.
 ## Unreleased
 
 - **Effect 4.0.4** — requires `effect`, `@effect/sql-pg` (Postgres), and
-  `@effect/vitest` (testing) 4.0.4 or later in the v4 line. The testing
+  `@effect/vitest` (testing) 4.0.4 or later in the v4 line (developed against 4.1.2). The testing
   integration uses Vitest 5. Redis imports use the stable persistence path.
+- **Drizzle** — use `drizzle-orm` 1.0.0-rc.5 or later with Effect 4.x
+  stable; earlier builds import the removed `effect/unstable/sql` path.
 - **Postgres notifications** — consume the scoped notification queue and its
   payloads, release failed subscriptions before reconnecting, and release
   listeners on store shutdown. Worker polling remains available during

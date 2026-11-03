@@ -37,20 +37,17 @@
     "vitest": "catalog:"
   },
   "catalog": {
-    "@effect/vitest": "4.0.4",
+    "@effect/vitest": "4.1.2",
     "@types/node": "26.1.2",
-    "effect": "4.0.4",
+    "effect": "4.1.2",
     "typescript": "7.0.2",
     "vitest": "5.0.3",
-    "drizzle-orm": "1.0.0-rc.5-169397b",
-    "drizzle-kit": "1.0.0-rc.5-ab785fc",
+    "drizzle-orm": "1.0.0-rc.5",
+    "drizzle-kit": "1.0.0-rc.5",
     "pg": "8.23.0",
     "@types/pg": "8.15.6",
-    "@effect/sql-pg": "4.0.4",
-    "@effect/platform-node": "4.0.4",
+    "@effect/sql-pg": "4.1.2",
+    "@effect/platform-node": "4.1.2",
     "redis": "6.2.1"
-  },
-  "patchedDependencies": {
-    "drizzle-orm@1.0.0-rc.5-169397b": "patches/drizzle-orm@1.0.0-rc.5-169397b.patch"
   }
 }

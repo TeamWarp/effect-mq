@@ -108,7 +108,7 @@ For more information, read the Bun API docs in `node_modules/bun-types/docs/**.m
 ## effect-mq project notes
 
 This is a bun monorepo (workspaces: `packages/*`, `examples/*`) building an
-Effect-native background job library on **Effect v4** (`effect@4.0.4`,
+Effect-native background job library on **Effect v4** (`effect@4.1.2`,
 pinned in the root `catalog`).
 
 - Architecture: ONE published package, `packages/effect-mq`, with subpath
