@@ -17,11 +17,11 @@
  * @since 0.1.0
  */
 import * as JobStore from "../JobStore.ts"
-import type { PgClient } from "@effect/sql-pg"
+import { type PgClient, PgTypes } from "@effect/sql-pg"
 import { asc, eq, getTableColumns, type SQL, sql } from "drizzle-orm"
 import * as PgDrizzle from "drizzle-orm/effect-postgres"
 import { getTableConfig } from "drizzle-orm/pg-core"
-import { Cause, Clock, type Context, Deferred, Duration, Effect, Layer, Option, Predicate, type Scope, Stream } from "effect"
+import { Cause, Clock, type Context, Deferred, Duration, Effect, Layer, Option, Predicate, Queue, Result, type Scope } from "effect"
 import type {
   MqDedupeTable,
   MqFlowChildrenTable,
@@ -33,6 +33,7 @@ import type {
 } from "./schema.ts"
 
 const { JobId } = JobStore
+const textArray = (values: ReadonlyArray<string>) => Result.getOrThrow(PgTypes.array(values, PgTypes.OID.text))
 
 /**
  * @since 0.1.0
@@ -416,12 +417,17 @@ export const make = (
         Deferred.doneUnsafe(waiter.deferred, Effect.void)
       }
     }
-    // Resubscribe forever: if the LISTEN stream ends or fails, wake-ups
-    // degrade to the worker's pollInterval until the next attempt succeeds.
-    yield* client.listen(wakeChannel).pipe(
-      Stream.runForEach((payload) =>
-        Effect.sync(() => signalWake(payload === "*" ? undefined : JobStore.QueueName(payload)))
-      ),
+    // Each retry releases the failed listener's reserved connection before
+    // acquiring another. Workers keep polling while LISTEN is unavailable.
+    yield* Effect.scoped(
+      Effect.gen(function*() {
+        const notifications = yield* client.listen(wakeChannel)
+        while (true) {
+          const { payload } = yield* Queue.take(notifications)
+          signalWake(payload === "*" ? undefined : JobStore.QueueName(payload))
+        }
+      })
+    ).pipe(
       Effect.catchCause((cause) =>
         Effect.logWarning(
           "effect-mq: LISTEN subscription failed; wake-ups degraded to polling until resubscribe",
@@ -1231,7 +1237,7 @@ export const make = (
               WITH candidate AS (
                 SELECT ${jobs.id} AS id FROM ${jobs}
                 WHERE ${jobs.queue} = ${claimOptions.queue} AND ${jobs.state} = 'waiting'
-                  AND ${jobs.name} = ANY(${sql.param([...claimOptions.names])})
+                  AND ${jobs.name} = ANY(${sql.param(textArray([...claimOptions.names]))})
                 ORDER BY ${jobs.priority} DESC, ${jobs.seq} ASC
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
@@ -1263,7 +1269,7 @@ export const make = (
             const next = rowsOf(yield* tx.execute<{ next: Date | null }>(sql`
               SELECT MIN(${jobs.runAt}) AS next FROM ${jobs}
               WHERE ${jobs.queue} = ${claimOptions.queue} AND ${jobs.state} = 'delayed'
-                AND ${jobs.name} = ANY(${sql.param([...claimOptions.names])})
+                AND ${jobs.name} = ANY(${sql.param(textArray([...claimOptions.names]))})
             `))
             const empty: JobStore.ClaimResult = {
               _tag: "Empty",
@@ -1580,7 +1586,7 @@ export const make = (
           if (listOptions.states !== undefined) {
             // NB: an empty array matches nothing (ANY('{}') is false), same
             // as the memory driver.
-            conditions.push(sql`${jobs.state} = ANY(${sql.param([...listOptions.states])})`)
+            conditions.push(sql`${jobs.state} = ANY(${sql.param(textArray([...listOptions.states]))})`)
           }
           if (listOptions.metadata !== undefined && Object.keys(listOptions.metadata).length > 0) {
             conditions.push(sql`${jobs.metadata} @> ${JSON.stringify(listOptions.metadata)}::jsonb`)

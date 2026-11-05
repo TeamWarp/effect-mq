@@ -31,7 +31,7 @@ const JobStoreLive = RedisJobStore.layer().pipe(
 
 :::
 
-`@effect/platform-node`'s `NodeRedis` has a peer dependency on `redis` (`>=5 <7`); `@effect/platform-bun`'s `BunRedis` uses the built-in `Bun.redis`, nothing extra to install. Any other client works through `Redis.make` from `effect/unstable/persistence`.
+`@effect/platform-node`'s `NodeRedis` has a peer dependency on `redis` (`>=5 <7`); `@effect/platform-bun`'s `BunRedis` uses the built-in `Bun.redis`, nothing extra to install. Any other client works through `Redis.make` from `effect/persistence`.
 
 `RedisJobStore.layer` accepts:
 

@@ -4,7 +4,7 @@
  * Metrics are **process-local operational signal, not persisted state**:
  * they live in the Effect metric registry of the emitting process and are
  * exported by whatever exporter the application runs (the Otlp modules from
- * `effect/unstable/observability`, `@effect/opentelemetry`, a Prometheus
+ * `effect/observability`, `@effect/opentelemetry`, a Prometheus
  * scraper, ...). Retention belongs to that metrics backend. The queue's
  * *durable* analogues remain in the store — `store.counts()` for live depth
  * and the attempt ledger for per-run history — and stay queryable forever.

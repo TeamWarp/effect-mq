@@ -91,7 +91,7 @@ tools/oxlint/anti-slop    local lint plugin enforcing honest types
 bun install
 bun run check     # TypeScript 7, per package
 bun run lint      # oxlint (incl. anti-slop rules)
-bun run test      # vitest 4 + @effect/vitest, TestClock-driven
+bun run test      # vitest 5 + @effect/vitest, TestClock-driven
                   # (storage suites self-skip without their backing service)
 bun run test:pg   # docker compose up + the Postgres suite
 bun run test:redis  # docker compose up + the Redis suite
