@@ -120,6 +120,10 @@ export const jobs = mqJobs<JobNames>("effect_mq_jobs", {
 })
 ```
 
+::: warning
+RLS-scoping these columns is for your own queries: the role the store connects as must not be subject to RLS on the `effect_mq_*` tables — grant it `BYPASSRLS`, or connect as the owner without `FORCE ROW LEVEL SECURITY`. The startup probe cannot catch a role that is: it is seven `limit(0)` selects, and a table with RLS enabled returns zero rows without an error when no policy lets the role see them, so `validate` passes and `claim` then silently matches nothing. What the producer side sees depends on the policy: with no permitting `INSERT` policy, `enqueue` raises a row-level security error; with a policy that lets the producer in but not the worker (a tenant-scoped policy is exactly that), the queue accepts work and never runs it, with no error anywhere.
+:::
+
 When the metadata convention isn't enough (coercions, renames), override the mapping at the store level:
 
 ```ts
