@@ -156,7 +156,7 @@ export const mqJobs = <
   }, (table) => [
     // Claim path: pop highest priority, FIFO within it.
     index(`${tableName}_ready_idx`)
-      .on(table.queue, table.priority.desc(), table.seq.asc())
+      .on(table.queue, table.priority.desc().nullsFirst(), table.seq.asc())
       .where(sql`${table.state} = 'waiting'`),
     // Delayed promotion + nextRunAt.
     index(`${tableName}_delayed_idx`)
