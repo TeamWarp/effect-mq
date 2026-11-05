@@ -6,19 +6,23 @@ bumps are additive.
 
 ## Unreleased
 
-- **Effect 4.0.4** — requires `effect`, `@effect/sql-pg` (Postgres), and
-  `@effect/vitest` (testing) 4.0.4 or later in the v4 line (developed against 4.1.2). The testing
-  integration uses Vitest 5. Redis imports use the stable persistence path.
-- **Drizzle** — use `drizzle-orm` 1.0.0-rc.5 or later with Effect 4.x
-  stable; earlier builds import the removed `effect/unstable/sql` path.
+- **Effect 4 stable** — peer ranges move from `>=4.0.0-rc <5` to `^4.0.4`
+  for `effect`, `@effect/sql-pg` (Postgres), and `@effect/vitest`
+  (testing). Breaking for Effect 4 release-candidate users; tested
+  against 4.1.2. Redis imports use the stable persistence path.
+- **Vitest 5** — the testing integration requires Vitest 5, matching
+  `@effect/vitest` 4.x. Breaking for test suites on Vitest 4.
+- **Drizzle** — the Postgres store needs `drizzle-orm` 1.0.0-rc.5 or later;
+  earlier builds import the removed `effect/unstable/sql` path.
 - **Postgres notifications** — consume the scoped notification queue and its
   payloads, release failed subscriptions before reconnecting, and release
-  listeners on store shutdown. Worker polling remains available during
+  listeners on store shutdown. Worker polling keeps running during
   notification outages.
-- **Native PostgreSQL parameters** — explicitly type text arrays so empty
-  state filters and empty claim-name lists keep matching no jobs.
-- Queue tables, Redis keys, encoded jobs, dedupe keys, and notification
-  payloads are unchanged; no storage migration is required.
+- **Empty filters on native Postgres** — text array parameters are typed
+  explicitly, so empty state filters and empty claim-name lists keep
+  matching no jobs.
+- **No storage migration** — queue tables, Redis keys, encoded jobs, dedupe
+  keys, and notification payloads are unchanged; upgrade in place.
 
 ## 0.7.0 — 2026-08-25
 
