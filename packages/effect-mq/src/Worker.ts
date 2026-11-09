@@ -1052,8 +1052,13 @@ export const make = <StoreId = JobStore, const Flows extends ReadonlyArray<FlowA
     const ensureQueueLoop = (queue: QueueName, registered: number | undefined) =>
       Effect.suspend(() => {
         if (startedQueues.has(queue)) return Effect.void
-        startedQueues.add(queue)
         const takers = queueConcurrency(queue, registered)
+        if (Number.isNaN(takers)) {
+          return Effect.die(
+            new Error(`effect-mq: concurrency for queue "${queue}" must not be NaN`)
+          )
+        }
+        startedQueues.add(queue)
         const loop = takerLoop(queue).pipe(
           Effect.updateContext(() => workerContext)
         )
