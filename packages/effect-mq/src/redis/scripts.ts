@@ -61,7 +61,7 @@
  *
  * @since 0.2.0
  */
-import { Redis } from "effect/unstable/persistence"
+import { Redis } from "effect/persistence"
 
 /**
  * Which optional list indexes (`p:byname:<name>` / `p:byqueue:<queue>`) this
